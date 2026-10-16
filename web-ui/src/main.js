@@ -6894,7 +6894,22 @@ document
   .querySelectorAll(".composer-shell")
   .forEach((composer) => composer.addEventListener("pointerdown", keepComposerTextFocus));
 $("messageText").addEventListener("paste", (event) => {
-  if (event.clipboardData?.files.length) return;
+  // Route clipboard images through the same attachment pipeline as the file picker.
+  const clipboard = event.clipboardData;
+  const files = [...(clipboard?.files || [])].filter((file) => file.type.startsWith("image/"));
+  const images = files.length
+    ? files
+    : [...(clipboard?.items || [])]
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter(Boolean);
+  if (images.length) {
+    if ($("imageInput").disabled) return;
+    event.preventDefault();
+    run(() => addImages(images));
+    return;
+  }
+  if (clipboard?.files.length) return;
   const text = event.clipboardData?.getData("text/plain");
   if (!shouldAttachPastedText(text)) return;
   event.preventDefault();
