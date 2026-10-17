@@ -6927,6 +6927,7 @@ document.querySelector(".composer-shell").addEventListener("focusout", () =>
   }),
 );
 $("messageText").onkeydown = (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
   if (!e.isComposing && !$("composerCommandPicker").hidden) {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -6953,7 +6954,7 @@ $("messageText").onkeydown = (e) => {
       return;
     }
   }
-  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+  if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
     e.preventDefault();
     $("submitBtn").click();
   }
@@ -7050,7 +7051,8 @@ $("temporaryPanelBtn").onclick = () => {
 $("temporaryCloseBtn").onclick = closePanels;
 $("temporarySendBtn").onclick = () => run(sendTemporaryMessage);
 $("temporaryText").onkeydown = (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+  if (event.isComposing || event.keyCode === 229) return;
+  if (event.key === "Enter" && !event.shiftKey && !event.altKey) {
     event.preventDefault();
     $("temporarySendBtn").click();
   }
