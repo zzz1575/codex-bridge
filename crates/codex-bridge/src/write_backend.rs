@@ -80,6 +80,8 @@ struct AppServerSession {
 struct AppServerEventBus {
     sender: broadcast::Sender<Value>,
     sequence: AtomicU64,
+    approvals: RwLock<Vec<Value>>,
+    approval_sequence: AtomicU64,
 }
 
 impl AppServerEventBus {
@@ -88,6 +90,13 @@ impl AppServerEventBus {
         Self {
             sender,
             sequence: AtomicU64::new(0),
+            approvals: RwLock::new(Vec::new()),
+            approval_sequence: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            ),
         }
     }
 
@@ -332,6 +341,27 @@ impl CodexCliBackend {
             .as_ref()
             .ok_or_else(app_server_unavailable)?;
         app_server.forget_thread(thread_id)
+    }
+
+    pub fn pending_approvals(&self) -> Vec<Value> {
+        self.app_server
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .events
+                    .approvals
+                    .read()
+                    .ok()
+                    .map(|entries| entries.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn resolve_approval(&self, id: u64, accept: bool) -> Result<Value, BackendFailure> {
+        self.app_server_rpc(
+            "bridge/resolveApproval",
+            json!({"id": id, "accept": accept}),
+        )
     }
 
     pub fn subscribe_app_server_events(&self) -> Option<broadcast::Receiver<Value>> {
@@ -776,6 +806,16 @@ fn app_server_worker(
                         params,
                         response,
                     } => {
+                        if method == "bridge/resolveApproval" {
+                            let result = resolve_pending_approval(
+                                websocket.as_mut().expect("connection ensured"),
+                                &events,
+                                params["id"].as_u64().unwrap_or(0),
+                                params["accept"].as_bool().unwrap_or(false),
+                            );
+                            let _ = response.send(result);
+                            continue;
+                        }
                         let remember_started_thread = method == "thread/start"
                             && !params
                                 .get("ephemeral")
@@ -1158,11 +1198,85 @@ fn read_app_server_message(
         } else {
             "app_server"
         };
+        observe_approval_message(events, &value);
         events.publish(json!({"type": event_type, "message": value}));
         Ok(None)
     } else {
         Ok(Some(value))
     }
+}
+
+fn approval_result(request: &Value, accept: bool) -> Option<Value> {
+    match request["method"].as_str()? {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some(json!({"decision": if accept { "accept" } else { "decline" }}))
+        }
+        "item/permissions/requestApproval" => Some(json!({
+            "permissions": if accept { request["params"]["permissions"].clone() } else { json!({}) },
+            "scope": "turn"
+        })),
+        _ => None,
+    }
+}
+
+fn observe_approval_message(events: &AppServerEventBus, message: &Value) {
+    let Ok(mut entries) = events.approvals.write() else {
+        return;
+    };
+    let before = entries.len();
+    if message.get("id").is_some() && approval_result(message, false).is_some() {
+        if !entries
+            .iter()
+            .any(|entry| entry["request"]["id"] == message["id"])
+        {
+            let id = events.approval_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+            entries.push(
+                json!({"id": id, "thread_id": message["params"]["threadId"], "request": message}),
+            );
+        }
+    } else if message["method"] == "serverRequest/resolved" {
+        entries.retain(|entry| entry["request"]["id"] != message["params"]["requestId"]);
+    } else if message["method"] == "turn/completed" {
+        entries.retain(|entry| {
+            !(entry["thread_id"] == message["params"]["threadId"]
+                && entry["request"]["params"]["turnId"] == message["params"]["turn"]["id"])
+        });
+    }
+    let changed = entries.len() != before;
+    drop(entries);
+    if changed {
+        events.publish(json!({"type": "bridge_approvals_changed"}));
+    }
+}
+
+fn resolve_pending_approval(
+    websocket: &mut WebSocket<UnixStream>,
+    events: &AppServerEventBus,
+    id: u64,
+    accept: bool,
+) -> Result<Value, BackendFailure> {
+    let mut entries = events
+        .approvals
+        .write()
+        .map_err(|_| app_server_unavailable())?;
+    let index = entries
+        .iter()
+        .position(|entry| entry["id"].as_u64() == Some(id))
+        .ok_or_else(|| BackendFailure {
+            code: "approval_not_pending",
+            message: "This approval is no longer pending; refresh the request list".into(),
+        })?;
+    let request = &entries[index]["request"];
+    let result = approval_result(request, accept).ok_or_else(|| BackendFailure {
+        code: "unsupported_approval",
+        message: "Unsupported approval type".into(),
+    })?;
+    // Reply on the exact connection that received the server request. Never replay approvals.
+    write_rpc_message(websocket, &json!({"id": request["id"], "result": result}))?;
+    entries.remove(index);
+    drop(entries);
+    events.publish(json!({"type": "bridge_approvals_changed"}));
+    Ok(json!({"id": id, "decision": if accept { "accept" } else { "decline" }}))
 }
 
 fn emit_connection_event(
@@ -1172,6 +1286,12 @@ fn emit_connection_event(
     user_agent: Option<&str>,
     error: Option<&str>,
 ) {
+    if status == "disconnected" {
+        if let Ok(mut entries) = events.approvals.write() {
+            entries.clear();
+        }
+        events.publish(json!({"type": "bridge_approvals_changed"}));
+    }
     if let Ok(mut info) = runtime.write() {
         info.connected = status == "connected";
         if user_agent.is_some() {
@@ -1343,6 +1463,110 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn approval_snapshot_deduplicates_and_expires_resolved_requests() {
+        let events = AppServerEventBus::new(16);
+        let request = json!({"id":"opaque-request", "method":"item/commandExecution/requestApproval",
+            "params":{"threadId":"thread-a", "turnId":"turn-a", "command":"echo OK"}});
+        observe_approval_message(&events, &request);
+        observe_approval_message(&events, &request);
+        assert_eq!(events.approvals.read().unwrap().len(), 1);
+        assert_eq!(
+            approval_result(&request, true).unwrap(),
+            json!({"decision":"accept"})
+        );
+        assert_eq!(
+            approval_result(&request, false).unwrap(),
+            json!({"decision":"decline"})
+        );
+        observe_approval_message(
+            &events,
+            &json!({"method":"serverRequest/resolved", "params":{"requestId":"opaque-request", "threadId":"thread-a"}}),
+        );
+        assert!(events.approvals.read().unwrap().is_empty());
+        let permission = json!({"id":77, "method":"item/permissions/requestApproval",
+            "params":{"permissions":{"network":{"enabled":true}}, "threadId":"thread-a", "turnId":"turn-a"}});
+        assert_eq!(
+            approval_result(&permission, true).unwrap(),
+            json!({"permissions":{"network":{"enabled":true}}, "scope":"turn"})
+        );
+        assert_eq!(
+            approval_result(&permission, false).unwrap(),
+            json!({"permissions":{}, "scope":"turn"})
+        );
+        observe_approval_message(&events, &permission);
+        observe_approval_message(
+            &events,
+            &json!({"method":"turn/completed", "params":{"threadId":"thread-a", "turn":{"id":"turn-a"}}}),
+        );
+        assert!(events.approvals.read().unwrap().is_empty());
+        assert!(approval_result(&json!({"method":"unknown"}), true).is_none());
+    }
+
+    #[test]
+    fn approval_decisions_reply_on_original_socket_and_reject_duplicate_clicks() {
+        for accept in [true, false] {
+            let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("bridge-approval-{}-{sequence}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("bridge.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (release_tx, release_rx) = std_mpsc::channel();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init = read_json(&mut ws);
+                ws.send(Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = read_json(&mut ws);
+                let rpc = read_json(&mut ws);
+                ws.send(Message::Text(
+                    json!({"id":rpc["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                ws.send(Message::Text(
+                    json!({"id":"approval-opaque", "method":"item/fileChange/requestApproval",
+                    "params":{"threadId":"thread-a","turnId":"turn-a","reason":"fixture"}})
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+                let answer = read_json(&mut ws);
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                answer
+            });
+            let backend =
+                CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(socket.clone()));
+            backend
+                .app_server_rpc("thread/loaded/list", json!({}))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while backend.pending_approvals().is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let snapshot = backend.pending_approvals();
+            assert_eq!(snapshot.len(), 1);
+            let id = snapshot[0]["id"].as_u64().unwrap();
+            backend.resolve_approval(id, accept).unwrap();
+            assert!(backend.pending_approvals().is_empty());
+            assert_eq!(
+                backend.resolve_approval(id, accept).unwrap_err().code,
+                "approval_not_pending"
+            );
+            release_tx.send(()).unwrap();
+            let answer = server.join().unwrap();
+            assert_eq!(
+                answer,
+                json!({"id":"approval-opaque","result":{"decision":if accept {"accept"} else {"decline"}}})
+            );
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::remove_dir(&dir).unwrap();
+        }
     }
 
     #[test]

@@ -6424,6 +6424,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
     let app_server_tools = state.app_server_tools.as_ref();
     let app_server_projects = state.app_server_projects.as_ref();
     match request {
+        Request::Pending => {
+            Response::success(json!({"requests": write_backend.pending_approvals()}))
+        }
+        Request::Approve { id } => match write_backend.resolve_approval(id, true) {
+            Ok(result) => Response::success(result),
+            Err(error) => write_backend_error(error),
+        },
+        Request::Decline { id } => match write_backend.resolve_approval(id, false) {
+            Ok(result) => Response::success(result),
+            Err(error) => write_backend_error(error),
+        },
         Request::Status => {
             if write_backend.app_server_socket().is_some() {
                 let _ = write_backend.app_server_rpc("thread/loaded/list", json!({}));

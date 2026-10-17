@@ -4575,3 +4575,33 @@ html[data-theme="light"] .composer-shell.agent-active:not(.submitting) {
       50% 50%;
   }
 }
+
+.approval-tray {
+  max-height: 38vh;
+  overflow: auto;
+  margin: 8px 12px;
+  padding: 12px;
+  border: 1px solid #d99b31;
+  border-radius: 12px;
+  background: var(--panel, #fff8e7);
+  color: var(--text, #222);
+}
+.approval-tray[hidden] {
+  display: none;
+}
+.approval-tray article + article {
+  margin-top: 14px;
+}
+.approval-tray p {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.approval-tray pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 20vh;
+  overflow: auto;
+}
+.approval-tray button {
+  margin: 8px 8px 0 0;
+}

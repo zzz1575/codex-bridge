@@ -1854,6 +1854,7 @@ function openProjectlessDraft() {
     if (state.composerReference) state.referenceDrafts.set(previous.id, state.composerReference);
   }
   state.current = thread;
+  renderApprovals();
   resetThreadViewState(thread);
   applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
   setSendMode("send", true);
@@ -5464,6 +5465,16 @@ function handleBridgeEvent(event) {
     renderTaskOverviews();
     return;
   }
+  if (
+    [
+      "bridge_approvals_changed",
+      "app_server_request",
+      "bridge_event_gap",
+      "bridge_app_server_connection",
+    ].includes(event?.type)
+  ) {
+    refreshApprovals().catch(() => {});
+  }
   if (event?.type !== "app_server") return;
   const message = event.message || {},
     method = message.method,
@@ -6410,6 +6421,83 @@ async function write(name) {
     setComposerSubmitting(false);
   }
 }
+let approvalGeneration = 0;
+let approvalSnapshot = [];
+const approvalInFlight = new Set();
+function renderApprovals() {
+  let tray = $("approvalTray");
+  if (!tray) {
+    tray = document.createElement("section");
+    tray.id = "approvalTray";
+    tray.className = "approval-tray";
+    tray.setAttribute("aria-live", "polite");
+    document.querySelector(".composer-shell").before(tray);
+  }
+  const entries = approvalSnapshot.filter((entry) => entry.thread_id === state.current?.id);
+  tray.hidden = entries.length === 0;
+  const signature = JSON.stringify([
+    getLanguage(),
+    state.current?.id,
+    entries,
+    [...approvalInFlight],
+  ]);
+  if (tray.dataset.signature === signature) return;
+  tray.dataset.signature = signature;
+  tray.replaceChildren();
+  for (const entry of entries) {
+    const box = document.createElement("article");
+    const title = document.createElement("strong");
+    title.textContent =
+      getLanguage() === "zh" ? "等待你的批准 · 会话已暂停" : "Approval required · Session paused";
+    box.append(title);
+    const params = entry.request.params || {};
+    const reason = document.createElement("p");
+    reason.textContent = params.reason || entry.request.method;
+    box.append(reason);
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent =
+      getLanguage() === "zh" ? "查看命令和权限范围" : "Command and permission details";
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(params, null, 2);
+    details.append(summary, pre);
+    box.append(details);
+    for (const name of ["approve", "decline"]) {
+      const button = document.createElement("button");
+      button.textContent =
+        name === "approve"
+          ? getLanguage() === "zh"
+            ? "仅批准本次"
+            : "Approve once"
+          : tr("decline");
+      button.disabled = approvalInFlight.has(entry.id);
+      if (name === "decline") button.className = "danger";
+      button.onclick = () =>
+        run(async () => {
+          if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
+          if (approvalInFlight.has(entry.id)) return;
+          approvalInFlight.add(entry.id);
+          renderApprovals();
+          try {
+            await command({ command: name, id: entry.id });
+          } finally {
+            approvalInFlight.delete(entry.id);
+            await refreshApprovals();
+          }
+        });
+      box.append(button);
+    }
+    tray.append(box);
+  }
+}
+async function refreshApprovals() {
+  if (demoMode) return;
+  const generation = ++approvalGeneration;
+  const result = await command({ command: "pending" }, false);
+  if (generation !== approvalGeneration) return;
+  approvalSnapshot = Array.isArray(result.requests) ? result.requests : [];
+  renderApprovals();
+}
 function approval(name) {
   const id = Number($("approvalId").value);
   if (!Number.isSafeInteger(id) || id < 0) throw new Error(tr("validRequestId"));
@@ -6992,7 +7080,7 @@ $("currentBtn").onclick = () =>
     await openThread(r.thread);
   });
 $("tailBtn").onclick = () => run(() => command({ command: "tail" }));
-$("pendingBtn").onclick = () => run(() => command({ command: "pending" }));
+$("pendingBtn").onclick = () => run(refreshApprovals);
 $("applyLastBtn").onclick = () => {
   state.pageSize = Number($("lastCount").value);
   run(refreshThread);
@@ -7479,3 +7567,5 @@ setInterval(() => {
 }, 5000);
 setInterval(() => refreshTaskOverviews().catch(() => {}), 1500);
 setInterval(() => refreshComposerStatus().catch(() => {}), 60000);
+
+setInterval(() => refreshApprovals().catch(() => {}), 2000);
