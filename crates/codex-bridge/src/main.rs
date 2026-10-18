@@ -6504,25 +6504,80 @@ fn app_server_tools_for_messages(
         }
     }
 
+    let mut subagent_names = HashMap::<String, String>::new();
+    let scanned = scan_app_server_tools_for_messages(
+        &wanted,
+        |cursor| {
+            write_backend.app_server_rpc(
+                "thread/items/list",
+                json!({
+                    "threadId": thread_id,
+                    "cursor": cursor,
+                    "limit": 100,
+                    "sortDirection": "desc",
+                }),
+            )
+        },
+        |item| subagent_activity_identity(write_backend, item, &mut subagent_names),
+    )?;
+    if let Ok(mut cache) = cache.threads.write() {
+        let entry = cache
+            .entry(thread_id.to_owned())
+            .or_insert_with(|| CachedAppServerTools {
+                known_message_ids: HashSet::new(),
+                tools: HashMap::new(),
+            });
+        // A page limit or an incomplete turn must not make a partial/empty observation
+        // a permanent cache hit. Leading SDK-only tools may be on the next page.
+        entry.known_message_ids.retain(|id| !wanted.contains(id));
+        entry.known_message_ids.extend(scanned.complete_message_ids);
+        entry.tools.extend(scanned.tools.clone());
+    }
+    Ok(scanned.tools)
+}
+
+struct ScannedAppServerTools {
+    tools: HashMap<String, Vec<ThreadToolCall>>,
+    complete_message_ids: HashSet<String>,
+}
+
+fn attach_leading_app_server_tools(
+    wanted: &HashSet<String>,
+    anchor: Option<&str>,
+    pending: &mut Vec<ThreadToolCall>,
+    tools: &mut HashMap<String, Vec<ThreadToolCall>>,
+) {
+    if let Some(id) = anchor.filter(|id| wanted.contains(*id)) {
+        // Descending SDK items normally attach to the preceding commentary. Before
+        // the first assistant item in a turn there is no such host: retain those
+        // tools on that first assistant rather than silently dropping SDK-only media.
+        pending.reverse();
+        let mut leading = std::mem::take(pending);
+        let existing = tools.entry(id.to_owned()).or_default();
+        leading.append(existing);
+        *existing = leading;
+    } else {
+        pending.clear();
+    }
+}
+
+fn scan_app_server_tools_for_messages(
+    wanted: &HashSet<String>,
+    mut read_page: impl FnMut(Option<String>) -> Result<Value, BackendFailure>,
+    mut subagent_identity: impl FnMut(&Value) -> Option<(String, String)>,
+) -> Result<ScannedAppServerTools, BackendFailure> {
     let mut tools = HashMap::<String, Vec<ThreadToolCall>>::new();
-    let mut found = HashSet::<String>::new();
+    let mut complete_message_ids = HashSet::<String>::new();
+    let mut turn_message_ids = HashSet::<String>::new();
     let mut cursor = None::<String>;
     let mut seen_cursors = HashSet::new();
     let mut pending_tools = Vec::<ThreadToolCall>::new();
-    let mut current_turn = None::<String>;
+    let mut current_turn = None::<Option<String>>;
+    let mut first_assistant = None::<String>;
     let mut latest_activities = HashSet::<String>::new();
     let mut recent_subagent = None::<(String, String)>;
-    let mut subagent_names = HashMap::<String, String>::new();
     for _ in 0..MAX_APP_SERVER_TOOL_PAGES {
-        let result = write_backend.app_server_rpc(
-            "thread/items/list",
-            json!({
-                "threadId": thread_id,
-                "cursor": cursor,
-                "limit": 100,
-                "sortDirection": "desc",
-            }),
-        )?;
+        let result = read_page(cursor.clone())?;
         let entries = result
             .get("data")
             .and_then(Value::as_array)
@@ -6531,32 +6586,46 @@ fn app_server_tools_for_messages(
                 message: "thread/items/list returned no item data".to_owned(),
             })?;
         for entry in entries {
-            let turn_id = entry.get("turnId").and_then(Value::as_str);
+            let turn_id = entry
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             if current_turn
-                .as_deref()
-                .is_some_and(|current| Some(current) != turn_id)
+                .as_ref()
+                .is_some_and(|current| current != &turn_id)
             {
-                pending_tools.clear();
+                attach_leading_app_server_tools(
+                    wanted,
+                    first_assistant.as_deref(),
+                    &mut pending_tools,
+                    &mut tools,
+                );
+                complete_message_ids.extend(turn_message_ids.drain());
+                if wanted.is_subset(&complete_message_ids) {
+                    return Ok(ScannedAppServerTools {
+                        tools,
+                        complete_message_ids,
+                    });
+                }
+                first_assistant = None;
                 recent_subagent = None;
             }
-            current_turn = turn_id.map(str::to_owned);
+            current_turn = Some(turn_id);
             let Some(item) = entry.get("item") else {
                 continue;
             };
             if item.get("type").and_then(Value::as_str) == Some("subAgentActivity") {
-                recent_subagent =
-                    subagent_activity_identity(write_backend, item, &mut subagent_names);
+                recent_subagent = subagent_identity(item);
                 continue;
             }
             if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    if wanted.contains(id) {
-                        pending_tools.reverse();
-                        tools.insert(id.to_owned(), std::mem::take(&mut pending_tools));
-                        found.insert(id.to_owned());
-                    } else {
-                        pending_tools.clear();
-                    }
+                first_assistant = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                if let Some(id) = first_assistant.as_deref().filter(|id| wanted.contains(*id)) {
+                    pending_tools.reverse();
+                    tools.insert(id.to_owned(), std::mem::take(&mut pending_tools));
+                    turn_message_ids.insert(id.to_owned());
+                } else {
+                    pending_tools.clear();
                 }
                 continue;
             }
@@ -6570,14 +6639,18 @@ fn app_server_tools_for_messages(
                 pending_tools.push(tool);
             }
         }
-        if found.len() == wanted.len() {
-            break;
-        }
         let Some(next) = result
             .get("nextCursor")
             .and_then(Value::as_str)
             .map(str::to_owned)
         else {
+            attach_leading_app_server_tools(
+                wanted,
+                first_assistant.as_deref(),
+                &mut pending_tools,
+                &mut tools,
+            );
+            complete_message_ids.extend(turn_message_ids.drain());
             break;
         };
         if !seen_cursors.insert(next.clone()) {
@@ -6588,17 +6661,10 @@ fn app_server_tools_for_messages(
         }
         cursor = Some(next);
     }
-    if let Ok(mut cache) = cache.threads.write() {
-        let entry = cache
-            .entry(thread_id.to_owned())
-            .or_insert_with(|| CachedAppServerTools {
-                known_message_ids: HashSet::new(),
-                tools: HashMap::new(),
-            });
-        entry.known_message_ids.extend(wanted.iter().cloned());
-        entry.tools.extend(tools.clone());
-    }
-    Ok(tools)
+    Ok(ScannedAppServerTools {
+        tools,
+        complete_message_ids,
+    })
 }
 
 fn overlay_app_server_tools(
@@ -14236,6 +14302,168 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             std::slice::from_mut(message),
             &HashMap::from([("overlay-message".to_owned(), tools)]),
         )
+    }
+
+    fn scan_fixture_tool_pages(wanted: &[&str], pages: Vec<Value>) -> ScannedAppServerTools {
+        let wanted = wanted.iter().map(|id| (*id).to_owned()).collect();
+        let mut pages = pages.into_iter();
+        scan_app_server_tools_for_messages(
+            &wanted,
+            |_| Ok(pages.next().expect("unexpected extra SDK page read")),
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn app_server_tool_overlay_keeps_sdk_only_mcp_image_before_the_first_assistant() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1EAAAAASUVORK5CYII=";
+        // Exact Codex 0.163 descending shape: no pre-tool assistant commentary.
+        let scanned = scan_fixture_tool_pages(
+            &["final-message"],
+            vec![json!({"data":[
+            {"turnId":"turn-a","item":{"type":"agentMessage","id":"final-message","text":"Done."}},
+            {"turnId":"turn-a","item":{"type":"mcpToolCall","id":"sdk-image-child","server":"fixture","tool":"render_image","status":"completed","result":{"content":[
+                {"type":"text","text":"Synthetic image fixture"},
+                {"type":"image","mimeType":"image/png","data":png}
+            ]}}},
+            {"turnId":"turn-a","item":{"type":"reasoning","id":"reasoning-a"}},
+            {"turnId":"turn-a","item":{"type":"userMessage","id":"user-a","content":[]}}
+        ],"nextCursor":null})],
+        );
+        assert!(scanned.complete_message_ids.contains("final-message"));
+        let typed = &scanned.tools["final-message"];
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].call_id, "sdk-image-child");
+        assert!(typed[0].has_image);
+        assert_eq!(
+            typed[0].output.as_ref().unwrap()["result"]["content"][1]["data"],
+            png
+        );
+        let mut message = overlay_fixture_message(vec![]);
+        message.id = Some("final-message".into());
+        message.turn_id = Some("turn-a".into());
+        message.phase = Some("final_answer".into());
+        let original = message.clone();
+        assert_eq!(
+            overlay_app_server_tools(std::slice::from_mut(&mut message), &scanned.tools),
+            1
+        );
+        let compact = compact_web_message_page(&[message], 3);
+        assert_eq!(compact[0]["tools"][0]["call_id"], "sdk-image-child");
+        assert_eq!(compact[0]["tools"][0]["has_image"], true);
+        let detailed = overlaid_tool_content(original, Some(&scanned.tools), 0).unwrap();
+        assert_eq!(detailed.call_id, "sdk-image-child");
+        assert_eq!(
+            detailed.output.as_ref().unwrap()["result"]["content"][1]["data"],
+            png
+        );
+    }
+
+    #[test]
+    fn app_server_tool_overlay_preserves_commentary_groups_and_prefixes_only_leading_tools() {
+        let scanned = scan_fixture_tool_pages(
+            &["final-message", "commentary"],
+            vec![json!({"data":[
+            {"turnId":"turn-a","item":{"type":"agentMessage","id":"final-message"}},
+            {"turnId":"turn-a","item":{"type":"sleep","id":"after-commentary","durationMs":200}},
+            {"turnId":"turn-a","item":{"type":"agentMessage","id":"commentary"}},
+            {"turnId":"turn-a","item":{"type":"sleep","id":"before-commentary","durationMs":100}},
+            {"turnId":"turn-a","item":{"type":"userMessage","id":"user-a"}}
+        ],"nextCursor":null})],
+        );
+        assert!(scanned.tools["final-message"].is_empty());
+        assert_eq!(
+            scanned.tools["commentary"]
+                .iter()
+                .map(|tool| tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before-commentary", "after-commentary"]
+        );
+    }
+
+    #[test]
+    fn app_server_tool_overlay_finishes_the_turn_across_pages_before_caching_an_empty_final() {
+        let scanned = scan_fixture_tool_pages(
+            &["final-message"],
+            vec![
+                json!({"data":[{"turnId":"turn-a","item":{"type":"agentMessage","id":"final-message"}}],"nextCursor":"page-two"}),
+                json!({"data":[
+                {"turnId":"turn-a","item":{"type":"imageView","id":"sdk-image-child","path":"/workspace/fixture.png"}},
+                {"turnId":"turn-a","item":{"type":"userMessage","id":"user-a"}}
+            ],"nextCursor":null}),
+            ],
+        );
+        assert_eq!(scanned.tools["final-message"][0].call_id, "sdk-image-child");
+        assert!(scanned.tools["final-message"][0].has_image);
+        assert!(scanned.complete_message_ids.contains("final-message"));
+    }
+
+    #[test]
+    fn app_server_tool_overlay_never_moves_tools_across_turns_or_unrequested_assistants() {
+        let scanned = scan_fixture_tool_pages(
+            &["final-message"],
+            vec![json!({"data":[
+            {"turnId":"turn-a","item":{"type":"agentMessage","id":"final-message"}},
+            {"turnId":"turn-a","item":{"type":"sleep","id":"belongs-to-commentary","durationMs":200}},
+            {"turnId":"turn-a","item":{"type":"agentMessage","id":"unrequested-commentary"}},
+            {"turnId":"turn-a","item":{"type":"sleep","id":"leading-unrequested","durationMs":100}},
+            {"turnId":"turn-older","item":{"type":"imageView","id":"other-turn-image","path":"/workspace/other.png"}}
+        ],"nextCursor":"must-not-be-read"})],
+        );
+        assert_eq!(scanned.tools.len(), 1);
+        assert!(scanned.tools["final-message"].is_empty());
+        assert_eq!(
+            scanned.complete_message_ids,
+            HashSet::from(["final-message".to_owned()])
+        );
+    }
+
+    #[test]
+    fn app_server_tool_overlay_flushes_orphans_before_crossing_into_an_older_turn() {
+        let scanned = scan_fixture_tool_pages(
+            &["final-message", "older-final"],
+            vec![json!({"data":[
+            {"turnId":"turn-a","item":{"type":"agentMessage","id":"final-message"}},
+            {"turnId":"turn-a","item":{"type":"imageView","id":"image-a","path":"/workspace/first.png"}},
+            {"turnId":"turn-older","item":{"type":"agentMessage","id":"older-final"}},
+            {"turnId":"turn-older","item":{"type":"imageView","id":"image-older","path":"/workspace/older.png"}}
+        ],"nextCursor":null})],
+        );
+        assert_eq!(
+            scanned.tools["final-message"]
+                .iter()
+                .map(|t| t.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image-a"]
+        );
+        assert_eq!(
+            scanned.tools["older-final"]
+                .iter()
+                .map(|t| t.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image-older"]
+        );
+        assert_eq!(scanned.complete_message_ids.len(), 2);
+    }
+
+    #[test]
+    fn app_server_tool_overlay_does_not_negative_cache_a_turn_truncated_by_the_page_bound() {
+        let pages = (0..MAX_APP_SERVER_TOOL_PAGES)
+            .map(|index| {
+                json!({
+                    "data":[{"turnId":"turn-a","item":if index == 0 {
+                        json!({"type":"agentMessage","id":"final-message"})
+                    } else {
+                        json!({"type":"reasoning","id":format!("reasoning-{index}")})
+                    }}],
+                    "nextCursor":format!("page-{}",index+1)
+                })
+            })
+            .collect();
+        let scanned = scan_fixture_tool_pages(&["final-message"], pages);
+        assert!(scanned.tools["final-message"].is_empty());
+        assert!(!scanned.complete_message_ids.contains("final-message"));
     }
 
     #[test]
