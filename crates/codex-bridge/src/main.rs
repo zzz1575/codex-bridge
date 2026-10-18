@@ -5740,6 +5740,85 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
     })
 }
 
+// Only the old mobile client's pure directory patch is promoted to relocation. Mixed
+// settings requests must remain untouched, including explicitly null extra fields.
+fn legacy_thread_cwd_request(method: &str, params: &Value) -> Option<Request> {
+    if method != "thread/settings/update" {
+        return None;
+    }
+    let fields = params.as_object()?;
+    if fields.len() != 2 {
+        return None;
+    }
+    let thread_id = fields.get("threadId")?.as_str()?;
+    let cwd = fields.get("cwd")?.as_str()?;
+    if thread_id.trim().is_empty() || cwd.is_empty() {
+        return None;
+    }
+    Some(Request::ThreadCwdUpdate {
+        thread_id: thread_id.to_owned(),
+        cwd: PathBuf::from(cwd),
+    })
+}
+
+fn legacy_thread_cwd_response(response: Response) -> Response {
+    if !response.ok {
+        return response;
+    }
+    let Some(Value::Object(mut relocation)) = response.result else {
+        return Response::error("app_server_protocol_error", "relocation returned no result");
+    };
+    let Some(backend) = relocation.remove("backend") else {
+        return Response::error(
+            "app_server_protocol_error",
+            "relocation returned no settings result",
+        );
+    };
+    Response::success(json!({
+        "action": "app_server_rpc",
+        "method": "thread/settings/update",
+        "result": backend,
+        "relocation": relocation,
+    }))
+}
+
+fn sync_relocated_project(
+    thread_id: &str,
+    project_id: Option<&str>,
+    mut rpc: impl FnMut(&str, Value) -> Result<Value, BackendFailure>,
+) -> Result<(), BackendFailure> {
+    // Codex 0.163: an empty string clears membership; null leaves it unchanged.
+    let result = rpc(
+        "thread/metadata/update",
+        json!({"threadId": thread_id, "projectId": project_id.unwrap_or("")}),
+    )?;
+    let applied = result.pointer("/thread/projectId");
+    let membership_matches = match project_id {
+        Some(expected) => applied.and_then(Value::as_str) == Some(expected),
+        None => applied.is_some_and(|value| value.is_null() || value.as_str() == Some("")),
+    };
+    if result.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id)
+        || !membership_matches
+    {
+        return Err(BackendFailure {
+            code: "app_server_protocol_error",
+            message: "thread/metadata/update did not confirm the requested project membership"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn relocation_membership_error(target: &Path, error: BackendFailure) -> Response {
+    Response::error(
+        "thread_relocation_incomplete",
+        format!(
+            "session directory changed to {}, but project membership synchronization failed ({}: {}); refresh the session before retrying",
+            target.display(), error.code, error.message,
+        ),
+    )
+}
+
 fn relocated_workspace_roots(thread: &Value, old_cwd: &Path, target: &Path) -> Vec<PathBuf> {
     let mut roots = thread
         .get("environments")
@@ -8599,6 +8678,26 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             let Some(old_cwd) = before.pointer("/thread/cwd").and_then(Value::as_str) else {
                 return Response::error("app_server_protocol_error", "thread/read returned no cwd");
             };
+            if before
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                == Some("active")
+            {
+                return Response::error(
+                    "thread_busy",
+                    "wait for the current turn to finish before changing the session directory",
+                );
+            }
+            // Resolve the destination before changing cwd, so a failed project query is harmless.
+            let projects = match app_server_list_all(
+                write_backend,
+                "project/list",
+                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+            ) {
+                Ok(projects) => projects,
+                Err(error) => return write_backend_error(error),
+            };
+            let project_id = project_id_for_path(&json!({"data": projects}), &target);
             let workspace_roots =
                 relocated_workspace_roots(&before["thread"], Path::new(old_cwd), &target);
             if before
@@ -8618,12 +8717,13 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     return write_backend_error(error);
                 }
             }
-            if let Err(error) = write_backend.app_server_rpc(
+            let settings_result = match write_backend.app_server_rpc(
                 "thread/settings/update",
                 json!({"threadId": thread_id, "cwd": target}),
             ) {
-                return write_backend_error(error);
-            }
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
             let after = match write_backend.app_server_rpc(
                 "thread/read",
                 json!({"threadId": thread_id, "includeTurns": false}),
@@ -8654,34 +8754,31 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 })
                 .filter_map(Value::as_str)
                 .any(|root| target.starts_with(root));
-            let project_id = app_server_list_all(
-                write_backend,
-                "project/list",
-                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
-            )
-            .ok()
-            .and_then(|projects| project_id_for_path(&json!({"data": projects}), &target));
-            let project_assigned = if let Some(project_id) = &project_id {
-                write_backend
-                    .app_server_rpc(
-                        "thread/metadata/update",
-                        json!({"threadId": thread_id, "projectId": project_id}),
-                    )
-                    .is_ok()
-            } else {
-                false
-            };
+            // Keep the actual execution directory visible even when metadata synchronization
+            // fails after the settings mutation has already taken effect.
             if let Ok(mut cached) = app_server_projects.index.write() {
                 *cached = None;
             }
             session_store.set_thread_cwd(&thread_id, target.clone());
+            let membership =
+                sync_relocated_project(&thread_id, project_id.as_deref(), |method, params| {
+                    write_backend.app_server_rpc(method, params)
+                });
             let _ = write_backend.watch_thread(&thread_id);
+            if let Err(error) = membership {
+                return relocation_membership_error(&target, error);
+            }
+            if let Ok(mut cached) = app_server_projects.index.write() {
+                *cached = None;
+            }
             Response::success(json!({
                 "action": "thread_cwd_update",
                 "thread_id": thread_id,
                 "old_cwd": old_cwd,
                 "cwd": target,
-                "project_assigned": project_assigned,
+                "project_assigned": project_id.is_some(),
+                "project_cleared": project_id.is_none(),
+                "backend": settings_result,
                 "workspace_roots_applied": workspace_roots_applied,
             }))
         }
@@ -9389,6 +9486,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "invalid_request",
                     "the bridge manages app-server initialization automatically",
                 );
+            }
+            if let Some(relocation) = legacy_thread_cwd_request(&method, &params) {
+                return legacy_thread_cwd_response(dispatch(relocation, state));
             }
             match write_backend.app_server_rpc(&method, params) {
                 Ok(result) => Response::success(json!({
@@ -10614,6 +10714,172 @@ mod tests {
             &json!({"data":[{"id":"new", "status":"completed", "itemsView":"full", "items":[]}]})
         )
         .is_none());
+    }
+
+    #[test]
+    fn relocation_legacy_exact_shape_uses_the_guarded_dedicated_request() {
+        let request = legacy_thread_cwd_request(
+            "thread/settings/update",
+            &json!({"threadId":"thread-1", "cwd":"/workspace/project with spaces"}),
+        );
+        assert!(
+            matches!(request, Some(Request::ThreadCwdUpdate { thread_id, cwd })
+            if thread_id == "thread-1" && cwd == Path::new("/workspace/project with spaces"))
+        );
+    }
+
+    #[test]
+    fn relocation_legacy_mixed_settings_including_null_are_never_intercepted() {
+        for (field, value) in [
+            ("model", json!("model-1")),
+            ("effort", json!("high")),
+            ("model", Value::Null),
+            ("effort", Value::Null),
+            ("approvalPolicy", json!("never")),
+            ("runtimeWorkspaceRoots", json!(["/workspace/shared"])),
+            ("futureSetting", Value::Null),
+        ] {
+            let mut params = json!({"threadId":"thread-1", "cwd":"/workspace/project"});
+            params[field] = value;
+            assert!(legacy_thread_cwd_request("thread/settings/update", &params).is_none());
+        }
+    }
+
+    #[test]
+    fn relocation_legacy_wrong_method_or_malformed_shape_stays_native() {
+        let valid = json!({"threadId":"thread-1", "cwd":"/workspace/project"});
+        assert!(legacy_thread_cwd_request("thread/resume", &valid).is_none());
+        for params in [
+            Value::Null,
+            json!([]),
+            json!({"threadId":"thread-1"}),
+            json!({"threadId":null, "cwd":"/workspace/project"}),
+            json!({"threadId":"thread-1", "cwd":null}),
+            json!({"threadId":" ", "cwd":"/workspace/project"}),
+            json!({"threadId":"thread-1", "cwd":""}),
+        ] {
+            assert!(legacy_thread_cwd_request("thread/settings/update", &params).is_none());
+        }
+    }
+
+    #[test]
+    fn relocation_legacy_success_preserves_native_envelope_and_real_settings_ack() {
+        let response = legacy_thread_cwd_response(Response::success(json!({
+            "action":"thread_cwd_update", "thread_id":"thread-1",
+            "cwd":"/workspace/real-project", "project_assigned":true,
+            "project_cleared":false, "workspace_roots_applied":true,
+            "backend":{"nativeAck":"retained"},
+        })));
+        assert!(response.ok);
+        let result = response.result.unwrap();
+        assert_eq!(result["action"], "app_server_rpc");
+        assert_eq!(result["method"], "thread/settings/update");
+        assert_eq!(result["result"], json!({"nativeAck":"retained"}));
+        assert_eq!(result["relocation"]["cwd"], "/workspace/real-project");
+        assert_eq!(result["relocation"]["project_assigned"], true);
+        assert!(result["relocation"].get("backend").is_none());
+    }
+
+    #[test]
+    fn relocation_legacy_failure_is_preserved_without_a_second_attempt() {
+        for code in [
+            "thread_writer_not_owned",
+            "thread_busy",
+            "thread_relocation_incomplete",
+        ] {
+            let original = Response::error(code, "synthetic failure");
+            assert_eq!(legacy_thread_cwd_response(original.clone()), original);
+        }
+    }
+
+    #[test]
+    fn relocation_project_assignment_is_verified_from_the_native_response() {
+        let mut requests = Vec::new();
+        sync_relocated_project("thread-1", Some("project-2"), |method, params| {
+            requests.push((method.to_owned(), params));
+            Ok(json!({"thread":{"id":"thread-1", "projectId":"project-2"}}))
+        })
+        .unwrap();
+        assert_eq!(
+            requests,
+            vec![(
+                "thread/metadata/update".to_owned(),
+                json!({"threadId":"thread-1", "projectId":"project-2"})
+            )]
+        );
+    }
+
+    #[test]
+    fn relocation_chats_clear_uses_empty_string_not_null() {
+        for cleared in [Value::Null, json!("")] {
+            let mut requests = Vec::new();
+            sync_relocated_project("thread-1", None, |method, params| {
+                requests.push((method.to_owned(), params));
+                Ok(json!({"thread":{"id":"thread-1", "projectId":cleared}}))
+            })
+            .unwrap();
+            assert_eq!(
+                requests,
+                vec![(
+                    "thread/metadata/update".to_owned(),
+                    json!({"threadId":"thread-1", "projectId":""})
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_metadata_failure_is_not_retried_or_reported_as_success() {
+        let mut attempts = 0;
+        let error = sync_relocated_project("thread-1", None, |_, _| {
+            attempts += 1;
+            Err(BackendFailure {
+                code: "app_server_rejected",
+                message: "synthetic refusal".to_owned(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        let response = relocation_membership_error(Path::new("/workspace/new-project"), error);
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "thread_relocation_incomplete");
+        assert!(error
+            .message
+            .contains("directory changed to /workspace/new-project"));
+        assert!(error.message.contains("refresh the session"));
+    }
+
+    #[test]
+    fn relocation_metadata_ack_must_confirm_the_same_thread_and_membership() {
+        for (target, result) in [
+            (
+                None,
+                json!({"thread":{"id":"thread-1", "projectId":"old-project"}}),
+            ),
+            (None, json!({"thread":{"id":"thread-1"}})),
+            (
+                None,
+                json!({"thread":{"id":"other-thread", "projectId":null}}),
+            ),
+            (
+                Some("new-project"),
+                json!({"thread":{"id":"thread-1", "projectId":null}}),
+            ),
+            (
+                Some("new-project"),
+                json!({"thread":{"id":"thread-1", "projectId":"old-project"}}),
+            ),
+        ] {
+            let mut attempts = 0;
+            let error = sync_relocated_project("thread-1", target, |_, _| {
+                attempts += 1;
+                Ok(result.clone())
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "app_server_protocol_error");
+            assert_eq!(attempts, 1);
+        }
     }
 
     #[test]
