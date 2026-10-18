@@ -4219,6 +4219,7 @@ async fn web_file_preview(
     };
     let store = Arc::clone(&state.bridge.session_store);
     let write_backend = Arc::clone(&state.bridge.write_backend);
+    let app_server_tools = Arc::clone(&state.bridge.app_server_tools);
     let visible_directories = Arc::clone(&state.visible_directories);
     let resolved = tokio::task::spawn_blocking(move || {
         let thread = store
@@ -4281,10 +4282,20 @@ async fn web_file_preview(
                 else {
                     return Err(FileDownloadFailure::OutsideWorkspace);
                 };
-                let message = store
+                let mut message = store
                     .read_message(&request.thread_id, message_index)
                     .map_err(|_| FileDownloadFailure::FileNotFound)?
                     .ok_or(FileDownloadFailure::FileNotFound)?;
+                // Generated images may exist only in the typed history. Apply the
+                // same overlay used by message pages before resolving its index.
+                if let Ok(tools) = app_server_tools_for_messages(
+                    &write_backend,
+                    &app_server_tools,
+                    &request.thread_id,
+                    std::slice::from_ref(&message),
+                ) {
+                    overlay_app_server_tools(std::slice::from_mut(&mut message), &tools);
+                }
                 let tool = message
                     .tools
                     .get(tool_index)
@@ -4361,12 +4372,15 @@ async fn web_file_preview(
 }
 
 fn tool_authorizes_image_path(tool: &ThreadToolCall, requested: &str) -> bool {
-    tool.name == "view_image"
-        && tool
-            .input
-            .get("path")
-            .and_then(Value::as_str)
-            .is_some_and(|path| path == requested)
+    tool_image_path(tool).is_some_and(|path| path == requested)
+}
+
+fn tool_image_path(tool: &ThreadToolCall) -> Option<&str> {
+    match tool.name.as_str() {
+        "view_image" => tool.input.get("path")?.as_str(),
+        "image_generation" => tool.input.get("savedPath")?.as_str(),
+        _ => None,
+    }
 }
 
 fn issue_download_ticket(
@@ -5914,17 +5928,33 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
         },
         "webSearch" => "web_search".to_owned(),
         "imageView" => "view_image".to_owned(),
+        "sleep" => "clock.sleep".to_owned(),
+        "imageGeneration" => "image_generation".to_owned(),
+        "functionCallOutput" => match (
+            item.get("namespace").and_then(Value::as_str),
+            item.get("name").and_then(Value::as_str),
+        ) {
+            (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
+            (_, Some(name)) => name.to_owned(),
+            _ => return None,
+        },
         "collabAgentToolCall" => item
             .get("tool")
             .and_then(Value::as_str)
             .unwrap_or("collab_agent")
             .to_owned(),
-        _ => return None,
+        // These are messages or lifecycle metadata, not independent tool calls.
+        "userMessage" | "hookPrompt" | "agentMessage" | "plan" | "reasoning"
+        | "subAgentActivity" | "enteredReviewMode" | "exitedReviewMode" | "contextCompaction" => {
+            return None
+        }
+        // Keep future extension items inspectable instead of silently erasing them.
+        _ => item_type.to_owned(),
     };
     let call_id = item
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or(item_type)
+        .filter(|id| !id.is_empty())?
         .to_owned();
     let status = item
         .get("status")
@@ -5941,6 +5971,15 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
             input.insert("path".to_owned(), Value::String(path));
         }
     }
+    if item_type == "imageGeneration" {
+        if let Some(path) = input
+            .get("savedPath")
+            .and_then(Value::as_str)
+            .and_then(normalize_local_image_path)
+        {
+            input.insert("savedPath".to_owned(), Value::String(path));
+        }
+    }
     let mut output = serde_json::Map::new();
     input.remove("id");
     input.remove("status");
@@ -5952,22 +5991,63 @@ fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
         "error",
         "contentItems",
         "success",
+        "output",
+        "failure",
+        "results",
     ] {
+        if field == "durationMs" && item_type == "sleep" {
+            continue;
+        }
         if let Some(value) = input.remove(field) {
             if !value.is_null() {
                 output.insert(field.to_owned(), value);
             }
         }
     }
+    if item_type == "imageGeneration" {
+        if let Some(result) = output.get("result").and_then(Value::as_str) {
+            // Official image-generation results may be a data URL or raw base64.
+            // Only turn strict image data into media; keep other results as text.
+            let image_url = if result.starts_with("data:image/") {
+                Some(result.to_owned())
+            } else {
+                (!result.is_empty()
+                    && result.len() <= 44 * 1024 * 1024
+                    && result
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte)))
+                .then(|| BASE64_STANDARD.decode(result).ok())
+                .flatten()
+                .and_then(|bytes| infer::get(&bytes).map(|kind| kind.mime_type()))
+                .filter(|mime| {
+                    matches!(
+                        *mime,
+                        "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/avif"
+                    )
+                })
+                .map(|mime| format!("data:{mime};base64,{result}"))
+            };
+            if let Some(image_url) = image_url {
+                output.insert("image_url".to_owned(), Value::String(image_url));
+            }
+        }
+    }
+    if web_value_contains_image(item) && !output.values().any(web_value_contains_image) {
+        // Preserve media carried by a future extension in its opaque payload too.
+        output.insert("item".to_owned(), item.clone());
+    }
+    let has_image = item_type == "imageView"
+        || (item_type == "imageGeneration"
+            && input.get("savedPath").and_then(Value::as_str).is_some())
+        || output.contains_key("image_url")
+        || output.values().any(web_value_contains_image);
     Some(ThreadToolCall {
         call_id,
         name,
         status,
         input: Value::Object(input),
         output: (!output.is_empty()).then_some(Value::Object(output)),
-        // ImageView identifies its image by path, so it remains an image tool
-        // even when app-server does not attach image bytes to the item.
-        has_image: item_type == "imageView",
+        has_image,
     })
 }
 
@@ -6308,10 +6388,284 @@ fn overlay_app_server_tools(
         let Some(typed) = tools.get(id) else {
             continue;
         };
-        message.tools.clone_from(typed);
-        replaced += 1;
+        if typed.is_empty() {
+            continue;
+        }
+        let previous = message.tools.clone();
+        let mut used = vec![false; typed.len()];
+        let mut merged = Vec::with_capacity(previous.len().max(typed.len()));
+        for rollout in &previous {
+            let matched = typed
+                .iter()
+                .enumerate()
+                .find(|(index, tool)| !used[*index] && tool.call_id == rollout.call_id)
+                .or_else(|| {
+                    let fingerprint = tool_overlay_fingerprint(rollout)?;
+                    typed.iter().enumerate().find(|(index, tool)| {
+                        !used[*index]
+                            && !output_only_tool(tool)
+                            && tool_overlay_fingerprint(tool).as_ref() == Some(&fingerprint)
+                    })
+                });
+            if let Some((index, tool)) = matched {
+                used[index] = true;
+                merged.push(if output_only_tool(tool) {
+                    merge_tool_observation(rollout, tool)
+                } else {
+                    merge_tool_observation(tool, rollout)
+                });
+            } else {
+                merged.push(rollout.clone());
+            }
+        }
+        for (index, tool) in typed.iter().enumerate() {
+            if used[index] || output_only_tool(tool) {
+                continue;
+            }
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|entry| entry.call_id == tool.call_id)
+            {
+                *existing = if output_only_tool(tool) {
+                    merge_tool_observation(existing, tool)
+                } else {
+                    merge_tool_observation(tool, existing)
+                };
+            } else if !output_only_tool(tool) {
+                merged.push(tool.clone());
+            }
+        }
+        // Process output observations after parent calls, independent of page order.
+        // Their IDs never imply new independent invocations.
+        for tool in typed.iter().filter(|tool| output_only_tool(tool)) {
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|entry| entry.call_id == tool.call_id)
+            {
+                *existing = merge_tool_observation(existing, tool);
+            }
+        }
+        if merged != previous {
+            message.tools = merged;
+            replaced += 1;
+        }
     }
     replaced
+}
+
+fn output_only_tool(tool: &ThreadToolCall) -> bool {
+    tool.input.get("type").and_then(Value::as_str) == Some("functionCallOutput")
+}
+
+fn overlaid_tool_content(
+    mut message: ThreadMessage,
+    typed_tools: Option<&HashMap<String, Vec<ThreadToolCall>>>,
+    tool_index: usize,
+) -> Option<ThreadToolCall> {
+    if let Some(tools) = typed_tools {
+        overlay_app_server_tools(std::slice::from_mut(&mut message), tools);
+    }
+    message.tools.get(tool_index).cloned()
+}
+
+fn tool_overlay_fingerprint(tool: &ThreadToolCall) -> Option<(String, String)> {
+    let input = if let Some(encoded) = tool.input.as_str() {
+        serde_json::from_str::<Value>(encoded).ok()?
+    } else {
+        tool.input.clone()
+    };
+    let name = tool.name.trim_start_matches("mcp__");
+    let identity = match name {
+        "exec_command" => {
+            let command = input
+                .get("commandActions")
+                .and_then(Value::as_array)
+                .filter(|actions| actions.len() == 1)
+                .and_then(|actions| actions[0].get("command"))
+                .or_else(|| input.get("command"))
+                .or_else(|| input.get("cmd"))?
+                .as_str()?;
+            let command = canonical_overlay_command(command);
+            if command.is_empty() {
+                return None;
+            }
+            // Explicitly different working directories are different executions.
+            let cwd = input
+                .get("cwd")
+                .or_else(|| input.get("workdir"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            json!([command, cwd]).to_string()
+        }
+        "view_image" => normalize_local_image_path(input.get("path")?.as_str()?)?,
+        "clock.sleep" | "sleep" => {
+            let duration = input
+                .get("durationMs")
+                .or_else(|| input.get("duration_ms"))?;
+            return Some(("clock.sleep".to_owned(), duration.as_u64()?.to_string()));
+        }
+        _ => {
+            // Exact arguments identify one invocation only when its tool name is
+            // shared. Unknown extension item payloads never use fuzzy matching.
+            if input
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| !matches!(kind, "mcpToolCall" | "dynamicToolCall"))
+            {
+                return None;
+            }
+            if name == "apply_patch" || name == "image_generation" {
+                return None;
+            }
+            let arguments = input.get("arguments").unwrap_or(&input);
+            if !arguments.is_object() || arguments.as_object()?.is_empty() {
+                return None;
+            }
+            arguments.to_string()
+        }
+    };
+    Some((name.to_owned(), identity))
+}
+
+fn canonical_overlay_command(command: &str) -> &str {
+    let command = command.trim();
+    for shell in [
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+        "/bin/zsh",
+        "bash",
+        "sh",
+        "zsh",
+    ] {
+        for flag in ["-lc", "-c"] {
+            let prefix = format!("{shell} {flag} ");
+            let Some(argument) = command.strip_prefix(&prefix) else {
+                continue;
+            };
+            if let Some(body) = argument
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+            {
+                if !body.contains(['\'', '\\']) {
+                    return body;
+                }
+            }
+            if let Some(body) = argument
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+            {
+                if !body.contains(['"', '\\', '$', '`']) {
+                    return body;
+                }
+            }
+        }
+    }
+    command
+}
+
+fn tool_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed"
+            | "failed"
+            | "interrupted"
+            | "cancelled"
+            | "canceled"
+            | "declined"
+            | "aborted"
+            | "error"
+            | "succeeded"
+            | "success"
+    )
+}
+
+fn merge_tool_observation(primary: &ThreadToolCall, secondary: &ThreadToolCall) -> ThreadToolCall {
+    let mut tool = primary.clone();
+    if !tool_terminal(&tool.status) && tool_terminal(&secondary.status) {
+        tool.status.clone_from(&secondary.status);
+    }
+    if !output_only_tool(secondary) {
+        tool.input = merge_tool_input(&primary.input, &secondary.input);
+    }
+    tool.output = match (&primary.output, &secondary.output) {
+        (Some(primary), Some(secondary)) => Some(merge_tool_value(primary, secondary)),
+        (None, Some(output)) => Some(output.clone()),
+        (output, _) => output.clone(),
+    };
+    tool.has_image |=
+        secondary.has_image || tool.output.as_ref().is_some_and(web_value_contains_image);
+    tool
+}
+
+fn merge_tool_input(primary: &Value, secondary: &Value) -> Value {
+    if primary.is_null() || primary.as_str() == Some("") {
+        return secondary.clone();
+    }
+    let (Some(primary_fields), Some(secondary_fields)) =
+        (primary.as_object(), secondary.as_object())
+    else {
+        return primary.clone();
+    };
+    let mut merged = secondary_fields.clone();
+    for (key, value) in primary_fields {
+        merged.insert(
+            key.clone(),
+            secondary_fields
+                .get(key)
+                .map_or_else(|| value.clone(), |other| merge_tool_input(value, other)),
+        );
+    }
+    Value::Object(merged)
+}
+
+fn merge_tool_value(primary: &Value, secondary: &Value) -> Value {
+    if primary.is_null() || primary.as_str() == Some("") {
+        return secondary.clone();
+    }
+    if secondary.is_null() || secondary == primary {
+        return primary.clone();
+    }
+    if secondary.get("app_server") == Some(primary) {
+        return secondary.clone();
+    }
+    if primary.get("rollout") == Some(secondary) {
+        return primary.clone();
+    }
+    let primary_lazy = primary.get("_codex_bridge_lazy").and_then(Value::as_bool) == Some(true);
+    let secondary_lazy = secondary.get("_codex_bridge_lazy").and_then(Value::as_bool) == Some(true);
+    if primary_lazy != secondary_lazy {
+        return if primary_lazy { secondary } else { primary }.clone();
+    }
+    if let (Some(primary), Some(secondary)) = (primary.as_object(), secondary.as_object()) {
+        let mut merged = secondary.clone();
+        for (key, value) in primary {
+            merged.insert(
+                key.clone(),
+                secondary
+                    .get(key)
+                    .map_or_else(|| value.clone(), |other| merge_tool_value(value, other)),
+            );
+        }
+        return Value::Object(merged);
+    }
+    if let (Some(primary_text), Some(secondary_text)) = (primary.as_str(), secondary.as_str()) {
+        if secondary_text.contains(primary_text) {
+            return secondary.clone();
+        }
+        if primary_text.contains(secondary_text) {
+            return primary.clone();
+        }
+    } else if !primary.is_object()
+        && !secondary.is_object()
+        && !primary.is_array()
+        && !secondary.is_array()
+    {
+        return primary.clone();
+    }
+    // Incompatible observations remain available in details instead of dropping
+    // a rollout output or opaque extension field when the app-server adds data.
+    json!({"app_server":primary,"rollout":secondary})
 }
 
 fn managed_services_snapshot(state: &BridgeState) -> Value {
@@ -7666,14 +8020,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     std::slice::from_ref(&message),
                 )
                 .ok();
-                let typed_tool = message.id.as_ref().and_then(|id| {
-                    typed_tools
-                        .as_ref()
-                        .and_then(|tools| tools.get(id))
-                        .and_then(|tools| tools.get(tool_index as usize))
-                        .cloned()
-                });
-                let tool = typed_tool.or_else(|| message.tools.get(tool_index as usize).cloned());
+                let tool =
+                    overlaid_tool_content(message, typed_tools.as_ref(), tool_index as usize);
                 let Some(tool) = tool else {
                     return Response::error(
                         "tool_content_not_found",
@@ -10172,9 +10520,7 @@ fn compact_tool_summary(tool: &ThreadToolCall, tool_index: usize) -> Value {
                     .collect::<Vec<_>>()
             })
         });
-    let image_path = (tool.name == "view_image")
-        .then(|| tool.input.get("path").and_then(Value::as_str))
-        .flatten();
+    let image_path = tool_image_path(tool);
     json!({
         "tool_index": tool_index,
         "call_id": tool.call_id,
@@ -10245,6 +10591,30 @@ fn compact_tool_bytes(tool: &ThreadToolCall) -> usize {
 }
 
 fn tool_preview(tool: &ThreadToolCall) -> String {
+    if matches!(tool.name.as_str(), "sleep" | "clock.sleep") {
+        return tool
+            .input
+            .get("durationMs")
+            .or_else(|| tool.input.get("duration_ms"))
+            .and_then(Value::as_u64)
+            .map(|duration| format!("等待 {} 秒", duration as f64 / 1000.0))
+            .unwrap_or_else(|| "等待".to_owned());
+    }
+    if tool.name == "image_generation" {
+        return if tool.status == "failed"
+            || tool
+                .output
+                .as_ref()
+                .and_then(|output| output.get("failure"))
+                .is_some_and(|failure| !failure.is_null())
+        {
+            "图片生成失败".to_owned()
+        } else if tool_terminal(&tool.status) {
+            "生成图片".to_owned()
+        } else {
+            "正在生成图片".to_owned()
+        };
+    }
     if tool.name == "write_stdin" {
         return "等待输出".to_owned();
     }
@@ -13260,6 +13630,343 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(tool.input["command"], "git status --short");
         assert_eq!(tool.output.as_ref().unwrap()["aggregatedOutput"], "clean");
         assert_eq!(tool_preview(&tool), "git status --short");
+    }
+
+    fn overlay_fixture_message(tools: Vec<ThreadToolCall>) -> ThreadMessage {
+        ThreadMessage {
+            timestamp: None,
+            id: Some("overlay-message".into()),
+            turn_id: Some("overlay-turn".into()),
+            role: "assistant".into(),
+            phase: Some("commentary".into()),
+            content: vec![json!({"type":"output_text","text":"Preserve this message."})],
+            tools,
+        }
+    }
+
+    fn overlay_fixture_tool(id: &str, name: &str, input: Value) -> ThreadToolCall {
+        ThreadToolCall {
+            call_id: id.into(),
+            name: name.into(),
+            status: "completed".into(),
+            input,
+            output: None,
+            has_image: false,
+        }
+    }
+
+    fn apply_fixture_overlay(message: &mut ThreadMessage, tools: Vec<ThreadToolCall>) -> usize {
+        overlay_app_server_tools(
+            std::slice::from_mut(message),
+            &HashMap::from([("overlay-message".to_owned(), tools)]),
+        )
+    }
+
+    #[test]
+    fn typed_tools_cover_generated_0163_variants_without_turning_messages_into_tools() {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/app-server-0.163.0-thread-items.json"
+        ))
+        .unwrap();
+        for variant in schema
+            .pointer("/definitions/ThreadItem/oneOf")
+            .unwrap()
+            .as_array()
+            .unwrap()
+        {
+            let name = variant
+                .pointer("/properties/type/enum/0")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let tool = typed_thread_tool(
+                &json!({"type":name,"id":"stable-item","name":"custom","durationMs":1500}),
+            );
+            let expected = matches!(
+                name,
+                "commandExecution"
+                    | "fileChange"
+                    | "mcpToolCall"
+                    | "dynamicToolCall"
+                    | "collabAgentToolCall"
+                    | "webSearch"
+                    | "imageView"
+                    | "sleep"
+                    | "imageGeneration"
+                    | "functionCallOutput"
+            );
+            assert_eq!(tool.is_some(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn typed_sleep_keeps_duration_and_readable_summary() {
+        let tool =
+            typed_thread_tool(&json!({"type":"sleep","id":"sleep-one","durationMs":1500})).unwrap();
+        assert_eq!(tool.name, "clock.sleep");
+        assert_eq!(tool.input["durationMs"], 1500);
+        assert_eq!(tool_preview(&tool), "等待 1.5 秒");
+    }
+
+    #[test]
+    fn typed_unknown_extension_preserves_opaque_output_and_media() {
+        let tool = typed_thread_tool(&json!({
+            "type":"futureVisualTool", "id":"future-one", "status":"failed",
+            "opaque":{"newField":[1,2]}, "media":{"image_url":"data:image/png;base64,aGVsbG8="},
+            "result":{"newResult":true},
+        }))
+        .unwrap();
+        assert_eq!(tool.call_id, "future-one");
+        assert_eq!(tool.name, "futureVisualTool");
+        assert_eq!(tool.input["opaque"]["newField"], json!([1, 2]));
+        assert_eq!(tool.output.as_ref().unwrap()["result"]["newResult"], true);
+        assert!(tool.has_image);
+        assert!(web_value_contains_image(tool.output.as_ref().unwrap()));
+        assert!(typed_thread_tool(&json!({"type":"futureVisualTool"})).is_none());
+    }
+
+    #[test]
+    fn generated_image_keeps_result_failure_and_exact_saved_path_authorization() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1EAAAAASUVORK5CYII=";
+        let tool = typed_thread_tool(&json!({
+            "type":"imageGeneration", "id":"generated-one", "status":"completed",
+            "result":png, "savedPath":"/workspace/generated.png", "revisedPrompt":"A tiny image", "failure":null,
+        })).unwrap();
+        assert!(tool.has_image);
+        assert_eq!(tool.output.as_ref().unwrap()["result"], png);
+        assert_eq!(
+            tool.output.as_ref().unwrap()["image_url"],
+            format!("data:image/png;base64,{png}")
+        );
+        assert_eq!(
+            compact_tool_summary(&tool, 0)["image_path"],
+            "/workspace/generated.png"
+        );
+        assert!(tool_authorizes_image_path(
+            &tool,
+            "/workspace/generated.png"
+        ));
+        assert!(!tool_authorizes_image_path(&tool, "/workspace/other.png"));
+        assert!(!tool_authorizes_image_path(&tool, "/etc/passwd"));
+        let failure = typed_thread_tool(&json!({
+            "type":"imageGeneration", "id":"failed-image", "status":"failed", "result":"",
+            "failure":{"type":"usageLimitExceeded","limitId":"images","resetsAt":null}
+        }))
+        .unwrap();
+        assert_eq!(tool_preview(&failure), "图片生成失败");
+        assert_eq!(
+            failure.output.unwrap()["failure"]["type"],
+            "usageLimitExceeded"
+        );
+    }
+
+    #[test]
+    fn empty_overlay_never_clears_rollout_tools_or_message_media() {
+        let mut tool = overlay_fixture_tool("rollout-only", "custom_tool", json!({"unknown":true}));
+        tool.has_image = true;
+        tool.output = Some(json!({"_codex_bridge_lazy":true,"bytes":123}));
+        let mut message = overlay_fixture_message(vec![tool]);
+        let previous = message.clone();
+        assert_eq!(apply_fixture_overlay(&mut message, vec![]), 0);
+        assert_eq!(message, previous);
+    }
+
+    #[test]
+    fn overlay_merges_known_calls_one_to_one_and_retains_unknown_rollout_calls() {
+        let mut original = overlay_fixture_tool(
+            "call-original:0",
+            "exec_command",
+            json!({"command":"sleep 40","cwd":"/workspace","customOption":true}),
+        );
+        original.output = Some(json!({"_codex_bridge_lazy":true,"bytes":123}));
+        let custom = overlay_fixture_tool(
+            "custom-one",
+            "custom_rollout_tool",
+            json!({"payload":"retain"}),
+        );
+        let mut message = overlay_fixture_message(vec![original, custom]);
+        let typed = typed_thread_tool(&json!({
+            "type":"commandExecution","id":"exec-one","command":"/bin/bash -lc 'sleep 40'",
+            "cwd":"/workspace","status":"completed","aggregatedOutput":"finished","commandActions":[]
+        })).unwrap();
+        apply_fixture_overlay(&mut message, vec![typed.clone()]);
+        assert_eq!(message.tools.len(), 2);
+        assert_eq!(message.tools[0].call_id, "exec-one");
+        assert_eq!(message.tools[0].input["customOption"], true);
+        assert_eq!(
+            message.tools[0].input["command"],
+            "/bin/bash -lc 'sleep 40'"
+        );
+        assert_eq!(
+            message.tools[0].output.as_ref().unwrap()["aggregatedOutput"],
+            "finished"
+        );
+        assert_eq!(message.tools[1].call_id, "custom-one");
+        assert_eq!(message.content[0]["text"], "Preserve this message.");
+        let previous = message.clone();
+        assert_eq!(apply_fixture_overlay(&mut message, vec![typed]), 0);
+        assert_eq!(message, previous);
+    }
+
+    #[test]
+    fn overlay_preserves_repeated_executions_and_different_directories() {
+        let mut message = overlay_fixture_message(
+            (0..3)
+                .map(|index| {
+                    overlay_fixture_tool(
+                        &format!("rollout-{index}"),
+                        "exec_command",
+                        json!({"command":"pwd","cwd":"/workspace"}),
+                    )
+                })
+                .collect(),
+        );
+        let typed = (0..2).map(|index| typed_thread_tool(&json!({
+            "type":"commandExecution","id":format!("exec-{index}"),"command":"pwd","cwd":"/workspace","status":"completed"
+        })).unwrap()).collect();
+        apply_fixture_overlay(&mut message, typed);
+        assert_eq!(message.tools.len(), 3);
+        assert_eq!(message.tools[0].call_id, "exec-0");
+        assert_eq!(message.tools[1].call_id, "exec-1");
+        assert_eq!(message.tools[2].call_id, "rollout-2");
+        let other = typed_thread_tool(&json!({
+            "type":"commandExecution","id":"other-cwd","command":"pwd","cwd":"/other","status":"completed"
+        })).unwrap();
+        apply_fixture_overlay(&mut message, vec![other]);
+        assert_eq!(message.tools.len(), 4);
+    }
+
+    #[test]
+    fn overlay_never_regresses_terminal_status_or_longer_output() {
+        let mut original =
+            overlay_fixture_tool("same-call", "exec_command", json!({"command":"test"}));
+        original.status = "failed".into();
+        original.output =
+            Some(json!({"aggregatedOutput":"first line\nsecond line","extraResult":true}));
+        original.has_image = true;
+        let mut message = overlay_fixture_message(vec![original]);
+        let typed = typed_thread_tool(&json!({
+            "type":"commandExecution","id":"same-call","command":"test","status":"inProgress","aggregatedOutput":"first line"
+        })).unwrap();
+        apply_fixture_overlay(&mut message, vec![typed]);
+        assert_eq!(message.tools.len(), 1);
+        assert_eq!(message.tools[0].status, "failed");
+        assert_eq!(
+            message.tools[0].output.as_ref().unwrap()["aggregatedOutput"],
+            "first line\nsecond line"
+        );
+        assert_eq!(
+            message.tools[0].output.as_ref().unwrap()["extraResult"],
+            true
+        );
+        assert!(message.tools[0].has_image);
+    }
+
+    #[test]
+    fn function_output_only_attaches_to_a_known_matching_parent_id() {
+        let output = typed_thread_tool(&json!({
+            "type":"functionCallOutput","id":"parent-one","name":"custom_tool","output":"media result"
+        })).unwrap();
+        let mut orphan = overlay_fixture_message(vec![]);
+        apply_fixture_overlay(&mut orphan, vec![output.clone()]);
+        assert!(orphan.tools.is_empty());
+        let mut parent = overlay_fixture_message(vec![overlay_fixture_tool(
+            "parent-one",
+            "custom_tool",
+            json!({"originalArgument":true}),
+        )]);
+        apply_fixture_overlay(&mut parent, vec![output]);
+        assert_eq!(parent.tools.len(), 1);
+        assert_eq!(parent.tools[0].input["originalArgument"], true);
+        assert_eq!(
+            parent.tools[0].output.as_ref().unwrap()["output"],
+            "media result"
+        );
+        let previous = parent.clone();
+        apply_fixture_overlay(&mut parent, vec![typed_thread_tool(&json!({
+            "type":"functionCallOutput","id":"different-call","name":"custom_tool","output":"other result"
+        })).unwrap()]);
+        assert_eq!(parent, previous);
+    }
+
+    #[test]
+    fn overlay_output_observations_are_order_independent_and_idempotent() {
+        let output = typed_thread_tool(&json!({
+            "type":"functionCallOutput", "id":"parent-one", "name":"custom_tool", "output":"second result"
+        })).unwrap();
+        let mut parent =
+            overlay_fixture_tool("parent-one", "custom_tool", json!({"argument":true}));
+        parent.output = Some(json!({"output":"first result"}));
+        let observations = vec![output, parent];
+        let mut message = overlay_fixture_message(vec![]);
+        apply_fixture_overlay(&mut message, observations.clone());
+        assert_eq!(message.tools.len(), 1);
+        assert_eq!(message.tools[0].input["argument"], true);
+        let encoded = message.tools[0].output.as_ref().unwrap().to_string();
+        assert!(encoded.contains("first result"));
+        assert!(encoded.contains("second result"));
+        let previous = message.clone();
+        apply_fixture_overlay(&mut message, observations);
+        assert_eq!(message, previous);
+    }
+
+    #[test]
+    fn lazy_details_and_image_paths_use_exactly_the_summary_overlay_order() {
+        let original = overlay_fixture_message(vec![
+            overlay_fixture_tool(
+                "rollout-a",
+                "exec_command",
+                json!({"command":"first","cwd":"/workspace"}),
+            ),
+            overlay_fixture_tool("unknown-between", "future_tool", json!({"opaque":true})),
+            overlay_fixture_tool(
+                "rollout-b",
+                "exec_command",
+                json!({"command":"second","cwd":"/workspace"}),
+            ),
+        ]);
+        let typed = HashMap::from([("overlay-message".to_owned(), vec![
+            typed_thread_tool(&json!({"type":"commandExecution","id":"typed-a","command":"first","cwd":"/workspace","status":"completed"})).unwrap(),
+            typed_thread_tool(&json!({"type":"commandExecution","id":"typed-b","command":"second","cwd":"/workspace","status":"completed"})).unwrap(),
+            typed_thread_tool(&json!({"type":"imageGeneration","id":"typed-image","savedPath":"/workspace/generated.png","status":"completed","result":""})).unwrap(),
+        ])]);
+        let mut summary = original.clone();
+        overlay_app_server_tools(std::slice::from_mut(&mut summary), &typed);
+        assert_eq!(
+            summary
+                .tools
+                .iter()
+                .map(|tool| tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["typed-a", "unknown-between", "typed-b", "typed-image"]
+        );
+        let mut hydrated = original.clone();
+        hydrated.tools[1].output = Some(json!({"opaqueResult":"Hydrated only on demand"}));
+        for (index, expected) in summary.tools.iter().enumerate() {
+            let detail = overlaid_tool_content(hydrated.clone(), Some(&typed), index).unwrap();
+            assert_eq!(detail.call_id, expected.call_id);
+            assert_eq!(detail.name, expected.name);
+            assert_eq!(
+                compact_tool_summary(&detail, index)["image_path"],
+                compact_tool_summary(expected, index)["image_path"]
+            );
+            if index == 1 {
+                assert_eq!(
+                    detail.output.as_ref().unwrap()["opaqueResult"],
+                    "Hydrated only on demand"
+                );
+            }
+        }
+        assert!(overlaid_tool_content(hydrated, Some(&typed), 4).is_none());
+        let generated = overlaid_tool_content(original, Some(&typed), 3).unwrap();
+        assert!(tool_authorizes_image_path(
+            &generated,
+            "/workspace/generated.png"
+        ));
+        assert!(!tool_authorizes_image_path(
+            &summary.tools[1],
+            "/workspace/generated.png"
+        ));
     }
 
     #[test]
