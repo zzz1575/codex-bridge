@@ -2,6 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::fs::{MetadataExt, OpenOptionsExt},
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Weak};
@@ -860,6 +865,21 @@ impl SessionStore {
 
     pub fn home(&self) -> &Path {
         &self.codex_home
+    }
+
+    /// Remove only this thread's obsolete Desktop assignment after native relocation succeeds.
+    pub fn clear_desktop_project_assignment(&self, thread_id: &str) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            clear_desktop_project_assignment(&self.codex_home, thread_id, || Ok(()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = thread_id;
+            Err(anyhow!(
+                "safe Desktop project assignment cleanup is unavailable"
+            ))
+        }
     }
 
     pub fn is_available(&self) -> bool {
@@ -2243,6 +2263,161 @@ fn first_ordinal_mismatch(path: &Path) -> Result<Option<OrdinalMismatch>> {
     Ok(None)
 }
 
+#[cfg(unix)]
+fn desktop_state_open(
+    directory: &File,
+    name: &std::ffi::CStr,
+    flags: i32,
+) -> std::io::Result<File> {
+    // Both fixed state and temporary files are relative to the already-open Codex home.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn desktop_state_unchanged(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mode() == after.mode()
+        && before.uid() == after.uid()
+        && before.gid() == after.gid()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(unix)]
+fn clear_desktop_project_assignment(
+    codex_home: &Path,
+    thread_id: &str,
+    before_replace: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let directory = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(codex_home)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .context("cannot safely open Codex home for Desktop assignment cleanup")
+        }
+    };
+    let name = std::ffi::CString::new(".codex-global-state.json").unwrap();
+    let mut input = match desktop_state_open(&directory, &name, libc::O_RDONLY | libc::O_NONBLOCK) {
+        Ok(input) => input,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("cannot safely open Desktop state"),
+    };
+    let original = input.metadata().context("cannot inspect Desktop state")?;
+    if !original.is_file() || original.len() > MAX_BYTES {
+        return Err(anyhow!(
+            "Desktop state is not a regular file within the size limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut input).take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BYTES || !desktop_state_unchanged(&original, &input.metadata()?) {
+        return Err(anyhow!(
+            "Desktop state changed during reading; no replacement was written"
+        ));
+    }
+    let mut state: Value =
+        serde_json::from_slice(&bytes).context("Desktop state is invalid JSON")?;
+    let Some(assignments) = state
+        .get_mut("thread-project-assignments")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    if assignments.remove(thread_id).is_none() {
+        return Ok(false);
+    }
+    let mut replacement = serde_json::to_vec_pretty(&state)?;
+    replacement.push(b'\n');
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow!("cannot allocate Desktop state temporary file: {error}"))?;
+    let suffix = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary =
+        std::ffi::CString::new(format!(".codex-global-state.json.relocate-{suffix}.tmp"))?;
+    let mut output = desktop_state_open(
+        &directory,
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+    )
+    .context("cannot create Desktop state temporary file")?;
+    let result = (|| -> Result<bool> {
+        output.write_all(&replacement)?;
+        let created = output.metadata()?;
+        if (created.uid() != original.uid() || created.gid() != original.gid())
+            && unsafe { libc::fchown(output.as_raw_fd(), original.uid(), original.gid()) } != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("cannot preserve Desktop state ownership");
+        }
+        output.set_permissions(original.permissions())?;
+        output.sync_all()?;
+        before_replace()?;
+        let mut current = desktop_state_open(&directory, &name, libc::O_RDONLY | libc::O_NONBLOCK)
+            .context("Desktop state changed before replacement")?;
+        if !desktop_state_unchanged(&original, &current.metadata()?) {
+            return Err(anyhow!(
+                "Desktop state changed externally; no replacement was written"
+            ));
+        }
+        let mut current_bytes = Vec::new();
+        (&mut current)
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut current_bytes)?;
+        let latest = desktop_state_open(&directory, &name, libc::O_RDONLY | libc::O_NONBLOCK)
+            .context("Desktop state changed before replacement")?;
+        if current_bytes != bytes
+            || !desktop_state_unchanged(&original, &current.metadata()?)
+            || !desktop_state_unchanged(&original, &latest.metadata()?)
+        {
+            return Err(anyhow!(
+                "Desktop state changed externally; no replacement was written"
+            ));
+        }
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error()).context("cannot replace Desktop state");
+        }
+        directory.sync_all()?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        // unlinkat removes only our unique name and never follows a substituted symlink.
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+    }
+    result
+}
+
 fn repair_rollout_ordinal_file(
     path: &Path,
     mismatch: OrdinalMismatch,
@@ -3447,6 +3622,178 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    mod desktop_assignment_cleanup {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        fn state_path(fixture: &Fixture) -> PathBuf {
+            fixture.path.join(".codex-global-state.json")
+        }
+
+        fn assert_no_temporary(fixture: &Fixture) {
+            assert!(fs::read_dir(&fixture.path).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".relocate-")));
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_removes_only_the_requested_key_and_preserves_permissions() {
+            let fixture = Fixture::new();
+            let path = state_path(&fixture);
+            let state = json!({
+                "thread-project-assignments": {
+                    "target-thread":{"projectId":"old-project", "projectKind":"local"},
+                    "other-thread":{"projectId":"keep-project", "projectKind":"local"}
+                },
+                "local-projects":{"keep-project":{"name":"Keep", "rootPaths":["/workspace/keep"]}},
+                "unknown-setting":{"nested":[true, 42, "untouched"]}
+            });
+            fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            let before = fs::metadata(&path).unwrap();
+            assert!(SessionStore::new(fixture.path.clone())
+                .clear_desktop_project_assignment("target-thread")
+                .unwrap());
+            let after = fs::metadata(&path).unwrap();
+            let mut expected = state;
+            expected["thread-project-assignments"]
+                .as_object_mut()
+                .unwrap()
+                .remove("target-thread");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+                expected
+            );
+            assert_eq!(before.mode(), after.mode());
+            assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+            assert_ne!(before.ino(), after.ino());
+            assert_no_temporary(&fixture);
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_missing_file_or_key_never_rewrites_state() {
+            let fixture = Fixture::new();
+            let store = SessionStore::new(fixture.path.clone());
+            assert!(!store
+                .clear_desktop_project_assignment("target-thread")
+                .unwrap());
+            assert!(!state_path(&fixture).exists());
+            let path = state_path(&fixture);
+            let bytes =
+                b"{ \"thread-project-assignments\": { \"other-thread\": {} }, \"keep\": 42 }";
+            fs::write(&path, bytes).unwrap();
+            let before = fs::metadata(&path).unwrap();
+            assert!(!store
+                .clear_desktop_project_assignment("target-thread")
+                .unwrap());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(desktop_state_unchanged(
+                &before,
+                &fs::metadata(&path).unwrap()
+            ));
+            assert_no_temporary(&fixture);
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_does_not_follow_state_or_home_symlinks() {
+            let fixture = Fixture::new();
+            let outside = fixture.path.join("outside.json");
+            let bytes = b"{\"thread-project-assignments\":{\"target-thread\":{}}}";
+            fs::write(&outside, bytes).unwrap();
+            symlink(&outside, state_path(&fixture)).unwrap();
+            assert!(SessionStore::new(fixture.path.clone())
+                .clear_desktop_project_assignment("target-thread")
+                .is_err());
+            assert_eq!(fs::read(&outside).unwrap(), bytes);
+            let home_link = fixture.path.join("linked-home");
+            symlink(&fixture.path, &home_link).unwrap();
+            assert!(SessionStore::new(home_link)
+                .clear_desktop_project_assignment("target-thread")
+                .is_err());
+            assert_no_temporary(&fixture);
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_invalid_json_is_left_unchanged() {
+            let fixture = Fixture::new();
+            let path = state_path(&fixture);
+            fs::write(&path, b"{not-json").unwrap();
+            assert!(SessionStore::new(fixture.path.clone())
+                .clear_desktop_project_assignment("target-thread")
+                .is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"{not-json");
+            assert_no_temporary(&fixture);
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_never_overwrites_an_external_in_place_write() {
+            let fixture = Fixture::new();
+            let path = state_path(&fixture);
+            fs::write(
+                &path,
+                b"{\"thread-project-assignments\":{\"target-thread\":{}}}",
+            )
+            .unwrap();
+            let external = b"{\"thread-project-assignments\":{\"target-thread\":{\"new\":true}},\"external\":42}";
+            let result = clear_desktop_project_assignment(&fixture.path, "target-thread", || {
+                fs::write(&path, external)?;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(&path).unwrap(), external);
+            assert_no_temporary(&fixture);
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_never_overwrites_an_external_atomic_replacement() {
+            let fixture = Fixture::new();
+            let path = state_path(&fixture);
+            fs::write(
+                &path,
+                b"{\"thread-project-assignments\":{\"target-thread\":{}}}",
+            )
+            .unwrap();
+            let external = b"{\"external\":true}";
+            let result = clear_desktop_project_assignment(&fixture.path, "target-thread", || {
+                let replacement = fixture.path.join("external-replacement");
+                fs::write(&replacement, external)?;
+                fs::rename(replacement, &path)?;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read(&path).unwrap(), external);
+            assert_no_temporary(&fixture);
+        }
+
+        #[test]
+        fn desktop_assignment_cleanup_rejects_a_symlink_swapped_before_replacement() {
+            let fixture = Fixture::new();
+            let path = state_path(&fixture);
+            let outside = fixture.path.join("outside.json");
+            fs::write(
+                &path,
+                b"{\"thread-project-assignments\":{\"target-thread\":{}}}",
+            )
+            .unwrap();
+            fs::write(&outside, b"{\"external\":true}").unwrap();
+            let result = clear_desktop_project_assignment(&fixture.path, "target-thread", || {
+                fs::remove_file(&path)?;
+                symlink(&outside, &path)?;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&outside).unwrap(), b"{\"external\":true}");
+            assert_no_temporary(&fixture);
+        }
+    }
 
     #[test]
     fn token_usage_windows_count_deltas_once_in_their_event_window() {

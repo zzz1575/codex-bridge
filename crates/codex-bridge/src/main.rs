@@ -9130,6 +9130,16 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             if let Ok(mut cached) = app_server_projects.index.write() {
                 *cached = None;
             }
+            let desktop_assignment_removed = match session_store.clear_desktop_project_assignment(&thread_id) {
+                Ok(removed) => removed,
+                Err(error) => return Response::error(
+                    "thread_relocation_incomplete",
+                    format!("session directory changed to {} and native project membership was synchronized, but Desktop project assignment cleanup failed: {error}; refresh the session before retrying", target.display()),
+                ),
+            };
+            if let Ok(mut cached) = app_server_projects.index.write() {
+                *cached = None;
+            }
             Response::success(json!({
                 "action": "thread_cwd_update",
                 "thread_id": thread_id,
@@ -9137,6 +9147,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "cwd": target,
                 "project_assigned": project_id.is_some(),
                 "project_cleared": project_id.is_none(),
+                "desktop_assignment_removed": desktop_assignment_removed,
                 "backend": settings_result,
                 "workspace_roots_applied": workspace_roots_applied,
             }))
