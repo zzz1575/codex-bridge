@@ -1,3 +1,4 @@
+import { createServerRequestTray } from "./server-requests.js";
 import "./styles.css";
 import {
   $,
@@ -1925,6 +1926,7 @@ function openProjectlessDraft() {
     if (state.composerReference) state.referenceDrafts.set(previous.id, state.composerReference);
   }
   state.current = thread;
+  serverRequestTray.render();
   renderApprovals();
   resetThreadViewState(thread);
   applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
@@ -3543,8 +3545,16 @@ function appendToolResultImage(parent, url, name = tr("toolResultImage")) {
 }
 const toolImagePreviewCache = new Map();
 const toolImageGalleryState = new Map();
+function toolHasImageFile(tool) {
+  return (
+    ["view_image", "image_generation"].includes(tool.name) &&
+    typeof tool.image_path === "string" &&
+    tool.image_path.length > 0 &&
+    !tool.image_path.includes("\0")
+  );
+}
 function toolImagePreviews(tool, threadId) {
-  const fileImage = tool.name === "view_image" && typeof tool.image_path === "string";
+  const fileImage = toolHasImageFile(tool);
   if (!threadId || (!fileImage && !tool.has_image)) return Promise.resolve([]);
   if (!fileImage && !Number.isInteger(tool.message_index)) return Promise.resolve([]);
   const cacheKey = fileImage
@@ -3983,7 +3993,7 @@ function toolGroupNode(
         }
         if (isCommandTool(tool.name)) appendCommandResult(body, r.tool.output, r.tool.status);
         else if (r.tool.output != null) appendToolValue(body, r.tool.output);
-        if (tool.name === "view_image" && !toolOutputImageUrls(r.tool.output).length) {
+        if (toolHasImageFile(imageTool) && !toolOutputImageUrls(r.tool.output).length) {
           const images = await toolImagePreviews(imageTool, threadId);
           for (const image of images)
             appendToolResultImage(body, image.url, image.name || tr("toolResultImage"));
@@ -3991,7 +4001,7 @@ function toolGroupNode(
       });
     };
     list.appendChild(detail);
-    if (tool.has_image || (tool.name === "view_image" && tool.image_path))
+    if (tool.has_image || toolHasImageFile(tool))
       list.appendChild(toolCallImagesNode(imageTool, threadId));
   }
   if (runningTool && isCommandTool(runningTool.name)) {
@@ -4580,9 +4590,7 @@ function messageNode(
       toolRow.appendChild(copy);
     }
     body.appendChild(toolRow);
-    const imageTools = (m.tools || []).filter(
-      (tool) => tool.has_image || (tool.name === "view_image" && tool.image_path),
-    );
+    const imageTools = (m.tools || []).filter((tool) => tool.has_image || toolHasImageFile(tool));
     if (imageTools.length)
       body.appendChild(
         toolImageGalleryNode(
@@ -4859,6 +4867,8 @@ function appServerItemTool(item) {
       fileChange: "apply_patch",
       webSearch: "web_search",
       imageView: "view_image",
+      sleep: "clock.sleep",
+      imageGeneration: "image_generation",
     };
   let name = names[type] || null;
   if (type === "mcpToolCall")
@@ -5783,6 +5793,7 @@ function handleBridgeEvent(event) {
     return;
   }
   if (event?.type === "bridge_event_gap") {
+    serverRequestTray.refresh();
     setMessageSyncPhase("reconnecting");
     state.lastMessageRefresh = 0;
     for (const threadId of state.taskTrackedIds) state.taskDirtyIds.add(threadId);
@@ -5792,6 +5803,8 @@ function handleBridgeEvent(event) {
     return;
   }
   if (event?.type === "bridge_app_server_connection") {
+    serverRequestTray.reset();
+    if (event.status === "connected") serverRequestTray.refresh();
     loadStatus().catch(() => {});
     return;
   }
@@ -5842,6 +5855,12 @@ function handleBridgeEvent(event) {
   ) {
     refreshApprovals().catch(() => {});
   }
+  if (
+    ["app_server_request", "bridge_server_requests_changed", "bridge_event_gap"].includes(
+      event?.type,
+    )
+  )
+    serverRequestTray.refresh();
   if (event?.type !== "app_server") return;
   const message = event.message || {},
     method = message.method,
@@ -6264,6 +6283,7 @@ async function openThread(
       state.referenceDrafts.set(state.current.id, state.composerReference);
   }
   state.current = thread;
+  serverRequestTray.render();
   renderAsyncQuestion();
   if (changedThread) applyThreadWriterLock({ state: "checking", read_only: true, reason: null });
   syncTemporaryForCurrent();
@@ -6810,6 +6830,14 @@ async function write(name) {
     setComposerSubmitting(false);
   }
 }
+const serverRequestTray = createServerRequestTray({
+  document,
+  getContainer: () => document.querySelector(".composer-shell"),
+  getThreadId: () => state.current?.id,
+  command: (request) => command(request, false),
+  isChinese: () => getLanguage() === "zh",
+  enabled: () => !demoMode,
+});
 let approvalGeneration = 0;
 let approvalSnapshot = [];
 const approvalInFlight = new Set();
@@ -8013,3 +8041,5 @@ setInterval(() => refreshComposerStatus().catch(() => {}), 60000);
 
 setInterval(() => refreshApprovals().catch(() => {}), 2000);
 setInterval(() => refreshUsageWindows().catch(() => {}), 300000);
+
+setInterval(() => serverRequestTray.refresh(), 2000);

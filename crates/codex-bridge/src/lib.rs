@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 mod app_server_schema;
 mod host_executor;
+mod server_requests;
 mod sessions;
 mod write_backend;
 
@@ -239,6 +240,12 @@ pub enum Request {
         message_id: Option<String>,
     },
     Pending,
+    ServerRequests,
+    ServerRequestRespond {
+        id: u64,
+        thread_id: String,
+        response: serde_json::Value,
+    },
     PendingMessages {
         thread_id: Option<String>,
     },
@@ -363,6 +370,8 @@ impl Request {
             Self::AudioTranscribe { .. } => "audio_transcribe",
             Self::Scroll { .. } => "scroll",
             Self::Pending => "pending",
+            Self::ServerRequests => "server_requests",
+            Self::ServerRequestRespond { .. } => "server_request_respond",
             Self::PendingMessages { .. } => "pending_messages",
             Self::PendingMessageDelete { .. } => "pending_message_delete",
             Self::PendingMessagesMerge { .. } => "pending_messages_merge",

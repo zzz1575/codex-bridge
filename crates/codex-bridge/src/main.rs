@@ -7205,6 +7205,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         );
     }
     match request {
+        Request::ServerRequests => {
+            Response::success(json!({"requests":write_backend.pending_server_requests()}))
+        }
+        Request::ServerRequestRespond {
+            id,
+            thread_id,
+            response,
+        } => match write_backend.respond_server_request(id, &thread_id, response) {
+            Ok(result) => Response::success(result),
+            Err(error) => write_backend_error(error),
+        },
         Request::Pending => {
             Response::success(json!({"requests": write_backend.pending_approvals()}))
         }

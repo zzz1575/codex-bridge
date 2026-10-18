@@ -81,6 +81,7 @@ struct AppServerEventBus {
     sender: broadcast::Sender<Value>,
     sequence: AtomicU64,
     approvals: RwLock<Vec<Value>>,
+    server_requests: RwLock<Vec<Value>>,
     approval_sequence: AtomicU64,
 }
 
@@ -91,6 +92,7 @@ impl AppServerEventBus {
             sender,
             sequence: AtomicU64::new(0),
             approvals: RwLock::new(Vec::new()),
+            server_requests: RwLock::new(Vec::new()),
             approval_sequence: AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -341,6 +343,25 @@ impl CodexCliBackend {
             .as_ref()
             .ok_or_else(app_server_unavailable)?;
         app_server.forget_thread(thread_id)
+    }
+
+    pub fn pending_server_requests(&self) -> Vec<Value> {
+        self.app_server
+            .as_ref()
+            .and_then(|s| s.events.server_requests.read().ok().map(|r| r.clone()))
+            .unwrap_or_default()
+    }
+
+    pub fn respond_server_request(
+        &self,
+        id: u64,
+        thread_id: &str,
+        response: Value,
+    ) -> Result<Value, BackendFailure> {
+        self.app_server_rpc(
+            "bridge/respondServerRequest",
+            json!({"id":id,"threadId":thread_id,"response":response}),
+        )
     }
 
     pub fn pending_approvals(&self) -> Vec<Value> {
@@ -806,6 +827,32 @@ fn app_server_worker(
                         params,
                         response,
                     } => {
+                        if method == "bridge/respondServerRequest" {
+                            let result = resolve_server_request(
+                                websocket.as_mut().expect("connection ensured"),
+                                &events,
+                                params["id"].as_u64().unwrap_or(0),
+                                params["threadId"].as_str().unwrap_or(""),
+                                &params["response"],
+                            );
+                            if result.as_ref().is_err_and(|error| {
+                                matches!(
+                                    error.code,
+                                    "app_server_timeout" | "app_server_protocol_error"
+                                )
+                            }) {
+                                websocket = None;
+                                emit_connection_event(
+                                    &events,
+                                    &runtime,
+                                    "disconnected",
+                                    None,
+                                    None,
+                                );
+                            }
+                            let _ = response.send(result);
+                            continue;
+                        }
                         if method == "bridge/resolveApproval" {
                             let result = resolve_pending_approval(
                                 websocket.as_mut().expect("connection ensured"),
@@ -1039,6 +1086,8 @@ fn ensure_app_server_connection(
     if websocket.is_some() {
         return Ok(());
     }
+    // A server request belongs to its transport connection. Never replay an old form after reconnect.
+    clear_prompt_requests(events);
     let metadata = std::fs::metadata(app_server_socket).map_err(|error| BackendFailure {
         code: "app_server_unavailable",
         message: format!(
@@ -1199,11 +1248,106 @@ fn read_app_server_message(
             "app_server"
         };
         observe_approval_message(events, &value);
+        if let Err(message) = observe_prompt_message(events, &value) {
+            if value.get("id").is_some() {
+                write_rpc_message(
+                    websocket,
+                    &json!({"id":value["id"],"error":{"code":-32600,"message":message}}),
+                )?;
+            }
+        }
         events.publish(json!({"type": event_type, "message": value}));
         Ok(None)
     } else {
         Ok(Some(value))
     }
+}
+
+fn observe_prompt_message(events: &AppServerEventBus, message: &Value) -> Result<(), &'static str> {
+    let mut entries = events
+        .server_requests
+        .write()
+        .map_err(|_| "Request cache is unavailable")?;
+    let before = entries.len();
+    if message.get("id").is_some()
+        && crate::server_requests::is_prompt(message["method"].as_str().unwrap_or(""))
+    {
+        if !entries
+            .iter()
+            .any(|entry| entry["request"]["id"] == message["id"])
+        {
+            if entries.len() >= 128 || message.to_string().len() > 64 * 1024 {
+                return Err("Server request exceeds Bridge limits");
+            }
+            let id = events.approval_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+            entries
+                .push(json!({"id":id,"thread_id":message["params"]["threadId"],"request":message}));
+        }
+    } else if message["method"] == "serverRequest/resolved" {
+        entries.retain(|entry| {
+            !(entry["request"]["id"] == message["params"]["requestId"]
+                && entry["thread_id"] == message["params"]["threadId"])
+        });
+    } else if message["method"] == "turn/completed" {
+        entries.retain(|entry| {
+            let turn = &entry["request"]["params"]["turnId"];
+            !(turn.is_string()
+                && entry["thread_id"] == message["params"]["threadId"]
+                && turn == &message["params"]["turn"]["id"])
+        });
+    }
+    let changed = before != entries.len();
+    drop(entries);
+    if changed {
+        events.publish(json!({"type":"bridge_server_requests_changed"}));
+    }
+    Ok(())
+}
+
+fn clear_prompt_requests(events: &AppServerEventBus) {
+    if let Ok(mut entries) = events.server_requests.write() {
+        entries.clear();
+    }
+    events.publish(json!({"type":"bridge_server_requests_changed"}));
+}
+
+fn resolve_server_request(
+    websocket: &mut WebSocket<UnixStream>,
+    events: &AppServerEventBus,
+    id: u64,
+    thread_id: &str,
+    response: &Value,
+) -> Result<Value, BackendFailure> {
+    let mut entries = events
+        .server_requests
+        .write()
+        .map_err(|_| app_server_unavailable())?;
+    let index = entries
+        .iter()
+        .position(|entry| entry["id"].as_u64() == Some(id))
+        .ok_or_else(|| BackendFailure {
+            code: "server_request_not_pending",
+            message: "This request is no longer pending; refresh the form".into(),
+        })?;
+    if entries[index]["thread_id"].as_str() != Some(thread_id) {
+        return Err(BackendFailure {
+            code: "server_request_wrong_thread",
+            message: "The request belongs to another session".into(),
+        });
+    }
+    let request = &entries[index]["request"];
+    let result = crate::server_requests::response_result(request, response).map_err(|message| {
+        BackendFailure {
+            code: "invalid_server_response",
+            message: message.into(),
+        }
+    })?;
+    // The original request id and owning connection are never replaced or replayed.
+    write_rpc_message(websocket, &json!({"id":request["id"],"result":result}))?;
+    entries.remove(index);
+    drop(entries);
+    events.publish(json!({"type":"bridge_server_requests_changed"}));
+    Ok(json!({"id":id,"status":"responded"}))
 }
 
 fn approval_result(request: &Value, accept: bool) -> Option<Value> {
@@ -1287,6 +1431,7 @@ fn emit_connection_event(
     error: Option<&str>,
 ) {
     if status == "disconnected" {
+        clear_prompt_requests(events);
         if let Ok(mut entries) = events.approvals.write() {
             entries.clear();
         }
@@ -1463,6 +1608,128 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn server_requests_deduplicate_expire_and_keep_uncorrelated_elicitations() {
+        let events = AppServerEventBus::new(16);
+        let question = json!({"id":"opaque","method":"item/tool/requestUserInput","params":{"threadId":"thread-a","turnId":"turn-a","questions":[]}});
+        let elicitation = json!({"id":99,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-a","turnId":null,"mode":"url","url":"https://example.com/verify"}});
+        observe_prompt_message(&events, &question).unwrap();
+        let original_id = events.server_requests.read().unwrap()[0]["id"].clone();
+        observe_prompt_message(&events, &question).unwrap();
+        observe_prompt_message(&events, &elicitation).unwrap();
+        assert_eq!(events.server_requests.read().unwrap().len(), 2);
+        observe_prompt_message(&events,&json!({"method":"serverRequest/resolved","params":{"requestId":"opaque","threadId":"other"}})).unwrap();
+        assert_eq!(events.server_requests.read().unwrap().len(), 2);
+        observe_prompt_message(&events,&json!({"method":"turn/completed","params":{"threadId":"thread-a","turn":{"id":"turn-a"}}})).unwrap();
+        assert_eq!(events.server_requests.read().unwrap().len(), 1);
+        let runtime = Arc::new(RwLock::new(AppServerRuntimeInfo {
+            connected: true,
+            user_agent: None,
+        }));
+        emit_connection_event(&events, &runtime, "disconnected", None, None);
+        assert!(events.server_requests.read().unwrap().is_empty());
+        observe_prompt_message(&events, &question).unwrap();
+        assert_ne!(events.server_requests.read().unwrap()[0]["id"], original_id);
+        observe_prompt_message(&events,&json!({"method":"serverRequest/resolved","params":{"requestId":"opaque","threadId":"thread-a"}})).unwrap();
+        assert!(events.server_requests.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn server_requests_reply_on_original_socket_and_reject_invalid_or_duplicate_answers() {
+        let cases = [
+            (
+                json!({"id":"question-opaque","method":"item/tool/requestUserInput","params":{"threadId":"thread-a","turnId":"turn-a","questions":[{"id":"q"}]}}),
+                json!({"answers":{"q":{"answers":["a"]}}}),
+            ),
+            (
+                json!({"id":81,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-a","turnId":null,"mode":"form","requestedSchema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}}}),
+                json!({"action":"accept","content":{"ok":true}}),
+            ),
+            (
+                json!({"id":"cancel-opaque","method":"mcpServer/elicitation/request","params":{"threadId":"thread-a","turnId":null,"mode":"openai/userVerification"}}),
+                json!({"action":"cancel"}),
+            ),
+        ];
+        for (request, expected) in cases {
+            let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("bridge-prompt-{}-{sequence}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("bridge.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let sent_request = request.clone();
+            let (release_tx, release_rx) = std_mpsc::channel();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init = read_json(&mut ws);
+                ws.send(Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = read_json(&mut ws);
+                let rpc = read_json(&mut ws);
+                ws.send(Message::Text(
+                    json!({"id":rpc["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                ws.send(Message::Text(sent_request.to_string().into()))
+                    .unwrap();
+                let response = read_json(&mut ws);
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                response
+            });
+            let backend =
+                CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(socket.clone()));
+            backend
+                .app_server_rpc("thread/loaded/list", json!({}))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while backend.pending_server_requests().is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let entries = backend.pending_server_requests();
+            assert_eq!(entries.len(), 1);
+            assert!(
+                backend.pending_approvals().is_empty(),
+                "Old approval clients must not see structured forms"
+            );
+            let id = entries[0]["id"].as_u64().unwrap();
+            assert_eq!(
+                backend
+                    .respond_server_request(id, "other", expected.clone())
+                    .unwrap_err()
+                    .code,
+                "server_request_wrong_thread"
+            );
+            assert_eq!(
+                backend
+                    .respond_server_request(id, "thread-a", json!({"unexpected":true}))
+                    .unwrap_err()
+                    .code,
+                "invalid_server_response"
+            );
+            assert_eq!(backend.pending_server_requests().len(), 1);
+            backend
+                .respond_server_request(id, "thread-a", expected.clone())
+                .unwrap();
+            assert_eq!(
+                backend
+                    .respond_server_request(id, "thread-a", expected.clone())
+                    .unwrap_err()
+                    .code,
+                "server_request_not_pending"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                server.join().unwrap(),
+                json!({"id":request["id"],"result":expected})
+            );
+            std::fs::remove_file(&socket).unwrap();
+            std::fs::remove_dir(&dir).unwrap();
+        }
     }
 
     #[test]

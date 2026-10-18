@@ -4845,3 +4845,66 @@ html[data-theme="light"] .composer-shell.agent-active:not(.submitting) {
 .approval-tray button {
   margin: 8px 8px 0 0;
 }
+
+.server-request-tray {
+  max-height: 48vh;
+  overflow: auto;
+  margin: 8px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel, Canvas);
+}
+.server-request-tray[hidden] {
+  display: none;
+}
+.server-request-tray article + article {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.server-request-tray form,
+.server-request-tray fieldset,
+.server-request-tray label {
+  display: grid;
+  gap: 8px;
+}
+.server-request-tray form {
+  margin-top: 10px;
+}
+.server-request-tray fieldset {
+  min-width: 0;
+  margin: 0 0 8px;
+}
+.server-request-tray p,
+.server-request-tray small {
+  overflow-wrap: anywhere;
+  margin: 5px 0;
+}
+.server-request-tray input,
+.server-request-tray select,
+.server-request-tray textarea {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.server-request-tray input[type="checkbox"] {
+  width: auto;
+}
+.server-request-tray textarea {
+  min-height: 64px;
+  max-height: 25vh;
+  resize: vertical;
+}
+.server-request-tray pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 20vh;
+  overflow: auto;
+}
+.server-request-tray button {
+  min-height: 40px;
+}
+.server-request-error {
+  color: var(--danger, #c33);
+}
