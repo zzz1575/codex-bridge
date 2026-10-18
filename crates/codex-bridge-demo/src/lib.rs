@@ -36,6 +36,7 @@ struct DemoState {
     active_steers: Vec<String>,
     active_tool_message: Option<usize>,
     next_pending: u32,
+    next_temporary: u32,
     file_len: u64,
     model: String,
     effort: String,
@@ -60,6 +61,7 @@ impl DemoState {
             active_steers: Vec::new(),
             active_tool_message: None,
             next_pending: 1,
+            next_temporary: 1,
             file_len: 48_320,
             model: "gpt-5.6-sol".to_owned(),
             effort: "medium".to_owned(),
@@ -125,6 +127,13 @@ impl DemoState {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 content.push(json!({"kind": "pasted_text", "text": text}));
+                continue;
+            }
+            if attachment.get("type").and_then(Value::as_str) == Some("file") {
+                content.push(json!({
+                    "kind": "context",
+                    "label": attachment.get("name").and_then(Value::as_str).unwrap_or("File attachment"),
+                }));
                 continue;
             }
             let url = attachment
@@ -805,6 +814,11 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
         .unwrap_or(PRIMARY_THREAD);
 
     let result = match command {
+        "token_usage_windows" => json!({
+            "seven_days": {"total_tokens": 128_400, "input_tokens": 96_200, "output_tokens": 32_200, "cached_input_tokens": 47_500},
+            "thirty_days": {"total_tokens": 534_900, "input_tokens": 401_000, "output_tokens": 133_900, "cached_input_tokens": 189_000},
+            "updated_at": 0
+        }),
         "status" => json!({
             "service": "codex-bridge-demo",
             "status": "ready",
@@ -1170,6 +1184,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 for attachment in &attachments {
                     summary.push_str(match attachment.get("type").and_then(Value::as_str) {
                         Some("pasted_text") => "\n[Pasted text attachment]",
+                        Some("file") => "\n[File attachment]",
                         _ => "\n[Image attachment]",
                     });
                 }
@@ -1267,11 +1282,17 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .get("thread_id")
                 .and_then(Value::as_str)
                 .unwrap_or(PRIMARY_THREAD);
+            let last_turn_id = request
+                .get("last_turn_id")
+                .and_then(Value::as_str)
+                .unwrap_or("latest");
+            let temporary_id = state.next_temporary;
+            state.next_temporary += 1;
             json!({
                 "action": "temporary_thread_create",
                 "source_thread_id": source_thread_id,
                 "thread": {
-                    "id": format!("demo-temporary-{source_thread_id}"),
+                    "id": format!("demo-temporary-{source_thread_id}-{last_turn_id}-{temporary_id}"),
                     "ephemeral": true,
                     "forked_from_id": source_thread_id,
                 },
@@ -1509,7 +1530,10 @@ mod tests {
         );
         assert_eq!(response["result"]["page"]["start"], total - 2);
         assert_eq!(response["result"]["page"]["end"], total);
-        assert_eq!(response["result"]["messages"][0]["message_index"], total - 2);
+        assert_eq!(
+            response["result"]["messages"][0]["message_index"],
+            total - 2
+        );
     }
 
     #[test]

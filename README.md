@@ -24,19 +24,24 @@ still use the account and network configured by Codex itself.
 - Structured messages, tool calls, diffs, status, models, and paginated history.
 - Terminal-style command output with live progress, exit codes, and parsed JSON when available.
 - Composer slash commands and skill selection, with inline computer-use screenshots.
+- Paste images into the composer or attach files of any format (up to 32 MiB per file).
 - Remote Queue, Steer, withdrawal, interruption, pinning, custom sections, renaming, and archiving.
+- Edit and rerun the latest interrupted prompt when that turn has no Steer input.
+- Fork a completed turn into a new session in the current directory or a new Git worktree.
+- Create a session directly from a project row, choosing the current directory or a new worktree.
 - Editable voice transcription through app-server, with an optional managed local whisper.cpp
   fallback for private Mac, Linux, homelab, and NAS deployments.
 - Bounded caches and authenticated file preview and downloads for long-running hosts.
 
 ## Release highlights
 
-### v0.3.10 · 2026-10-04
+### v0.3.11 · 2026-10-17
 
-- **Custom sections:** show custom sections beneath Pinned, including project folders and sessions.
-- **Project history:** keep moved conversations visible inside their assigned project folders.
+- **Session paths:** start a session from a project row, fork a completed turn, or open a temporary conversation from a turn or selected text.
+- **Composer:** paste images, upload files with progress, and edit the latest interrupted prompt before rerunning it.
+- **Activity:** see command output, tool steps in temporary conversations, and recent token usage.
 
-See the [latest release notes](docs/releases/v0.3.10.md) or the
+See the [latest release notes](docs/releases/v0.3.11.md) or the
 [complete release history](docs/releases/).
 
 ## Web UI
@@ -54,9 +59,10 @@ rendered tool calls and diffs, task pinning, renaming, and archiving, model sele
 English and Chinese text, queue/steer message handoff, and opt-in browser notifications when a run
 finishes while the page is in the background. Large pasted text appears as a file attachment in the
 conversation. Tool images can be viewed at their call and browsed in the message gallery.
+Settings shows token usage for the past 7 and 30 days and refreshes it every five minutes.
 Notifications require site permission and an open Web UI
 page; clicking one focuses the page and opens that session. Local file links can download regular
-files smaller than 16 MiB; the server resolves each link against that task's workspace or an
+files smaller than 33 MiB; the server resolves each link against that task's workspace or an
 explicitly configured visible directory and rejects paths or symlinks outside those roots.
 Authenticated clients receive a random download ticket that
 expires after five minutes and tolerates browser or proxy retries. Tickets live only in bridge
@@ -150,8 +156,9 @@ codexctl show --last 20
 ```
 
 The optional Web UI listens on `127.0.0.1:18791` by default and normally requires a private
-password file. Successful browser Basic Auth creates a seven-day HttpOnly session cookie whose
-private token survives ordinary bridge restarts. A same-host authenticated reverse proxy may use
+password file. The sign-in page supports password-manager autofill and creates a seven-day
+HttpOnly session cookie whose private token survives ordinary bridge restarts. A same-host
+authenticated reverse proxy may use
 `--web-ui-no-auth`; that mode is rejected unless the listener is bound to a loopback address. See
 the installation guide before binding another interface or placing it behind an HTTPS proxy.
 

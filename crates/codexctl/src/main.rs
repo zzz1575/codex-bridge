@@ -18,7 +18,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
-    /// Target thread for show/send/steer/interrupt/host-exec, overriding daemon selection.
+    /// Target thread for show/send/steer/interrupt/host-exec/relocate, overriding daemon selection.
     #[arg(long, global = true, value_name = "THREAD_ID")]
     thread: Option<String>,
 
@@ -28,6 +28,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// List projects known to the bridge.
+    Projects {
+        #[arg(long)]
+        include_archived: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage Codex projects.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    /// Create an empty session in the current directory or a selected project.
+    New {
+        /// Existing project directory; defaults to the current directory.
+        #[arg(long, value_name = "DIRECTORY", conflicts_with = "chat")]
+        project: Option<PathBuf>,
+        /// Create a Chats session without a project.
+        #[arg(long, conflicts_with = "worktree")]
+        chat: bool,
+        /// Create the session in a new Git worktree.
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// List known Codex threads.
     Ls {
         /// Maximum number of threads to return.
@@ -73,6 +101,16 @@ enum Command {
         /// Return only the last N user/assistant messages.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=10000))]
         last: Option<u32>,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a session's working directory after moving its project.
+    Relocate {
+        /// Existing absolute directory to use for subsequent turns.
+        #[arg(value_name = "DIRECTORY")]
+        directory: PathBuf,
 
         /// Emit structured JSON.
         #[arg(long)]
@@ -133,6 +171,19 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// Register an existing directory as a Codex project.
+    Create {
+        #[arg(value_name = "DIRECTORY")]
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("mode")
@@ -167,6 +218,9 @@ enum DirectionArg {
 enum OutputKind {
     Generic,
     Threads,
+    Projects,
+    Project,
+    NewThread,
     Selection,
     Current,
     Messages,
@@ -186,6 +240,59 @@ impl From<DirectionArg> for ScrollDirection {
 impl Command {
     fn into_request(self, target_thread: Option<String>) -> Result<(Request, bool, OutputKind)> {
         match self {
+            Self::Projects {
+                include_archived,
+                json,
+            } => {
+                reject_target(&target_thread, "projects")?;
+                Ok((
+                    Request::Projects { include_archived },
+                    json,
+                    OutputKind::Projects,
+                ))
+            }
+            Self::Project { command } => {
+                reject_target(&target_thread, "project")?;
+                match command {
+                    ProjectCommand::Create { path, name, json } => Ok((
+                        Request::ProjectCreate {
+                            path: std::fs::canonicalize(&path).with_context(|| {
+                                format!("cannot open project directory {}", path.display())
+                            })?,
+                            name,
+                        },
+                        json,
+                        OutputKind::Project,
+                    )),
+                }
+            }
+            Self::New {
+                project,
+                chat,
+                worktree,
+                model,
+                json,
+            } => {
+                reject_target(&target_thread, "new")?;
+                let project_path = if chat {
+                    None
+                } else {
+                    let path = project.unwrap_or(std::env::current_dir()?);
+                    Some(std::fs::canonicalize(&path).with_context(|| {
+                        format!("cannot open project directory {}", path.display())
+                    })?)
+                };
+                Ok((
+                    Request::ThreadCreate {
+                        project_path,
+                        worktree,
+                        model,
+                        prompt: None,
+                    },
+                    json,
+                    OutputKind::NewThread,
+                ))
+            }
             Self::Ls {
                 limit,
                 include_archived,
@@ -224,6 +331,14 @@ impl Command {
                 },
                 json,
                 OutputKind::Messages,
+            )),
+            Self::Relocate { directory, json } => Ok((
+                Request::ThreadCwdUpdate {
+                    thread_id: target_thread.context("relocate requires --thread THREAD_ID")?,
+                    cwd: directory,
+                },
+                json,
+                OutputKind::Generic,
             )),
             Self::Tail => {
                 reject_target(&target_thread, "tail")?;
@@ -379,6 +494,9 @@ async fn send_request(socket_path: &Path, request: &Request) -> Result<Response>
 fn print_human(value: &serde_json::Value, output_kind: OutputKind) -> Result<()> {
     match output_kind {
         OutputKind::Threads => return print_threads(value),
+        OutputKind::Projects => return print_projects(value),
+        OutputKind::Project => return print_project(value),
+        OutputKind::NewThread => return print_new_thread(value),
         OutputKind::Selection => return print_selection(value),
         OutputKind::Current => return print_current(value),
         OutputKind::Messages => return print_messages(value),
@@ -426,6 +544,60 @@ fn print_threads(value: &serde_json::Value) -> Result<()> {
         if returned < available {
             eprintln!("showing {returned} of {available} threads; increase --limit to see more");
         }
+    }
+    Ok(())
+}
+
+fn print_projects(value: &serde_json::Value) -> Result<()> {
+    let projects = value
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .context("bridge response has no projects array")?;
+    for project in projects {
+        println!(
+            "{}\t{}",
+            string_value(project, "name").unwrap_or("<unnamed>"),
+            string_value(project, "path").unwrap_or("<unknown>")
+        );
+    }
+    Ok(())
+}
+
+fn print_project(value: &serde_json::Value) -> Result<()> {
+    let project = value
+        .get("project")
+        .context("bridge response has no project")?;
+    println!(
+        "project: {}",
+        string_value(project, "name").unwrap_or("<unnamed>")
+    );
+    println!("id: {}", string_value(project, "id").unwrap_or("<unknown>"));
+    if let Some(path) = project
+        .get("roots")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|roots| roots.first())
+        .and_then(|root| string_value(root, "path"))
+    {
+        println!("path: {path}");
+    }
+    println!(
+        "status: {}",
+        string_value(value, "status").unwrap_or("unknown")
+    );
+    Ok(())
+}
+
+fn print_new_thread(value: &serde_json::Value) -> Result<()> {
+    let thread = value
+        .get("thread")
+        .context("bridge response has no thread")?;
+    println!(
+        "thread: {}",
+        string_value(thread, "id").unwrap_or("<unknown>")
+    );
+    print_thread_location(thread);
+    if let Some(location) = string_value(value, "location") {
+        println!("location: {location}");
     }
     Ok(())
 }
@@ -609,6 +781,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_and_session_commands_map_to_bridge_requests() {
+        let cli = Cli::try_parse_from(["codexctl", "projects", "--json"]).unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::Projects {
+                include_archived: false
+            }
+        );
+
+        let cli =
+            Cli::try_parse_from(["codexctl", "project", "create", ".", "--name", "Demo"]).unwrap();
+        let (request, _, _) = cli.command.into_request(cli.thread).unwrap();
+        assert_eq!(
+            request,
+            Request::ProjectCreate {
+                path: std::fs::canonicalize(".").unwrap(),
+                name: Some("Demo".into()),
+            }
+        );
+
+        let cli = Cli::try_parse_from(["codexctl", "new", "--chat", "--json"]).unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::ThreadCreate {
+                project_path: None,
+                worktree: false,
+                model: None,
+                prompt: None,
+            }
+        );
+        assert!(Cli::try_parse_from(["codexctl", "new", "--chat", "--worktree"]).is_err());
+    }
+
+    #[test]
     fn send_joins_unquoted_message_words() {
         let cli = Cli::try_parse_from([
             "codexctl", "--thread", "thread-1", "send", "keep", "going", "--json",
@@ -649,6 +859,30 @@ mod tests {
                 last: Some(5),
             }
         );
+    }
+
+    #[test]
+    fn relocate_requires_explicit_thread_and_keeps_directory_path() {
+        let cli = Cli::try_parse_from([
+            "codexctl",
+            "--thread",
+            "thread-1",
+            "relocate",
+            "/tmp/new-project",
+            "--json",
+        ])
+        .unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::ThreadCwdUpdate {
+                thread_id: "thread-1".into(),
+                cwd: PathBuf::from("/tmp/new-project"),
+            }
+        );
+        let cli = Cli::try_parse_from(["codexctl", "relocate", "/tmp/new-project"]).unwrap();
+        assert!(cli.command.into_request(cli.thread).is_err());
     }
 
     #[test]

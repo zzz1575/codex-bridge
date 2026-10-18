@@ -50,7 +50,7 @@ function fixedAssetCacheBuster() {
     enforce: "post",
     transformIndexHtml: {
       order: "post",
-      handler(html, context) {
+      async handler(html, context) {
         if (!context.bundle) return html;
         for (const fileName of ["assets/app.js", "assets/app.css"]) {
           const asset = context.bundle[fileName];
@@ -58,6 +58,11 @@ function fixedAssetCacheBuster() {
           const content = asset.type === "asset" ? asset.source : asset.code;
           const version = createHash("sha256").update(content).digest("hex").slice(0, 12);
           html = html.replace(`/${fileName}`, `/${fileName}?v=${version}`);
+        }
+        for (const fileName of ["favicon.ico", "app-icon.png"]) {
+          const content = await readFile(new URL(`./public/${fileName}`, import.meta.url));
+          const version = createHash("sha256").update(content).digest("hex").slice(0, 12);
+          html = html.replaceAll(`/${fileName}`, `/${fileName}?v=${version}`);
         }
         return html;
       },
@@ -68,10 +73,11 @@ function fixedAssetCacheBuster() {
 export default defineConfig({
   plugins: [demoWasmBuildAsset(), demoWasmDevAsset(), fixedAssetCacheBuster()],
   base: "/",
-  publicDir: false,
+  publicDir: "public",
   server: {
     proxy: {
       "/api": "http://127.0.0.1:18791",
+      "/login": "http://127.0.0.1:18791",
     },
   },
   build: {

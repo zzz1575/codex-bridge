@@ -19,13 +19,51 @@ import {
 } from "../src/browser-notifications.js";
 import { createAuthenticationGate } from "../src/auth-gate.js";
 import { createEventSequenceTracker } from "../src/event-sequence.js";
+import {
+  imageFileFromSource,
+  pastedFiles,
+  readClipboardImage,
+  richClipboardParts,
+} from "../src/clipboard-images.js";
 import { demoCommandWithInstance } from "../src/demo-client.js";
 import { goalToggleState } from "../src/goal-state.js";
+import { goalPanelKey, questionPanelKey, snapshotIsCurrent } from "../src/floating-panel-state.js";
 import { asyncQuestionReplyMode } from "../src/async-question-state.js";
 import { commandPickerTrigger } from "../src/command-picker.js";
 import { appendLiveCommandText, commandOutputModel, isCommandTool } from "../src/command-output.js";
 import { LARGE_PASTE_CHARS, shouldAttachPastedText } from "../src/large-paste.js";
 import { orderedTurnChildren, turnUsageHost } from "../src/turn-stack.js";
+
+test("floating prompts stay scoped to their item and reject snapshots older than live events", () => {
+  const goal = { createdAt: "2026-10-10T00:00:00Z", objective: "Current goal" };
+  const dismissedGoal = goalPanelKey("thread-a", goal);
+  assert.equal(goalPanelKey("thread-a", goal), dismissedGoal);
+  assert.notEqual(goalPanelKey("thread-b", goal), dismissedGoal);
+  assert.notEqual(
+    goalPanelKey("thread-a", { ...goal, createdAt: "2026-10-10T01:00:00Z" }),
+    dismissedGoal,
+  );
+  const dismissedQuestion = questionPanelKey("thread-a", { item_id: "question-1" });
+  assert.notEqual(questionPanelKey("thread-a", { item_id: "question-2" }), dismissedQuestion);
+  assert.notEqual(questionPanelKey("thread-b", { item_id: "question-1" }), dismissedQuestion);
+  assert.equal(snapshotIsCurrent(2, 2, "thread-a", "thread-a"), true);
+  assert.equal(snapshotIsCurrent(2, 3, "thread-a", "thread-a"), false);
+  assert.equal(snapshotIsCurrent(2, 2, "thread-a", "thread-b"), false);
+});
+
+test("mobile clarification keeps the goal panel available above it", async () => {
+  const stylesheet = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+  const mobilePanels = stylesheet.slice(
+    stylesheet.indexOf("@media (max-width: 789px)"),
+    stylesheet.indexOf(".goal-head {"),
+  );
+  assert.match(
+    mobilePanels,
+    /\.goal-float,\s*body:has\(\.goal-float:not\(\[hidden\]\)\) \.question-float/,
+  );
+  assert.match(mobilePanels, /max-height: min\(34dvh, calc\(50dvh - 95px\)\)/);
+  assert.doesNotMatch(mobilePanels, /display:\s*none/);
+});
 
 test("command output keeps terminal text, exit status, and parsed JSON distinct", () => {
   const native = commandOutputModel({
@@ -226,7 +264,23 @@ import {
   shouldFollowMessageTail,
   shouldResumeMessageTail,
   toolGroupIdentity,
+  visibleTimelineMessages,
 } from "../src/viewport-state.js";
+
+test("latest turn prompts remain visible when its tool tail exceeds the first page", () => {
+  const prompt = { message_index: 4, role: "user", turn_id: "turn-a" },
+    steer = { message_index: 9, role: "user", turn_id: "turn-a" },
+    tail = [
+      { message_index: 14, role: "assistant", turn_id: "turn-a" },
+      { message_index: 15, role: "assistant", turn_id: "turn-a" },
+    ];
+  assert.deepEqual(visibleTimelineMessages(tail, [prompt, steer]), [prompt, steer, ...tail]);
+  assert.deepEqual(visibleTimelineMessages([steer, ...tail], [prompt, steer]), [
+    prompt,
+    steer,
+    ...tail,
+  ]);
+});
 
 const wasmPath = new URL(
   "../../target/wasm32-unknown-unknown/release/codex_bridge_demo.wasm",
@@ -544,7 +598,11 @@ test("new session starts above pinned sessions and chooses from project history"
     source,
     /if \(state\.current\.projectless_draft\)[\s\S]*materializeProjectlessDraft/,
   );
-  assert.doesNotMatch(source, /className = "project-add"/);
+  assert.match(source, /if \(p\.kind === "project"\)[\s\S]*create\.className = "project-add"/);
+  assert.match(source, /create\.onclick = \(\) => showCreateDialog\(p\)/);
+  assert.match(source, /if \(project\) return showCreateMode\(project\)/);
+  assert.match(stylesheet, /\.project-head\s*\{[^}]*display:\s*flex;/s);
+  assert.match(stylesheet, /\.project-add\s*\{[^}]*width:\s*30px;/s);
   assert.match(stylesheet, /\.session-create-button\s*\{[^}]*width:\s*100%;/s);
 });
 
@@ -552,6 +610,8 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   const command = await demoClient();
   const status = result(command({ command: "status" }));
   assert.equal(status.demo, true);
+  const windows = result(command({ command: "token_usage_windows" }));
+  assert.ok(windows.thirty_days.total_tokens > windows.seven_days.total_tokens);
   assert.equal(status.managed_services.codex_gui.stdio_app_server_count, 0);
   assert.equal(status.managed_services.app_server.status.running, true);
   assert.equal(status.managed_services.whisper.fallback, true);
@@ -1045,13 +1105,12 @@ test("mobile session rows reveal a direct archive action with a right swipe", as
   );
 });
 
-test("composer keeps images as attachments and transcribes voice into editable text", async () => {
+test("composer accepts files and clipboard images while voice stays transcribed", async () => {
   const index = await readFile(indexPath, "utf8");
   const source = await readFile(mainScriptPath, "utf8");
-  assert.match(
-    index,
-    /id="imageInput"[\s\S]*?accept="image\/jpeg,image\/png,image\/webp,image\/gif"/,
-  );
+  assert.match(index, /id="fileInput"[\s\S]*?type="file"[\s\S]*?multiple/);
+  assert.match(source, /richClipboardParts\(clipboard\?\.getData\("text\/html"\), plain\)/);
+  assert.match(source, /uploadComposerFile\(file,/);
   assert.match(index, /id="audioInput"[^>]*accept="audio\/\*"[^>]*capture/);
   assert.match(source, /attachments = state\.composerAttachments\.map/);
   assert.match(source, /submission_id: submissionId/);
@@ -1078,6 +1137,30 @@ test("composer keeps images as attachments and transcribes voice into editable t
     stylesheet,
     /\.composer-actions button\.unavailable::after\s*\{[^}]*content:\s*"×"/s,
   );
+});
+
+test("rich clipboard separates text and an embedded image without a file item", async () => {
+  const source = "data:image/png;base64,aGVsbG8=";
+  const parsed = richClipboardParts(
+    `<p>Review this <img src="${source}"></p>`,
+    `Review this ${source}`,
+    () => ({
+      querySelectorAll: () => [{ getAttribute: () => source }],
+      body: { textContent: "Review this" },
+    }),
+  );
+  assert.deepEqual(parsed, { hasImages: true, imageSources: [source], text: "Review this" });
+  assert.deepEqual(pastedFiles({ items: [], files: [] }), []);
+  const file = await imageFileFromSource(
+    source,
+    async () => new Response(new Blob(["image bytes"], { type: "image/png" })),
+  );
+  assert.equal(file.type, "image/png");
+  assert.equal(await file.text(), "image bytes");
+  const fallback = await readClipboardImage(async () => [
+    { types: ["image/png"], getType: async () => new Blob(["clipboard"], { type: "image/png" }) },
+  ]);
+  assert.equal(await fallback.text(), "clipboard");
 });
 
 test("tool output images open in a zoomable viewer", async () => {
@@ -1799,6 +1882,19 @@ test("pending handoff matches multimodal user messages one-to-one", async () => 
     ).length,
     1,
   );
+  assert.deepEqual(
+    reconcilePendingMessages(
+      [{ id: "file-only", text: "[File attachment]", after_message_index: 12 }],
+      [
+        {
+          role: "user",
+          message_index: 13,
+          content: [{ kind: "context", label: "Attached-file context" }],
+        },
+      ],
+    ),
+    [],
+  );
 
   const source = await readFile(mainScriptPath, "utf8");
   const merge = source.slice(
@@ -1806,6 +1902,7 @@ test("pending handoff matches multimodal user messages one-to-one", async () => 
     source.indexOf("async function deletePending"),
   );
   assert.match(merge, /reconcilePendingMessages/);
+  assert.match(merge, /visibleTimelineMessages\(state\.visibleMessages, state\.leadingTurnUsers\)/);
   assert.match(source, /after_message_index: state\.lastMessageIndex \?\? -1/);
   const writeFlow = source.slice(
     source.indexOf("async function write"),
@@ -2134,6 +2231,29 @@ test("message copy follows text before tools and completion metadata", async () 
     stylesheet,
     /\.message\.user\.has-turn-usage > \.message-body > \.message-copy\s*\{[^}]*right:\s*8px;/s,
   );
+});
+
+test("completed turn actions offer copy and fork from the selected turn", async () => {
+  const [source, html] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+  ]);
+  const layout = source.slice(
+    source.indexOf("function layoutTurnGroup"),
+    source.indexOf("function messageNode"),
+  );
+  assert.match(layout, /if \(completed && finalNode && group\.turnId\)/);
+  assert.match(layout, /copy\?\.remove\(\)/);
+  assert.match(layout, /turnActionMenu\(text, state\.current\?\.id, group\.turnId\)/);
+  assert.match(source, /add\("copyMessage"/);
+  assert.match(source, /add\("forkSession", \(\) => showForkDialog\(threadId, turnId\)\)/);
+  assert.match(source, /command: "thread_fork_start", thread_id: threadId, last_turn_id: turnId/);
+  assert.match(
+    source,
+    /command: "thread_fork", thread_id: threadId, last_turn_id: turnId, worktree: false/,
+  );
+  assert.match(html, /id="forkCurrentBtn"/);
+  assert.match(html, /id="forkWorktreeBtn"/);
 });
 
 test("long assistant output collapses by viewport with controls at the message bottom", async () => {
@@ -2477,7 +2597,7 @@ test("queued text messages expose an ordered merge action", async () => {
   assert.match(source, /refreshPending\(\{ preserveOptimistic: false \}\)/);
 });
 
-test("selected text creates an annotated full-screen temporary conversation", async () => {
+test("turn menu opens an identified full-screen temporary conversation", async () => {
   const [source, stylesheet, html] = await Promise.all([
     readFile(mainScriptPath, "utf8"),
     readFile(stylesheetPath, "utf8"),
@@ -2494,7 +2614,7 @@ test("selected text creates an annotated full-screen temporary conversation", as
     /\.head-actions \.temporary-toggle:not\(\[hidden\]\)/,
     "the mobile header must not override an unavailable temporary entry",
   );
-  assert.doesNotMatch(html, /temporaryDraftBtn/, "Temp reuses the Queue/Steer mode control");
+  assert.doesNotMatch(html, /temporaryDraftBtn/);
   assert.match(
     html,
     /id="composerStatus"[\s\S]*?id="composerReference"[\s\S]*?class="composer-shell"/,
@@ -2506,21 +2626,27 @@ test("selected text creates an annotated full-screen temporary conversation", as
   );
   assert.match(temporaryPanel, /class="thread-head temporary-head"/);
   assert.match(temporaryPanel, /class="composer-shell temporary-composer-shell"/);
+  assert.match(temporaryPanel, /id="temporaryIdBtn"/);
   assert.doesNotMatch(temporaryPanel, /tool-toggle/, "temporary chat has no toolbar action");
+  assert.match(html, /id="selectionTemporaryBtn"/);
+  assert.match(html, /id="temporaryReference"/);
   assert.match(
-    html,
-    /id="selectionCopyBtn"[\s\S]*id="selectionInsertBtn"[\s\S]*id="selectionTemporaryBtn"/,
+    source,
+    /add\("temporaryConversation", \(\) => run\(\(\) => createTemporaryThread\(threadId, turnId\)\)\)/,
   );
   assert.match(source, /command: "temporary_thread_create"/);
   assert.match(source, /command: "temporary_turn_start"/);
   assert.match(source, /command: "temporary_turn_interrupt"/);
-  assert.match(source, /last_turn_id: selection\.turnId \|\| null/);
-  assert.match(source, /state\.temporaryThreads\.set\(sourceThreadId, temporary\)/);
-  assert.match(source, /mode === "send" && state\.temporarySelection\?\.turnId/);
-  assert.match(source, /if \(name === "temp"\)[\s\S]*?sendTemporaryMessage\(\)/);
+  assert.match(source, /last_turn_id: turnId/);
+  assert.match(source, /state\.temporaryThreads\.set\(key, temporary\)/);
+  assert.match(source, /state\.activeTemporaryBySource\.set\(sourceThreadId, key\)/);
+  assert.match(source, /createTemporaryThread\(sourceThreadId, selection\.turnId, selection\)/);
+  assert.doesNotMatch(source, /mode === "temp"/);
+  assert.match(stylesheet, /\.temporary-activity\.running\s*\{/);
+  assert.match(stylesheet, /\.composer-shell\.submitting #temporarySendBtn \.submit-spinner/);
   const insertHandler = source.slice(
     source.indexOf('$("selectionInsertBtn").onclick'),
-    source.indexOf('$("selectionTemporaryBtn").onclick'),
+    source.indexOf("function syncScrim()"),
   );
   assert.match(insertHandler, /setComposerReference\(selection\)/);
   assert.doesNotMatch(insertHandler, /insertComposerText/);
@@ -2538,6 +2664,23 @@ test("selected text creates an annotated full-screen temporary conversation", as
   );
   assert.equal(temporary.thread.ephemeral, true);
   assert.equal(temporary.thread.forked_from_id, "demo-thread-web-ui");
+  assert.match(temporary.thread.id, /demo-turn-1-1$/);
+  const another = result(
+    command({
+      command: "temporary_thread_create",
+      thread_id: "demo-thread-web-ui",
+      last_turn_id: "demo-turn-2",
+    }),
+  );
+  assert.notEqual(another.thread.id, temporary.thread.id);
+  const sameTurn = result(
+    command({
+      command: "temporary_thread_create",
+      thread_id: "demo-thread-web-ui",
+      last_turn_id: "demo-turn-1",
+    }),
+  );
+  assert.notEqual(sameTurn.thread.id, temporary.thread.id);
   const turn = result(
     command({
       command: "temporary_turn_start",
@@ -2551,38 +2694,168 @@ test("selected text creates an annotated full-screen temporary conversation", as
   assert.match(turn.demo_reply, /in-memory temporary branch/);
 });
 
-test("failed Temp creation returns the main composer to a usable mode", async () => {
+test("failed Temp creation leaves the main composer untouched", async () => {
   const source = await readFile(mainScriptPath, "utf8");
-  const writeSource = source.slice(
-    source.indexOf("async function write(name) {"),
-    source.indexOf("function approval(name) {"),
+  const createSource = source.slice(
+    source.indexOf(
+      "async function createTemporaryThread(sourceThreadId, turnId, selection = null) {",
+    ),
+    source.indexOf("async function sendTemporaryMessage() {"),
   );
   const message = { value: "Retry in the main conversation" };
-  const sendMode = { value: "temp" };
-  const modes = [];
-  const submitting = [];
   const context = {
     state: {
       current: { id: "manta" },
-      activeTurnId: "active-turn",
-      composerAttachments: [],
-      composerReference: null,
+      temporaryCreating: false,
+      temporaryThreads: new Map(),
+      activeTemporaryBySource: new Map(),
     },
-    $: (id) => ({ messageText: message, sendMode })[id],
-    voiceRecorder: null,
-    setComposerSubmitting: (value) => submitting.push(value),
-    createTemporaryThread: async () => {
+    $: (id) => ({ messageText: message })[id],
+    notify: () => {},
+    tr: (value) => value,
+    command: async () => {
       throw new Error("fork failed");
     },
-    setSendMode: (mode) => {
-      modes.push(mode);
-      sendMode.value = mode;
+  };
+  await assert.rejects(
+    runInNewContext(`${createSource}\ncreateTemporaryThread("manta", "turn-1")`, context),
+    /fork failed/,
+  );
+  assert.equal(message.value, "Retry in the main conversation");
+  assert.equal(context.state.temporaryCreating, false);
+  assert.equal(context.state.temporaryThreads.size, 0);
+});
+
+test("temporary conversations retain a separate ID for each source turn", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const createSource = source.slice(
+    source.indexOf(
+      "async function createTemporaryThread(sourceThreadId, turnId, selection = null) {",
+    ),
+    source.indexOf("async function sendTemporaryMessage() {"),
+  );
+  const requests = [];
+  const temporaryText = { value: "" };
+  const state = {
+    current: { id: "manta" },
+    temporaryCreating: false,
+    temporaryThreads: new Map(),
+    activeTemporaryBySource: new Map(),
+  };
+  const context = {
+    state,
+    $: (id) => (id === "temporaryText" ? temporaryText : { hidden: true }),
+    notify: () => {},
+    tr: (value) => value,
+    renderTemporaryMessages: () => {},
+    openTemporaryPanel: () => {},
+    command: async (request) => {
+      requests.push(request);
+      return { thread: { id: `temp-${requests.length}` } };
     },
   };
-  await assert.rejects(runInNewContext(`${writeSource}\nwrite("temp")`, context), /fork failed/);
-  assert.equal(message.value, "Retry in the main conversation");
-  assert.deepEqual(modes, ["steer"]);
-  assert.deepEqual(submitting, [true, false]);
+  const create = runInNewContext(`${createSource}\ncreateTemporaryThread`, context);
+  await create("manta", "turn-1");
+  state.temporaryThread.draft = "unfinished turn-1 question";
+  await create("manta", "turn-1");
+  await create("manta", "turn-2");
+  assert.equal(temporaryText.value, "");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(
+    requests.map((request) => request.last_turn_id),
+    ["turn-1", "turn-2"],
+  );
+  assert.equal(state.temporaryThreads.size, 2);
+  assert.equal(state.temporaryThread.id, "temp-2");
+  assert.equal(state.activeTemporaryBySource.get("manta"), "manta:turn-2");
+  await create("manta", "turn-1");
+  assert.equal(state.temporaryThread.id, "temp-1");
+  assert.equal(temporaryText.value, "unfinished turn-1 question");
+});
+
+test("selected text seeds only the first question in its own temporary branch", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const createSource = source.slice(
+    source.indexOf(
+      "async function createTemporaryThread(sourceThreadId, turnId, selection = null) {",
+    ),
+    source.indexOf("async function sendTemporaryMessage() {"),
+  );
+  const sendSource = source.slice(
+    source.indexOf("async function sendTemporaryMessage() {"),
+    source.indexOf("async function transcribeAudio(audio) {"),
+  );
+  const textarea = { value: "" },
+    requests = [];
+  const state = {
+    current: { id: "manta" },
+    temporaryCreating: false,
+    temporaryThreads: new Map(),
+    activeTemporaryBySource: new Map(),
+  };
+  const context = {
+    state,
+    $: (id) => (id === "temporaryText" ? textarea : { hidden: true }),
+    notify: () => {},
+    tr: (key) => key,
+    newSubmissionId: () => "submission",
+    renderTemporaryMessages: () => {},
+    openTemporaryPanel: () => {},
+    selectedContextPrompt: (selection, text) => `Selected: ${selection.text}\nQuestion: ${text}`,
+    command: async (request) => {
+      requests.push(request);
+      return request.command === "temporary_thread_create"
+        ? { thread: { id: `temp-${requests.length}` } }
+        : { turn_id: `turn-${requests.length}` };
+    },
+  };
+  const actions = runInNewContext(
+    `${createSource}\n${sendSource}\n({ createTemporaryThread, sendTemporaryMessage })`,
+    context,
+  );
+  const selection = { text: "still running", turnId: "active-turn", messageIndex: 7 };
+  await actions.createTemporaryThread("manta", "active-turn", selection);
+  assert.equal(state.temporaryThread.selection.text, "still running");
+  textarea.value = "Why?";
+  await actions.sendTemporaryMessage();
+  assert.equal(requests[1].text, "Selected: still running\nQuestion: Why?");
+  state.temporaryThread.activeTurnId = null;
+  textarea.value = "And then?";
+  await actions.sendTemporaryMessage();
+  assert.equal(requests[2].text, "And then?");
+  await actions.createTemporaryThread("manta", "active-turn");
+  assert.notEqual(state.temporaryThread.id, "temp-1");
+});
+
+test("temporary tool steps count distinct native tool items across start and completion", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const eventSource = source.slice(
+    source.indexOf("function handleTemporaryAppServerEvent(method, params, threadId) {"),
+    source.indexOf("function handleBridgeEvent(event) {"),
+  );
+  const temporary = { id: "temp-1", activeTurnId: "turn-1", messages: [], toolSteps: 0 };
+  const state = {
+    temporaryThreads: new Map([["source:turn", temporary]]),
+    temporaryThread: temporary,
+  };
+  let renders = 0;
+  const context = {
+    state,
+    appServerItemTool: (item) => (item?.type === "commandExecution" ? { id: item.id } : null),
+    renderTemporaryMessages: () => {
+      renders++;
+    },
+    temporaryItemText: () => "Done",
+  };
+  const handle = runInNewContext(`${eventSource}\nhandleTemporaryAppServerEvent`, context);
+  const tool = { type: "commandExecution", id: "call-1" };
+  assert.equal(handle("item/started", { item: tool }, "temp-1"), true);
+  handle("item/completed", { item: tool }, "temp-1");
+  handle("item/started", { item: { ...tool, id: "call-2" } }, "temp-1");
+  assert.equal(temporary.toolSteps, 2);
+  assert.equal(renders, 3);
+  handle("turn/completed", {}, "temp-1");
+  assert.equal(temporary.activeTurnId, null);
 });
 
 test("failed Temp turn keeps its text available for an explicit retry", async () => {
@@ -2591,11 +2864,10 @@ test("failed Temp turn keeps its text available for an explicit retry", async ()
     source.indexOf("async function sendTemporaryMessage() {"),
     source.indexOf("async function transcribeAudio(audio) {"),
   );
-  const textarea = { value: "Inspect this selection" };
+  const textarea = { value: "Inspect this turn" };
   const temporary = {
     id: "temporary-thread",
     sourceThreadId: "manta",
-    selection: { text: "selected text" },
     messages: [],
     activeTurnId: null,
   };
@@ -2604,7 +2876,6 @@ test("failed Temp turn keeps its text available for an explicit retry", async ()
     $: () => textarea,
     newSubmissionId: () => "temp-submission",
     renderTemporaryMessages: () => {},
-    selectedContextPrompt: (_selection, text) => text,
     command: async () => {
       throw new Error("turn start failed");
     },
@@ -2613,9 +2884,66 @@ test("failed Temp turn keeps its text available for an explicit retry", async ()
     runInNewContext(`${sendSource}\nsendTemporaryMessage()`, context),
     /turn start failed/,
   );
-  assert.equal(textarea.value, "Inspect this selection");
+  assert.equal(textarea.value, "Inspect this turn");
   assert.equal(temporary.activeTurnId, null);
   assert.equal(temporary.messages.at(-1).running, false);
+});
+
+test("failed Temp turn does not overwrite another branch's draft", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const sendSource = source.slice(
+    source.indexOf("async function sendTemporaryMessage() {"),
+    source.indexOf("async function transcribeAudio(audio) {"),
+  );
+  const textarea = { value: "First branch question" };
+  const first = { id: "temp-1", sourceThreadId: "manta", messages: [], activeTurnId: null };
+  const second = { id: "temp-2", sourceThreadId: "manta", draft: "Second branch draft" };
+  let rejectRequest;
+  const context = {
+    state: { current: { id: "manta" }, temporaryThread: first },
+    $: () => textarea,
+    newSubmissionId: () => "temp-submission",
+    renderTemporaryMessages: () => {},
+    command: () => new Promise((_, reject) => (rejectRequest = reject)),
+  };
+  const sending = runInNewContext(`${sendSource}\nsendTemporaryMessage()`, context);
+  context.state.temporaryThread = second;
+  textarea.value = second.draft;
+  rejectRequest(new Error("turn start failed"));
+  await assert.rejects(sending, /turn start failed/);
+  assert.equal(first.draft, "First branch question");
+  assert.equal(textarea.value, "Second branch draft");
+});
+
+test("Temp composer sends plain text to its own session ID", async () => {
+  const source = await readFile(mainScriptPath, "utf8");
+  const sendSource = source.slice(
+    source.indexOf("async function sendTemporaryMessage() {"),
+    source.indexOf("async function transcribeAudio(audio) {"),
+  );
+  const textarea = { value: "Inspect this turn" };
+  const temporary = {
+    id: "temp-123",
+    sourceThreadId: "manta",
+    messages: [],
+    activeTurnId: null,
+  };
+  let sent;
+  const context = {
+    state: { current: { id: "manta" }, temporaryThread: temporary },
+    $: () => textarea,
+    newSubmissionId: () => "temp-submission",
+    renderTemporaryMessages: () => {},
+    command: async (request) => {
+      sent = request;
+      return { turn_id: "temp-turn" };
+    },
+  };
+  await runInNewContext(`${sendSource}\nsendTemporaryMessage()`, context);
+  assert.equal(sent.thread_id, "temp-123");
+  assert.equal(sent.text, "Inspect this turn");
+  assert.equal(temporary.activeTurnId, "temp-turn");
+  assert.equal(textarea.value, "");
 });
 
 test("a lost Steer response reconciles server acceptance without trapping the composer", async () => {
@@ -2754,6 +3082,7 @@ test("stale writer status keeps Steer selection and submit controls available", 
   };
   const context = {
     state,
+    demoMode: false,
     $: element,
     document: { querySelector: () => element("shell") },
     tr: (key) => key,
@@ -2771,6 +3100,12 @@ test("stale writer status keeps Steer selection and submit controls available", 
   assert.equal(element("sendMode").value, "steer");
   assert.equal(element("sendModeToggle").disabled, false);
   assert.equal(element("submitBtn").disabled, false);
+  state.activeTurnId = null;
+  context.applyThreadWriterLock({ state: "unavailable", read_only: true });
+  assert.equal(element("relocateThreadBtn").disabled, false);
+  state.current = null;
+  context.applyThreadWriterLock({ state: "unavailable", read_only: true });
+  assert.equal(element("relocateThreadBtn").disabled, true);
 });
 
 test("a command timeout also covers a stalled response body", async () => {
@@ -2817,6 +3152,8 @@ test("a slow history page does not delay writer or queue state", async () => {
   };
   const context = {
     state,
+    goalStateVersion: 0,
+    snapshotIsCurrent,
     $: (id) => ({ textContent: "", id }),
     renderAsyncQuestion: () => {},
     applyThreadWriterLock: (lock) => locks.push(lock.state),
@@ -2831,6 +3168,7 @@ test("a slow history page does not delay writer or queue state", async () => {
     setMessageSyncPhase: () => {},
     yieldToBrowser: async () => {},
     refreshActivity: async () => {},
+    refreshEditableInterruptedTurn: async () => {},
     refreshAsyncQuestions: async () => {},
     fetchMessages: () => new Promise(() => {}),
     command: async (request) => {

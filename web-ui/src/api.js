@@ -1,5 +1,6 @@
 import { createAuthenticationGate } from "./auth-gate.js";
 import { createEventSequenceTracker } from "./event-sequence.js";
+import { sendFileUpload } from "./file-upload.js";
 
 export const $ = (id) => document.getElementById(id);
 
@@ -13,6 +14,21 @@ const eventListeners = new Set();
 const eventSequence = createEventSequenceTracker();
 const performanceBuckets = new Map();
 let performanceFlush = null;
+export async function uploadComposerFile(file, onProgress = () => {}) {
+  if (demoMode) return { id: crypto.randomUUID(), name: file.name, size: file.size };
+  await authenticate();
+  const encodedName = btoa(String.fromCharCode(...new TextEncoder().encode(file.name)));
+  try {
+    return await sendFileUpload(file, encodedName, onProgress);
+  } catch (error) {
+    if (error.status === 401) {
+      const expired = new Error("authentication expired; reload the page to sign in again");
+      authentication.block(expired);
+      throw expired;
+    }
+    throw error;
+  }
+}
 async function fetchWithTimeout(url, options, timeoutMs) {
   if (!timeoutMs) return fetch(url, options);
   const controller = new AbortController(),

@@ -15,6 +15,7 @@ pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const GIT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
 const GIT_BRANCH_PARALLELISM: usize = 16;
 const SUMMARY_CACHE_TTL: Duration = Duration::from_secs(3);
+const USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
 const MESSAGE_CACHE_ENTRIES: usize = 10;
 const BACKGROUND_COLD_WARM_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -97,9 +98,11 @@ pub struct SessionStore {
     summary_cache: Arc<Mutex<Option<SummaryCache>>>,
     ephemeral_threads: Arc<Mutex<HashMap<String, ThreadSummary>>>,
     ephemeral_chat_threads: Arc<Mutex<HashSet<String>>>,
+    cwd_overrides: Arc<Mutex<HashMap<String, PathBuf>>>,
     message_cache: Arc<Mutex<HashMap<PathBuf, CachedMessages>>>,
     message_load_locks: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     activity_cache: Arc<Mutex<HashMap<PathBuf, CachedActivity>>>,
+    usage_cache: Arc<Mutex<Option<(Instant, TokenUsageWindows)>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -369,6 +372,7 @@ const PINNED_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 pub struct ThreadProjectIndex {
     projects: HashMap<String, IndexedProject>,
     thread_projects: HashMap<String, Option<String>>,
+    thread_cwds: HashMap<String, PathBuf>,
     sections: Vec<(String, String)>,
     thread_sections: HashMap<String, String>,
     section_projects: HashMap<PathBuf, String>,
@@ -441,6 +445,16 @@ impl ThreadProjectIndex {
                 Some((id, project_id))
             })
             .collect();
+        let thread_cwds = threads
+            .iter()
+            .filter_map(|thread| {
+                let cwd = thread.get("cwd")?.as_str()?;
+                if !Path::new(cwd).is_absolute() {
+                    return None;
+                }
+                Some((thread.get("id")?.as_str()?.to_owned(), PathBuf::from(cwd)))
+            })
+            .collect();
         let sections = sections
             .get("data")
             .and_then(Value::as_array)
@@ -466,6 +480,7 @@ impl ThreadProjectIndex {
         Self {
             projects,
             thread_projects,
+            thread_cwds,
             sections,
             thread_sections,
             section_projects: HashMap::new(),
@@ -572,6 +587,10 @@ impl ThreadProjectIndex {
         Some(PathBuf::from(format!("{SECTION_PATH_PREFIX}{section_id}")))
     }
 
+    pub fn thread_cwds(&self) -> &HashMap<String, PathBuf> {
+        &self.thread_cwds
+    }
+
     fn group_for_thread(&self, thread: &ThreadSummary) -> (PathBuf, String, ProjectKind) {
         if let Some(section_id) = self.thread_sections.get(&thread.id) {
             if let Some((_, name)) = self.sections.iter().find(|(id, _)| id == section_id) {
@@ -587,10 +606,16 @@ impl ThreadProjectIndex {
                 .as_ref()
                 .and_then(|project_id| self.projects.get(project_id))
             {
-                let path = matching_project_root(project, &thread.cwd)
-                    .or_else(|| project.roots.first().cloned())
-                    .unwrap_or_else(|| thread.cwd.clone());
-                return (path, project.name.clone(), ProjectKind::Project);
+                let git_root = project_root_for_cwd(&thread.cwd);
+                let moved_to_git_project = git_root.join(".git").exists()
+                    && !project.roots.iter().any(|root| root == &git_root);
+                if let Some(path) = matching_project_root(project, &thread.cwd).or_else(|| {
+                    (!moved_to_git_project)
+                        .then(|| project.roots.first().cloned())
+                        .flatten()
+                }) {
+                    return (path, project.name.clone(), ProjectKind::Project);
+                }
             }
         }
         if let Some((project, path)) = self
@@ -604,6 +629,10 @@ impl ThreadProjectIndex {
             return (path, project.name.clone(), ProjectKind::Project);
         }
         if self.thread_projects.contains_key(&thread.id) {
+            let root = project_root_for_cwd(&thread.cwd);
+            if root.join(".git").exists() {
+                return (root.clone(), project_name(&root), ProjectKind::Project);
+            }
             return (
                 PathBuf::from(CHATS_PROJECT_PATH),
                 "Chats".to_owned(),
@@ -656,6 +685,8 @@ pub struct ProjectThreadSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessagePage {
     pub messages: Vec<ThreadMessage>,
+    #[serde(default)]
+    pub leading_turn_users: Vec<(usize, ThreadMessage)>,
     pub start: usize,
     pub end: usize,
     pub total: usize,
@@ -693,6 +724,30 @@ pub struct TokenUsageBreakdown {
     pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsageWindows {
+    pub seven_days: TokenUsageBreakdown,
+    pub thirty_days: TokenUsageBreakdown,
+    pub updated_at: u64,
+}
+
+impl TokenUsageBreakdown {
+    fn add(&mut self, other: Self) {
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(other.cache_write_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(other.reasoning_output_tokens);
+    }
 }
 
 impl TokenUsageBreakdown {
@@ -795,9 +850,11 @@ impl SessionStore {
             summary_cache: Arc::new(Mutex::new(None)),
             ephemeral_threads: Arc::new(Mutex::new(HashMap::new())),
             ephemeral_chat_threads: Arc::new(Mutex::new(HashSet::new())),
+            cwd_overrides: Arc::new(Mutex::new(HashMap::new())),
             message_cache: Arc::new(Mutex::new(HashMap::new())),
             message_load_locks: Arc::new(Mutex::new(HashMap::new())),
             activity_cache: Arc::new(Mutex::new(HashMap::new())),
+            usage_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -807,6 +864,85 @@ impl SessionStore {
 
     pub fn is_available(&self) -> bool {
         self.codex_home.join("sessions").is_dir()
+    }
+
+    pub fn token_usage_windows(&self) -> Result<TokenUsageWindows> {
+        if let Ok(cache) = self.usage_cache.lock() {
+            if let Some((at, usage)) = *cache {
+                if at.elapsed() < USAGE_CACHE_TTL {
+                    return Ok(usage);
+                }
+            }
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let usage = self.scan_token_usage_windows(now)?;
+        if let Ok(mut cache) = self.usage_cache.lock() {
+            *cache = Some((Instant::now(), usage));
+        }
+        Ok(usage)
+    }
+
+    fn scan_token_usage_windows(&self, now: u64) -> Result<TokenUsageWindows> {
+        let seven_cutoff = now.saturating_sub(7 * 86_400);
+        let thirty_cutoff = now.saturating_sub(30 * 86_400);
+        let mut usage = TokenUsageWindows {
+            updated_at: now,
+            ..Default::default()
+        };
+        let mut files = Vec::new();
+        collect_rollout_files(&self.codex_home.join("sessions"), false, &mut files)?;
+        collect_rollout_files(&self.codex_home.join("archived_sessions"), true, &mut files)?;
+        for (path, _) in files {
+            if fs::metadata(&path)?
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .is_some_and(|modified| modified.as_secs() < thirty_cutoff)
+            {
+                continue;
+            }
+            let file = File::open(&path)?;
+            let mut previous = TokenUsageBreakdown::default();
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if !line.contains("\"token_count\"") {
+                    continue;
+                }
+                let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if record.get("type").and_then(Value::as_str) != Some("event_msg")
+                    || record.pointer("/payload/type").and_then(Value::as_str)
+                        != Some("token_count")
+                {
+                    continue;
+                }
+                let Some(total) = record.pointer("/payload/info/total_token_usage") else {
+                    continue;
+                };
+                let current = TokenUsageBreakdown::from_rollout(total);
+                let delta = if current.total_tokens < previous.total_tokens {
+                    current
+                } else {
+                    current.since(previous)
+                };
+                previous = current;
+                let Some(timestamp) = record
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(rollout_timestamp_seconds)
+                else {
+                    continue;
+                };
+                if timestamp >= thirty_cutoff && timestamp <= now {
+                    usage.thirty_days.add(delta);
+                    if timestamp >= seven_cutoff {
+                        usage.seven_days.add(delta);
+                    }
+                }
+            }
+        }
+        Ok(usage)
     }
 
     /// Validate and repair one session while its app-server writer is stopped by the caller.
@@ -887,6 +1023,37 @@ impl SessionStore {
         }
     }
 
+    pub fn set_thread_cwd(&self, thread_id: &str, cwd: PathBuf) {
+        if let Ok(mut overrides) = self.cwd_overrides.lock() {
+            overrides.insert(thread_id.to_owned(), cwd.clone());
+        }
+        if let Ok(mut threads) = self.ephemeral_threads.lock() {
+            if let Some(thread) = threads.get_mut(thread_id) {
+                thread.cwd = cwd;
+            }
+        }
+        if let Ok(mut chats) = self.ephemeral_chat_threads.lock() {
+            chats.remove(thread_id);
+        }
+    }
+
+    pub fn sync_thread_cwds(&self, index: &ThreadProjectIndex) {
+        if let Ok(mut overrides) = self.cwd_overrides.lock() {
+            overrides.extend(index.thread_cwds().clone());
+        }
+    }
+
+    fn apply_cwd_overrides(&self, threads: &mut [ThreadSummary]) {
+        if let Ok(overrides) = self.cwd_overrides.lock() {
+            for thread in threads {
+                if let Some(cwd) = overrides.get(&thread.id) {
+                    thread.cwd = cwd.clone();
+                    thread.git_branch = None;
+                }
+            }
+        }
+    }
+
     pub fn remove_ephemeral_thread(&self, thread_id: &str) {
         if let Ok(mut threads) = self.ephemeral_threads.lock() {
             threads.remove(thread_id);
@@ -920,9 +1087,8 @@ impl SessionStore {
 
     pub fn find_thread(&self, thread_id: &str) -> Result<Option<ThreadSummary>> {
         // An exact lookup should not turn an expired list-cache TTL into a full
-        // rollout rescan. Thread identity and cwd are immutable rollout
-        // metadata, so a stale list entry is still suitable for detail and file
-        // authorization requests. Newly started threads are covered by the
+        // rollout rescan. Thread identity and rollout path are immutable here;
+        // app-server cwd changes are overlaid below. Newly started threads are covered by the
         // ephemeral index. On a genuine miss, inspect only rollout filenames
         // matching this id instead of parsing every thread to rebuild the list.
         let mut thread = self.summary_cache.lock().ok().and_then(|cache| {
@@ -940,8 +1106,24 @@ impl SessionStore {
                 .ok()
                 .and_then(|threads| threads.get(thread_id).cloned());
         }
-        if thread.is_none() {
-            thread = self.find_rollout_thread(thread_id, false)?;
+        // A newly created thread has no rollout yet. Once the first turn writes
+        // one, the cached/ephemeral summary must stop masking its messages.
+        if thread
+            .as_ref()
+            .is_none_or(|summary| summary.rollout_path.as_os_str().is_empty())
+        {
+            if let Some(stored) = self.find_rollout_thread(thread_id, false)? {
+                if let Ok(mut ephemeral) = self.ephemeral_threads.lock() {
+                    ephemeral.remove(thread_id);
+                }
+                if let Ok(mut cache) = self.summary_cache.lock() {
+                    if let Some(cache) = cache.as_mut() {
+                        cache.threads.retain(|summary| summary.id != thread_id);
+                        cache.threads.push(stored.clone());
+                    }
+                }
+                thread = Some(stored);
+            }
         }
         if thread.is_none() {
             // Preserve compatibility with imported or test rollouts whose
@@ -953,6 +1135,7 @@ impl SessionStore {
                 .find(|thread| thread.id == thread_id);
         }
         if let Some(thread) = &mut thread {
+            self.apply_cwd_overrides(std::slice::from_mut(thread));
             populate_git_branches(std::slice::from_mut(thread), &self.git_branch_cache);
         }
         Ok(thread)
@@ -1186,10 +1369,12 @@ impl SessionStore {
         if let Ok(cache) = self.summary_cache.lock() {
             if let Some(cache) = cache.as_ref() {
                 if cache.refreshed_at.elapsed() <= SUMMARY_CACHE_TTL {
-                    return Ok(self.merge_ephemeral_threads(filter_archived(
+                    let mut threads = self.merge_ephemeral_threads(filter_archived(
                         cache.threads.clone(),
                         include_archived,
-                    )));
+                    ));
+                    self.apply_cwd_overrides(&mut threads);
+                    return Ok(threads);
                 }
             }
         }
@@ -1201,7 +1386,9 @@ impl SessionStore {
                 threads: threads.clone(),
             });
         }
-        Ok(self.merge_ephemeral_threads(filter_archived(threads, include_archived)))
+        let mut threads = self.merge_ephemeral_threads(filter_archived(threads, include_archived));
+        self.apply_cwd_overrides(&mut threads);
+        Ok(threads)
     }
 
     fn merge_ephemeral_threads(&self, mut threads: Vec<ThreadSummary>) -> Vec<ThreadSummary> {
@@ -1347,6 +1534,7 @@ impl SessionStore {
                 summary,
                 MessagePage {
                     messages: Vec::new(),
+                    leading_turn_users: Vec::new(),
                     start: 0,
                     end: 0,
                     total: 0,
@@ -1366,10 +1554,31 @@ impl SessionStore {
         let start = end.saturating_sub(limit);
         let mut page_messages = messages[start..end].to_vec();
         retain_latest_tool_activities(&messages, &mut page_messages, start);
+        let leading_turn_users = if before.is_none() {
+            messages
+                .last()
+                .and_then(|last| last.turn_id.as_deref())
+                .map(|turn_id| {
+                    messages[..start]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .take_while(|(_, message)| message.turn_id.as_deref() == Some(turn_id))
+                        .filter(|(_, message)| message.role == "user")
+                        .map(|(index, message)| (index, message.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut leading_turn_users = leading_turn_users;
+        leading_turn_users.reverse();
         Ok((
             summary,
             MessagePage {
                 messages: page_messages,
+                leading_turn_users,
                 start,
                 end,
                 total,
@@ -1926,6 +2135,62 @@ fn collect_rollout_files(
         }
     }
     Ok(())
+}
+
+fn rollout_timestamp_seconds(timestamp: &str) -> Option<u64> {
+    let date = timestamp.get(..10)?;
+    let time = timestamp.get(11..19)?;
+    if timestamp.as_bytes().get(10) != Some(&b'T') {
+        return None;
+    }
+    let year = date.get(..4)?.parse::<i64>().ok()?;
+    let month = date.get(5..7)?.parse::<i64>().ok()?;
+    let day = date.get(8..10)?.parse::<i64>().ok()?;
+    let hour = time.get(..2)?.parse::<i64>().ok()?;
+    let minute = time.get(3..5)?.parse::<i64>().ok()?;
+    let second = time.get(6..8)?.parse::<i64>().ok()?;
+    if date.as_bytes().get(4) != Some(&b'-')
+        || date.as_bytes().get(7) != Some(&b'-')
+        || time.as_bytes().get(2) != Some(&b':')
+        || time.as_bytes().get(5) != Some(&b':')
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let suffix = timestamp
+        .get(19..)?
+        .trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = if suffix == "Z" {
+        0
+    } else {
+        let sign = match suffix.as_bytes().first()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if suffix.as_bytes().get(3) != Some(&b':') || suffix.len() != 6 {
+            return None;
+        }
+        let hours = suffix.get(1..3)?.parse::<i64>().ok()?;
+        let minutes = suffix.get(4..6)?.parse::<i64>().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+    // Gregorian civil date to days since the Unix epoch.
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second - offset).ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3184,6 +3449,29 @@ mod tests {
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn token_usage_windows_count_deltas_once_in_their_event_window() {
+        let fixture = Fixture::new();
+        fixture.write_rollout("rollout-usage.jsonl", &[
+            r#"{"timestamp":"2026-09-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100,"input_tokens":80,"output_tokens":20}}}}"#,
+            r#"{"timestamp":"2026-09-25T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":180,"input_tokens":140,"output_tokens":40}}}}"#,
+            r#"{"timestamp":"2026-10-08T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":210,"input_tokens":160,"output_tokens":50}}}}"#,
+            r#"{"timestamp":"2026-10-08T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":210,"input_tokens":160,"output_tokens":50}}}}"#,
+            r#"{"timestamp":"2026-10-09T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":5,"input_tokens":4,"output_tokens":1}}}}"#,
+        ]);
+        let now = rollout_timestamp_seconds("2026-10-10T12:00:00Z").unwrap();
+        let usage = SessionStore::new(fixture.path.clone())
+            .scan_token_usage_windows(now)
+            .unwrap();
+        assert_eq!(usage.thirty_days.total_tokens, 115);
+        assert_eq!(usage.seven_days.total_tokens, 35);
+        assert_eq!(usage.seven_days.input_tokens, 24);
+        assert_eq!(
+            rollout_timestamp_seconds("1970-01-01T01:00:00+01:00"),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn repairs_a_duplicate_rollout_ordinal_without_dropping_events() {
         let fixture = Fixture::new();
         let path = fixture.write_rollout(
@@ -3843,6 +4131,38 @@ mod tests {
     }
 
     #[test]
+    fn app_server_cwd_moves_chat_into_new_git_project_without_rewriting_rollout() {
+        let fixture = Fixture::new();
+        let chat = fixture.path.join("chat");
+        let project = fixture.path.join("projects/new-project");
+        fs::create_dir_all(&chat).unwrap();
+        init_git_repo(&project, "main");
+        let record = format!(
+            r#"{{"timestamp":"2026-09-09T01:00:00Z","type":"session_meta","payload":{{"id":"relocated-thread","cwd":{}}}}}"#,
+            serde_json::to_string(&chat).unwrap()
+        );
+        let rollout = fixture.write_rollout("rollout-relocated.jsonl", &[&record]);
+        let index = ThreadProjectIndex::from_app_server(
+            &json!({"data":[]}),
+            &[json!({"id":"relocated-thread","cwd":project,"projectId":null})],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        store.sync_thread_cwds(&index);
+        let summary = store.find_thread("relocated-thread").unwrap().unwrap();
+        assert_eq!(summary.cwd, project);
+        let projects = store.list_projects_with_index(false, Some(&index)).unwrap();
+        assert_eq!(
+            projects
+                .iter()
+                .find(|entry| entry.path == project)
+                .unwrap()
+                .thread_count,
+            1
+        );
+        assert_eq!(fs::read_to_string(rollout).unwrap().trim(), record);
+    }
+
+    #[test]
     fn message_pages_only_return_the_requested_slice() {
         let fixture = Fixture::new();
         fixture.write_rollout(
@@ -3878,6 +4198,78 @@ mod tests {
         assert_eq!((older.start, older.end), (0, 2));
         assert!(!older.has_more);
         assert_eq!(older.messages[1].id.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn first_prompt_promotes_an_ephemeral_thread_when_its_rollout_appears() {
+        let fixture = Fixture::new();
+        let store = SessionStore::new(fixture.path.clone());
+        store.register_ephemeral_thread(
+            "thread-first-prompt".to_owned(),
+            PathBuf::from("/tmp/project"),
+            None,
+            1,
+            false,
+        );
+        // Populate the list cache before the app-server creates the rollout.
+        assert_eq!(store.list_threads(false).unwrap().len(), 1);
+        let (_, empty) = store
+            .read_message_page("thread-first-prompt", None, 8)
+            .unwrap()
+            .unwrap();
+        assert!(empty.messages.is_empty());
+
+        fixture.write_rollout(
+            "rollout-2026-08-30T01-00-00-thread-first-prompt.jsonl",
+            &[
+                r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-first-prompt","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-30T01:00:01Z","type":"response_item","payload":{"type":"message","id":"first-prompt","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            ],
+        );
+
+        let (summary, page) = store
+            .read_message_page("thread-first-prompt", None, 8)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.rollout_path.as_os_str().is_empty());
+        assert_eq!(page.messages[0].id.as_deref(), Some("first-prompt"));
+        let listed = store.list_threads(false).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].rollout_path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn latest_page_keeps_the_running_turn_prompt_separate_from_its_bounded_slice() {
+        let fixture = Fixture::new();
+        fixture.write_rollout(
+            "rollout-turn-prompt.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"thread-turn-prompt","cwd":"/tmp/project"}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","id":"prompt","role":"user","content":[{"type":"input_text","text":"start"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-active"}}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","id":"tool-one","role":"assistant","content":[{"type":"output_text","text":"working"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-active"}}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","id":"steer","role":"user","content":[{"type":"input_text","text":"more"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-active"}}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","id":"tool-two","role":"assistant","content":[{"type":"output_text","text":"still working"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-active"}}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, latest) = store
+            .read_message_page("thread-turn-prompt", None, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!((latest.start, latest.end), (3, 4));
+        assert_eq!(
+            latest
+                .leading_turn_users
+                .iter()
+                .map(|(index, message)| (*index, message.id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(0, Some("prompt")), (2, Some("steer"))]
+        );
+        let (_, older) = store
+            .read_message_page("thread-turn-prompt", Some(latest.start), 1)
+            .unwrap()
+            .unwrap();
+        assert!(older.leading_turn_users.is_empty());
     }
 
     #[test]

@@ -28,6 +28,12 @@ Message text and attachments come from durable rollout pagination. Tool groups p
 typed `thread/turns/list` items and fall back to raw rollout calls only when app-server data is not
 available, avoiding JavaScript-wrapper parsing in the normal path.
 
+The menu after a completed turn offers Copy, Fork, and a temporary conversation. Selecting text in
+a message also offers a temporary conversation that carries the selection into its first question.
+Fork creates a new session in the current directory or a new Git worktree. A temporary conversation
+opens its own composer and shows a copyable session ID and tool step count.
+Project rows also open the session creation dialog directly at that directory/worktree choice.
+
 The composer uses a single compact **Steer/Queue** button. Clicking it switches how the next
 message is delivered without consuming space for two side-by-side controls.
 
@@ -47,9 +53,9 @@ npm run dev
 npm run build
 ```
 
-The development server proxies `/api` to the default bridge address at
-`http://127.0.0.1:18791`. Basic Auth bootstraps a seven-day HttpOnly browser session cookie whose
-private token survives ordinary bridge restarts. An authenticated same-host reverse proxy may use
+The development server proxies `/api` and `/login` to the default bridge address at
+`http://127.0.0.1:18791`. The sign-in form creates a seven-day HttpOnly browser session cookie
+whose private token survives ordinary bridge restarts. An authenticated same-host reverse proxy may use
 `--web-ui-no-auth`, which is restricted to loopback listeners.
 
 `dist/` is checked in because Rust uses `include_str!` to package these deterministic asset

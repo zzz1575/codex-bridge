@@ -2,6 +2,7 @@ const attachmentLabels = new Map([
   ["Image attachment", "image"],
   ["Audio attachment", "audio"],
   ["Pasted text attachment", "pasted_text"],
+  ["File attachment", "file"],
 ]);
 
 function inputFingerprint(textParts, attachments) {
@@ -10,6 +11,7 @@ function inputFingerprint(textParts, attachments) {
     image: attachments.filter((kind) => kind === "image").length,
     audio: attachments.filter((kind) => kind === "audio").length,
     pastedText: attachments.filter((kind) => kind === "pasted_text").length,
+    file: attachments.filter((kind) => kind === "file").length,
   });
 }
 
@@ -17,9 +19,10 @@ function pendingFingerprint(entry) {
   const textParts = [],
     attachments = [];
   for (const line of String(entry?.text || "").split("\n")) {
-    const match = /^\[(Image attachment|Audio attachment|Pasted text attachment)\]$/.exec(
-      line.trim(),
-    );
+    const match =
+      /^\[(Image attachment|Audio attachment|Pasted text attachment|File attachment)\]$/.exec(
+        line.trim(),
+      );
     if (match) attachments.push(attachmentLabels.get(match[1]));
     else textParts.push(line);
   }
@@ -32,6 +35,9 @@ function messageFingerprint(message) {
   for (const item of message?.content || []) {
     if (item.kind === "text" && typeof item.text === "string") textParts.push(item.text);
     else if (item.kind === "pasted_text") attachments.push("pasted_text");
+    else if (item.kind === "uploaded_file") attachments.push("file");
+    else if (item.kind === "context" && item.label === "Attached-file context")
+      attachments.push("file");
     else if (item.kind === "context" && attachmentLabels.has(item.label)) {
       attachments.push(attachmentLabels.get(item.label));
     }
@@ -48,7 +54,9 @@ export function pendingInputSummary(text, attachments) {
         ? "[Audio attachment]"
         : attachment.type === "pasted_text"
           ? "[Pasted text attachment]"
-          : "[Image attachment]",
+          : attachment.type === "file"
+            ? "[File attachment]"
+            : "[Image attachment]",
     );
   }
   return parts.join("\n");

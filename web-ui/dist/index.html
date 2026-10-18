@@ -7,8 +7,11 @@
       content="width=device-width,initial-scale=1,interactive-widget=resizes-content"
     />
     <title>Codex App Server WebUI</title>
-    <script type="module" crossorigin src="/assets/app.js?v=9c635c3298b8"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=c15de27e5b6b">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico?v=f4d2cd6622e1" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/app-icon.png?v=6f9077d5595d" />
+    <link rel="apple-touch-icon" href="/app-icon.png?v=6f9077d5595d" />
+    <script type="module" crossorigin src="/assets/app.js?v=f24bc9f6274e"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=cb1f1c1cdae9">
   </head>
   <body>
     <div class="app">
@@ -19,7 +22,9 @@
             href="https://github.com/hitsmaxft/codex-bridge"
             target="_blank"
             rel="noreferrer"
-            ><span class="dot"></span><span>Codex App Server WebUI</span></a
+            ><img class="brand-icon" src="/app-icon.png?v=6f9077d5595d" alt="" width="28" height="28" /><span
+              >Codex App Server WebUI</span
+            ></a
           ><button
             class="settings-toggle"
             id="settingsBtn"
@@ -84,6 +89,13 @@
             <div class="component-status" id="componentStatus"></div>
             <div class="resource-status" id="resourceStatus"></div>
             <button id="statusBtn" data-i18n="refreshStatus">Refresh status</button>
+          </section>
+          <section class="settings-card">
+            <h3 data-i18n="usageHistory">Token usage</h3>
+            <div class="usage-windows" id="usageWindows" aria-live="polite"></div>
+            <div class="settings-help" data-i18n="usageHistoryHelp">
+              From local session history · refreshes every 5 minutes
+            </div>
           </section>
           <section class="settings-card">
             <label for="languageBtn" data-i18n="language">Language</label>
@@ -294,8 +306,8 @@
               <button
                 id="attachBtn"
                 type="button"
-                data-i18n-aria-label="addImage"
-                aria-label="Add image"
+                data-i18n-aria-label="addFile"
+                aria-label="Add file"
               >
                 <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
               </button>
@@ -313,19 +325,13 @@
                 </svg>
               </button>
             </div>
-            <input
-              id="imageInput"
-              type="file"
-              accept="image/jpeg,image/png,image/webp,image/gif"
-              multiple
-              hidden
-            />
+            <input id="fileInput" type="file" multiple hidden />
             <input id="audioInput" type="file" accept="audio/*" capture hidden disabled />
             <input id="sendMode" type="hidden" value="steer" /><textarea
               id="messageText"
               rows="1"
               data-i18n-placeholder="messagePlaceholder"
-              placeholder="Type a message… · Enter to send, Shift+Enter for a new line"
+              placeholder="Type a message… · ⌘ Enter to send"
               aria-controls="composerCommandOptions"
               aria-expanded="false"
             ></textarea
@@ -374,6 +380,7 @@
           </button>
           <div class="head-copy">
             <h2 id="temporaryTitle">Temporary conversation</h2>
+            <button class="temporary-id" id="temporaryIdBtn" type="button" hidden></button>
             <div class="compact-meta" id="temporaryCompactHint">
               In memory · not saved to history
             </div>
@@ -382,6 +389,14 @@
         </div>
         <div class="temporary-messages" id="temporaryMessages"></div>
         <div class="composer temporary-composer" id="temporaryComposer">
+          <div class="composer-reference temporary-reference" id="temporaryReference" hidden>
+            <div class="composer-reference-content">
+              <span class="composer-reference-label" data-i18n="selectedContext"
+                >Selected context</span
+              >
+              <span class="composer-reference-text" id="temporaryReferenceText"></span>
+            </div>
+          </div>
           <div class="composer-shell temporary-composer-shell">
             <div class="send-modes" aria-hidden="true">
               <span class="mode-button" data-i18n="temporaryShort">Temp</span>
@@ -390,7 +405,7 @@
               id="temporaryText"
               rows="1"
               data-i18n-placeholder="temporaryPlaceholder"
-              placeholder="Ask about the selected text…"
+              placeholder="Ask in this temporary conversation…"
             ></textarea>
             <button class="danger" id="temporaryStopBtn" type="button" hidden>
               <span class="submit-stop" aria-hidden="true"></span>
@@ -424,6 +439,9 @@
           <div class="tool-row">
             <button id="copySessionIdBtn" type="button" data-i18n="copySessionId" disabled>
               Copy session ID
+            </button>
+            <button id="relocateThreadBtn" type="button" data-i18n="relocateSession" disabled>
+              Change session directory
             </button>
             <button id="renameThreadBtn" data-i18n="renameCurrent">Rename session</button>
             <button id="collapseMessagesBtn" data-i18n="collapseMessages">Collapse messages</button>
@@ -702,6 +720,40 @@
         <div class="create-actions">
           <span class="create-progress" id="createProgress"></span
           ><button id="createCancelBtn" data-i18n="cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div
+      class="create-dialog"
+      id="forkDialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="forkTitle"
+      hidden
+    >
+      <div class="create-card">
+        <h2 id="forkTitle" data-i18n="forkSession">Fork session</h2>
+        <p class="create-step-help" data-i18n="forkSessionHelp">
+          Continue from the end of this turn in a new session.
+        </p>
+        <div class="create-options">
+          <button class="create-option" id="forkCurrentBtn" type="button">
+            <strong data-i18n="currentDirectory">Current directory</strong>
+            <span data-i18n="currentDirectoryHelp"
+              >Start in the existing directory and include current uncommitted changes.</span
+            >
+          </button>
+          <button class="create-option" id="forkWorktreeBtn" type="button">
+            <strong data-i18n="newWorktree">New worktree</strong>
+            <span data-i18n="newWorktreeHelp"
+              >Create an isolated detached worktree from HEAD; uncommitted changes are not
+              copied.</span
+            >
+          </button>
+        </div>
+        <div class="create-actions">
+          <span class="create-progress" id="forkProgress"></span
+          ><button id="forkCancelBtn" type="button" data-i18n="cancel">Cancel</button>
         </div>
       </div>
     </div>

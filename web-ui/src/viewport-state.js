@@ -33,6 +33,15 @@ export function messageIdentity(message) {
   return id ? `id:${id}` : `index:${message?.message_index ?? "unknown"}`;
 }
 
+export function visibleTimelineMessages(messages, leadingTurnUsers) {
+  if (!leadingTurnUsers?.length) return messages;
+  const loaded = new Set(messages.map((message) => message.message_index));
+  return [
+    ...messages,
+    ...leadingTurnUsers.filter((message) => !loaded.has(message.message_index)),
+  ].sort((a, b) => a.message_index - b.message_index);
+}
+
 export function toolGroupIdentity(threadId, message, liveTool = null) {
   // A message-level tool group grows by appending calls while a turn runs. Its
   // first call is the stable anchor; using the newest call would rename the

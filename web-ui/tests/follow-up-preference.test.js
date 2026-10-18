@@ -208,12 +208,28 @@ test("polling idle activity does not replace follow-up with queue", async () => 
   assert.deepEqual(c.modeChanges, []);
 });
 
-test("leaving a temporary selection returns to follow-up even while idle", () => {
-  const c = composer({ mode: "temp" });
+test("a temporary branch opens separately without replacing the main follow-up preference", async () => {
+  const c = composer();
+  Object.assign(c.state, {
+    temporaryThreads: new Map(),
+    activeTemporaryBySource: new Map(),
+    temporaryCreating: false,
+  });
+  const temporaryText = { value: "" },
+    panel = { hidden: true };
+  c.context.$ = (id) => c.elements[id] || (id === "temporaryText" ? temporaryText : panel);
+  Object.assign(c.context, {
+    command: async () => ({ thread: { id: "temporary-fixture" } }),
+    renderTemporaryMessages() {},
+    openTemporaryPanel() {},
+  });
   vm.runInContext(
-    functionSource("function setTemporarySelection(", "async function createTemporaryThread("),
+    functionSource("async function createTemporaryThread(", "async function sendTemporaryMessage("),
     c.context,
   );
-  c.context.setTemporarySelection(null);
+  assert.equal(await c.context.createTemporaryThread("thread-fixture", "turn-fixture"), true);
+  assert.equal(c.state.temporaryThread.id, "temporary-fixture");
+  assert.equal(c.elements.messageText.value, "Next instruction");
   assert.equal(c.elements.sendMode.value, "steer");
+  assert.deepEqual(c.modeChanges, []);
 });

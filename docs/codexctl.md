@@ -18,7 +18,8 @@ CODEX_BRIDGE_SOCKET=/path/to/control.sock codexctl status
 
 Read commands may use the selected task or the newest unarchived rollout. Write commands are more
 strict: `send`, `steer`, `interrupt`, and `host-exec` require either a prior `select` or an explicit
-global `--thread`. They never infer a write target from file modification time.
+global `--thread`. `relocate` requires an explicit `--thread`. They never infer a write target from
+file modification time.
 
 ```sh
 codexctl ls --limit 20
@@ -39,10 +40,14 @@ focus.
 | Command               | Purpose                                                | Backend status       |
 | --------------------- | ------------------------------------------------------ | -------------------- |
 | `ls`                  | List tasks from the rollout store                      | Implemented          |
+| `projects`            | List Codex projects                                    | Implemented          |
+| `project create`      | Register an existing project directory                 | Implemented          |
+| `new`                 | Create a session in a project or Chats                 | Implemented          |
 | `select`              | Set the daemon's default write target                  | Implemented          |
 | `current`             | Show the selected task, or the newest readable rollout | Implemented          |
 | `status`              | Show daemon, protocol, and rollout-store status        | Implemented          |
 | `show`                | Read user and assistant messages                       | Implemented          |
+| `relocate`            | Change an existing session's working directory         | Implemented          |
 | `send`                | Queue a new turn with `codex queue`                    | Implemented          |
 | `steer`               | Add guidance to the active turn through app-server     | Implemented          |
 | `interrupt`           | Interrupt the active turn through app-server           | Implemented          |
@@ -71,6 +76,12 @@ codexctl status --json
 codexctl ls --limit 50
 codexctl ls --include-archived --json
 
+codexctl projects
+codexctl project create /path/to/project --name "My project"
+codexctl new --project /path/to/project
+codexctl new --project /path/to/project --worktree
+codexctl new --chat
+
 codexctl show
 codexctl show --last 20
 codexctl show <THREAD_ID> --json
@@ -79,13 +90,29 @@ codexctl --thread <THREAD_ID> show --last 50
 
 `ls` and `show` read `$CODEX_HOME/sessions` and `session_index.jsonl` without resuming a task or
 taking writer ownership. Message reads keep only user and assistant messages, tolerate a rollout
-that is still being appended, and return the task's recorded working directory. The task list also
+that is still being appended, and return the session's current working directory. The task list also
 tries `git branch --show-current` in that directory; JSON uses `null` if the directory is gone, is
 not a Git repository, or is on a detached HEAD.
+
+`project create` registers a directory that already exists. It does not create a filesystem
+directory or start a session. `new` starts an empty session and selects it as the daemon's current
+thread. Without options it uses the caller's current directory; `--chat` creates a projectless
+Chats session. Use `send` with the returned thread ID to submit the first prompt.
 
 `ls --json` and `current --json` include both `cwd` (the task's working directory) and
 `rollout_path` (the session JSONL file, when one exists). `codexctl` has no separate command to
 open the containing session directory.
+
+After moving a Chat workspace into an existing project directory, point its session at that
+directory before the next turn:
+
+```sh
+codexctl --thread <THREAD_ID> relocate /path/to/project
+```
+
+The directory must already exist and be absolute. The session must be idle, with no other
+app-server holding its writer. This changes where subsequent turns run and updates the project list; it
+does not move files. The same action is available in the Web UI session tools.
 
 Override the read store for an isolated or offline inspection by starting the daemon with
 `--codex-home PATH`. This changes the daemon, not `codexctl` itself.

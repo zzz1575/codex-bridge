@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Query, RawQuery, Request as AxumRequest, State};
+use axum::extract::{DefaultBodyLimit, Form, Query, RawQuery, Request as AxumRequest, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response as HttpResponse};
@@ -45,11 +45,12 @@ mod pasted_text;
 mod whisper;
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
-const MAX_WEB_REQUEST_BYTES: usize = 12 * 1024 * 1024;
+const MAX_WEB_REQUEST_BYTES: usize = 34 * 1024 * 1024;
+const MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COMPOSER_ATTACHMENTS: usize = 6;
 const MAX_ATTACHMENT_URL_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ATTACHMENT_TOTAL_BYTES: usize = 10 * 1024 * 1024;
-const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 33 * 1024 * 1024;
 const DESKTOP_WS_MAX_BYTES: usize = 64 << 20;
 const DOWNLOAD_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const PROJECT_INDEX_TTL: Duration = Duration::from_secs(10);
@@ -64,9 +65,12 @@ const DEFAULT_WS_BRIDGE_ADDR: &str = "127.0.0.1:18790";
 const DEFAULT_WHISPER_ADDR: &str = "127.0.0.1:18792";
 const DESKTOP_CODEX_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const WEB_INDEX: &str = include_str!("../../../web-ui/dist/index.html");
+const WEB_LOGIN: &str = include_str!("../../../web-ui/login.html");
 const WEB_APP_JS: &str = include_str!("../../../web-ui/dist/assets/app.js");
 const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const WEB_FILE_PREVIEW_JS: &str = include_str!("../../../web-ui/dist/assets/file-preview.js");
+const WEB_APP_ICON: &[u8] = include_bytes!("../../../web-ui/dist/app-icon.png");
+const WEB_FAVICON: &[u8] = include_bytes!("../../../web-ui/dist/favicon.ico");
 const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
 const MAX_PERFORMANCE_EVENTS: usize = 128;
@@ -462,6 +466,12 @@ struct WebAuth {
     username: String,
     password: String,
     session_token: String,
+}
+
+#[derive(Deserialize)]
+struct WebLoginForm {
+    username: String,
+    password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1098,12 +1108,13 @@ fn queue_input_text(input: &Value) -> Option<String> {
                         if !wrapper.request.trim().is_empty() {
                             parts.push(wrapper.request.trim().to_owned());
                         }
-                        parts.extend(
-                            wrapper
-                                .paths
-                                .iter()
-                                .map(|_| "[Pasted text attachment]".to_owned()),
-                        );
+                        parts.extend(wrapper.paths.iter().map(|path| {
+                            if pasted_text::is_upload_path(path) {
+                                "[File attachment]".to_owned()
+                            } else {
+                                "[Pasted text attachment]".to_owned()
+                            }
+                        }));
                     } else {
                         parts.push(text.to_owned());
                     }
@@ -1137,6 +1148,7 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
                 url.len()
             }
             ComposerAttachment::PastedText { text, .. } => text.len(),
+            ComposerAttachment::File { .. } => 0,
         })
     });
     if total_bytes > MAX_ATTACHMENT_TOTAL_BYTES {
@@ -1150,7 +1162,10 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
         input.push(json!({"type":"text", "text":text, "text_elements":[]}));
     }
     for attachment in attachments {
-        if matches!(attachment, ComposerAttachment::PastedText { .. }) {
+        if matches!(
+            attachment,
+            ComposerAttachment::PastedText { .. } | ComposerAttachment::File { .. }
+        ) {
             continue;
         }
         if matches!(attachment, ComposerAttachment::Audio { .. }) {
@@ -1182,6 +1197,7 @@ fn composer_input(text: &str, attachments: &[ComposerAttachment]) -> Result<Vec<
             ),
             ComposerAttachment::Audio { .. } => unreachable!("audio rejected above"),
             ComposerAttachment::PastedText { .. } => unreachable!("pasted text skipped above"),
+            ComposerAttachment::File { .. } => unreachable!("uploaded file skipped above"),
         };
         if url.len() > MAX_ATTACHMENT_URL_BYTES || !valid_prefix {
             return Err(Response::error(
@@ -1256,6 +1272,7 @@ fn pending_input_summary(text: &str, attachments: &[ComposerAttachment]) -> Stri
             ComposerAttachment::Image { .. } => "[Image attachment]".to_owned(),
             ComposerAttachment::Audio { .. } => "[Audio attachment]".to_owned(),
             ComposerAttachment::PastedText { .. } => "[Pasted text attachment]".to_owned(),
+            ComposerAttachment::File { .. } => "[File attachment]".to_owned(),
         });
     }
     parts.join("\n")
@@ -1336,10 +1353,26 @@ fn thread_message_input_summary(message: &ThreadMessage) -> Option<String> {
         .iter()
         .filter_map(
             |content| match content.get("type").and_then(Value::as_str) {
-                Some("input_text" | "text") => content
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                Some("input_text" | "text") => {
+                    content.get("text").and_then(Value::as_str).map(|text| {
+                        if let Some(wrapper) = pasted_text::parse_wrapper(text) {
+                            let mut parts = Vec::new();
+                            if !wrapper.request.trim().is_empty() {
+                                parts.push(wrapper.request.trim().to_owned());
+                            }
+                            parts.extend(wrapper.paths.iter().map(|path| {
+                                if pasted_text::is_upload_path(path) {
+                                    "[File attachment]".to_owned()
+                                } else {
+                                    "[Pasted text attachment]".to_owned()
+                                }
+                            }));
+                            parts.join("\n")
+                        } else {
+                            text.to_owned()
+                        }
+                    })
+                }
                 Some("input_image" | "image" | "local_image" | "localImage") => {
                     Some("[Image attachment]".to_owned())
                 }
@@ -3656,13 +3689,23 @@ async fn handle_connection(stream: UnixStream, state: BridgeState) -> Result<()>
 fn web_router(state: WebState) -> Router {
     Router::new()
         .route("/", get(web_index))
+        .route(
+            "/login",
+            get(web_login_get)
+                .post(web_login)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/assets/app.js", get(web_app_js))
         .route("/assets/app.css", get(web_app_css))
         .route("/assets/file-preview.js", get(web_file_preview_js))
+        .route("/app-icon.png", get(web_app_icon))
+        .route("/apple-touch-icon.png", get(web_app_icon))
+        .route("/favicon.ico", get(web_favicon))
         .route("/api/auth", get(web_auth_check))
         .route("/api/file-ticket", post(web_file_ticket))
         .route("/api/file", get(web_file_download))
         .route("/api/file-preview", post(web_file_preview))
+        .route("/api/attachment-upload", post(web_attachment_upload))
         .route("/api/file-preview-content", get(web_file_preview_content))
         .route("/api/command", post(web_command))
         .route("/api/events", get(web_events))
@@ -3685,6 +3728,22 @@ async fn normalize_web_host(mut request: AxumRequest, next: Next) -> HttpRespons
 }
 
 async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        false,
+        &state.public_origins,
+    ) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if state
+        .auth
+        .as_deref()
+        .is_some_and(|auth| !web_auth_allowed(&headers, Some(auth)))
+    {
+        return web_login_page(false);
+    }
     web_asset_response(
         &state,
         &headers,
@@ -3692,6 +3751,100 @@ async fn web_index(State(state): State<WebState>, headers: HeaderMap) -> HttpRes
         "text/html; charset=utf-8",
         "private, no-cache",
     )
+}
+
+fn web_login_page(invalid_credentials: bool) -> HttpResponse {
+    let message = if invalid_credentials {
+        "<p class=\"error\" role=\"alert\">Incorrect username or password.</p>"
+    } else {
+        ""
+    };
+    let mut response = (
+        if invalid_credentials {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::OK
+        },
+        WEB_LOGIN.replace("<!--LOGIN_ERROR-->", message),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"),
+    );
+    response
+        .headers_mut()
+        .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    response
+}
+
+async fn web_login_get(State(state): State<WebState>, headers: HeaderMap) -> HttpResponse {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        false,
+        &state.public_origins,
+    ) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if web_auth_allowed(&headers, state.auth.as_deref()) {
+        let mut response = StatusCode::SEE_OTHER.into_response();
+        response
+            .headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static("/"));
+        response
+    } else {
+        web_login_page(false)
+    }
+}
+
+async fn web_login(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WebLoginForm>,
+) -> HttpResponse {
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let Some(auth) = state.auth.as_deref() else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if !(constant_time_eq(form.username.as_bytes(), auth.username.as_bytes())
+        & constant_time_eq(form.password.as_bytes(), auth.password.as_bytes()))
+    {
+        return web_login_page(true);
+    }
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    set_web_session_cookie(
+        &mut response,
+        &headers,
+        auth,
+        state.secure,
+        &state.public_origins,
+    );
+    response
 }
 
 async fn web_app_js(
@@ -3729,6 +3882,34 @@ async fn web_file_preview_js(State(state): State<WebState>, headers: HeaderMap) 
         WEB_FILE_PREVIEW_JS,
         "text/javascript; charset=utf-8",
         "private, no-cache",
+    )
+}
+
+async fn web_app_icon(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        Bytes::from_static(WEB_APP_ICON),
+        "image/png",
+        web_asset_cache_control(query.as_deref()),
+    )
+}
+
+async fn web_favicon(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> HttpResponse {
+    web_asset_response(
+        &state,
+        &headers,
+        Bytes::from_static(WEB_FAVICON),
+        "image/x-icon",
+        web_asset_cache_control(query.as_deref()),
     )
 }
 
@@ -3810,7 +3991,7 @@ async fn web_file_download(
         Ok(Err(FileDownloadFailure::TooLarge)) => {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "file must be smaller than 16 MiB",
+                "file must be smaller than 33 MiB",
             )
                 .into_response();
         }
@@ -3892,7 +4073,7 @@ async fn web_file_preview_content(
         Ok(Err(FileDownloadFailure::TooLarge)) => {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "file must be smaller than 16 MiB",
+                "file must be smaller than 33 MiB",
             )
                 .into_response()
         }
@@ -3986,7 +4167,7 @@ async fn web_file_ticket(
         Ok(Err(FileDownloadFailure::TooLarge)) => {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "file must be smaller than 16 MiB",
+                "file must be smaller than 33 MiB",
             )
                 .into_response()
         }
@@ -4143,7 +4324,7 @@ async fn web_file_preview(
         Ok(Err(FileDownloadFailure::TooLarge)) => {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "file must be smaller than 16 MiB",
+                "file must be smaller than 33 MiB",
             )
                 .into_response()
         }
@@ -4562,6 +4743,58 @@ fn web_asset_cache_control(query: Option<&str>) -> &'static str {
     }
 }
 
+async fn web_attachment_upload(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> HttpResponse {
+    if !web_auth_allowed(&headers, state.auth.as_deref()) {
+        return basic_auth_required();
+    }
+    if !web_headers_allowed(
+        &headers,
+        state.port,
+        state.secure,
+        true,
+        &state.public_origins,
+    ) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    if body.is_empty() || body.len() > MAX_UPLOAD_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file must be between 1 byte and 32 MiB",
+        )
+            .into_response();
+    }
+    let Some(encoded_name) = headers
+        .get("x-attachment-name")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (StatusCode::BAD_REQUEST, "attachment name is required").into_response();
+    };
+    let Ok(name_bytes) = BASE64_STANDARD.decode(encoded_name) else {
+        return (StatusCode::BAD_REQUEST, "invalid attachment name").into_response();
+    };
+    if name_bytes.len() > 512 {
+        return (StatusCode::BAD_REQUEST, "attachment name is too long").into_response();
+    }
+    let Ok(name) = String::from_utf8(name_bytes) else {
+        return (StatusCode::BAD_REQUEST, "invalid attachment name").into_response();
+    };
+    let home = state.bridge.session_store.home().to_path_buf();
+    let size = body.len();
+    match tokio::task::spawn_blocking(move || pasted_text::store_upload(&home, &name, &body)).await
+    {
+        Ok(Ok((id, name))) => Json(json!({"id": id, "name": name, "size": size})).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not save attachment",
+        )
+            .into_response(),
+    }
+}
+
 async fn web_command(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -4591,7 +4824,7 @@ async fn web_command(
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(Response::error(
                 "request_too_large",
-                "request exceeds 12 MiB",
+                "request exceeds 34 MiB",
             )),
         )
             .into_response();
@@ -4993,12 +5226,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn basic_auth_required() -> HttpResponse {
-    let mut response = (StatusCode::UNAUTHORIZED, "authentication required").into_response();
-    response.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"Codex Bridge\", charset=\"UTF-8\""),
-    );
-    response
+    (StatusCode::UNAUTHORIZED, "authentication required").into_response()
 }
 
 fn weekly_usage(rate_limits: &Value) -> Option<Value> {
@@ -5510,6 +5738,32 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
             .then(|| project.get("id")?.as_str().map(str::to_owned))
             .flatten()
     })
+}
+
+fn relocated_workspace_roots(thread: &Value, old_cwd: &Path, target: &Path) -> Vec<PathBuf> {
+    let mut roots = thread
+        .get("environments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|environment| environment.get("cwd").and_then(Value::as_str) == old_cwd.to_str())
+        .flat_map(|environment| {
+            environment
+                .get("runtimeWorkspaceRoots")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute() && root != old_cwd)
+        .collect::<Vec<_>>();
+    if !roots.iter().any(|root| target.starts_with(root)) {
+        roots.push(target.to_path_buf());
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn pinned_thread_ids(write_backend: &CodexCliBackend) -> Result<Vec<String>, BackendFailure> {
@@ -6333,6 +6587,18 @@ fn temporary_fork_turn_id(thread: &Value, requested: &str) -> Result<String, &'s
         .ok_or("finish the first turn before creating a temporary conversation")
 }
 
+fn fork_turn_is_completed(thread: &Value, requested: &str) -> bool {
+    thread
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("id").and_then(Value::as_str) == Some(requested))
+        })
+        .is_some_and(|turn| turn.get("status").and_then(Value::as_str) == Some("completed"))
+}
+
 fn fetch_app_server_project_index(
     write_backend: &CodexCliBackend,
     include_archived: bool,
@@ -6394,16 +6660,19 @@ fn app_server_project_index(
     cache: &AppServerProjectCache,
     include_archived: bool,
     codex_home: &Path,
+    session_store: &SessionStore,
 ) -> Option<ThreadProjectIndex> {
     if let Ok(cached) = cache.index.read() {
         if let Some(cached) = cached.as_ref().filter(|cached| {
             cached.refreshed_at.elapsed() <= PROJECT_INDEX_TTL
                 && (cached.includes_archived || !include_archived)
         }) {
+            session_store.sync_thread_cwds(&cached.index);
             return Some(cached.index.clone());
         }
     }
     let index = fetch_app_server_project_index(write_backend, include_archived, codex_home).ok()?;
+    session_store.sync_thread_cwds(&index);
     if let Ok(mut cached) = cache.index.write() {
         *cached = Some(CachedAppServerProjectIndex {
             refreshed_at: Instant::now(),
@@ -6412,6 +6681,73 @@ fn app_server_project_index(
         });
     }
     Some(index)
+}
+
+fn editable_interrupted_turn(
+    write_backend: &CodexCliBackend,
+    thread_id: &str,
+) -> Result<Option<Value>, BackendFailure> {
+    let page = write_backend.app_server_rpc(
+        "thread/turns/list",
+        json!({
+            "threadId": thread_id,
+            "sortDirection": "desc",
+            "limit": 1,
+            "itemsView": "full",
+        }),
+    )?;
+    let Some(turn) = interrupted_prompt_from_turn_page(&page) else {
+        return Ok(None);
+    };
+    // Reverting a turn also discards queued input, so never offer edit while a queue exists.
+    let queue = write_backend.app_server_rpc(
+        "thread/queue/list",
+        json!({
+            "threadId": thread_id, "limit": 1,
+        }),
+    )?;
+    let Some(queued) = queue.get("data").and_then(Value::as_array) else {
+        return Err(BackendFailure {
+            code: "app_server_protocol_error",
+            message: "thread/queue/list response has no data".to_owned(),
+        });
+    };
+    if !queued.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(turn))
+}
+
+fn interrupted_prompt_from_turn_page(page: &Value) -> Option<Value> {
+    let turn = page.get("data")?.as_array()?.first()?;
+    if turn["status"] != "interrupted" || turn["itemsView"] != "full" {
+        return None;
+    }
+    let items = turn.get("items")?.as_array()?;
+    let mut prompts = items.iter().filter(|item| item["type"] == "userMessage");
+    let prompt = prompts.next()?;
+    // A second userMessage in the same turn represents steer input.
+    if prompts.next().is_some() {
+        return None;
+    }
+    let input = prompt.get("content")?.as_array()?;
+    let texts = input
+        .iter()
+        .filter(|item| item["type"] == "text")
+        .collect::<Vec<_>>();
+    if texts.len() != 1 {
+        return None;
+    }
+    if texts[0]
+        .get("text_elements")
+        .and_then(Value::as_array)
+        .is_some_and(|elements| !elements.is_empty())
+    {
+        return None;
+    }
+    let text = texts[0].get("text")?.as_str()?;
+    let turn_id = turn.get("id")?.as_str()?;
+    Some(json!({"turn_id": turn_id, "text": text, "input": input}))
 }
 
 fn dispatch(request: Request, state: &BridgeState) -> Response {
@@ -6423,6 +6759,18 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
     let pending_messages = state.pending_messages.as_ref();
     let app_server_tools = state.app_server_tools.as_ref();
     let app_server_projects = state.app_server_projects.as_ref();
+    if matches!(
+        &request,
+        Request::Ls { .. } | Request::Current | Request::Show { .. } | Request::Messages { .. }
+    ) {
+        let _ = app_server_project_index(
+            write_backend,
+            app_server_projects,
+            false,
+            session_store.home(),
+            session_store,
+        );
+    }
     match request {
         Request::Pending => {
             Response::success(json!({"requests": write_backend.pending_approvals()}))
@@ -6435,6 +6783,82 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             Ok(result) => Response::success(result),
             Err(error) => write_backend_error(error),
         },
+        Request::TokenUsageWindows => match session_store.token_usage_windows() {
+            Ok(usage) => Response::success(json!(usage)),
+            Err(error) => Response::error("usage_unavailable", error.to_string()),
+        },
+        Request::InterruptedTurnEdit { thread_id } => {
+            match editable_interrupted_turn(write_backend, &thread_id) {
+                Ok(turn) => Response::success(json!({"turn": turn.map(|turn| json!({
+                    "turn_id": turn["turn_id"], "text": turn["text"],
+                }))})),
+                Err(error) => write_backend_error(error),
+            }
+        }
+        Request::InterruptedTurnRetry {
+            thread_id,
+            turn_id,
+            text,
+            submission_id,
+        } => {
+            if text.trim().is_empty() || submission_id.trim().is_empty() {
+                return Response::error(
+                    "invalid_request",
+                    "edited prompt and submission ID are required",
+                );
+            }
+            let resolved =
+                match resolve_write_target(Some(thread_id), session_store, selected_thread) {
+                    Ok(resolved) => resolved,
+                    Err(response) => return response,
+                };
+            if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
+            let turn =
+                match editable_interrupted_turn(write_backend, &resolved.thread.id) {
+                    Ok(Some(turn)) if turn["turn_id"] == turn_id => turn,
+                    Ok(_) => return Response::error(
+                        "turn_not_editable",
+                        "the interrupted turn is no longer the latest turn or contains steer input",
+                    ),
+                    Err(error) => return write_backend_error(error),
+                };
+            let mut input = turn["input"].as_array().cloned().unwrap_or_default();
+            let Some(first_text) = input.iter_mut().find(|item| item["type"] == "text") else {
+                return Response::error(
+                    "turn_not_editable",
+                    "the original prompt has no editable text",
+                );
+            };
+            first_text["text"] = json!(text);
+            if let Some(object) = first_text.as_object_mut() {
+                object.remove("text_elements");
+            }
+            if let Err(error) = write_backend.app_server_rpc(
+                "thread/revert",
+                json!({
+                    "threadId": resolved.thread.id,
+                    "beforeTurnId": turn_id,
+                }),
+            ) {
+                return write_backend_error(error);
+            }
+            match write_backend.start_turn(&resolved.thread.id, &input, &submission_id) {
+                Ok(started) => Response::success(json!({
+                    "action": "interrupted_turn_retry",
+                    "thread_id": resolved.thread.id,
+                    "turn_id": started.turn_id,
+                })),
+                Err(error) => Response::error(
+                    "retry_start_failed_after_revert",
+                    format!(
+                        "interrupted turn was removed, but the edited prompt could not start: {}",
+                        error.message
+                    ),
+                ),
+            }
+        }
         Request::Status => {
             if write_backend.app_server_socket().is_some() {
                 let _ = write_backend.app_server_rpc("thread/loaded/list", json!({}));
@@ -6580,6 +7004,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                                 "[Image attachment]"
                                     | "[Audio attachment]"
                                     | "[Pasted text attachment]"
+                                    | "[File attachment]"
                             )
                         })
                 })
@@ -6762,6 +7187,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 app_server_projects,
                 include_archived,
                 session_store.home(),
+                session_store,
             );
             match session_store.list_projects_with_index(include_archived, project_index.as_ref()) {
                 Ok(projects) => Response::success(json!({
@@ -6774,6 +7200,83 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "include_archived": include_archived,
                 })),
                 Err(error) => backend_error(error),
+            }
+        }
+        Request::ProjectCreate { path, name } => {
+            let canonical = match fs::canonicalize(&path) {
+                Ok(path) if path.is_dir() => path,
+                Ok(_) => {
+                    return Response::error(
+                        "invalid_project_path",
+                        "project root must be a directory",
+                    )
+                }
+                Err(error) => {
+                    return Response::error(
+                        "invalid_project_path",
+                        format!("cannot open project {}: {error}", path.display()),
+                    )
+                }
+            };
+            let name = name.unwrap_or_else(|| {
+                canonical
+                    .file_name()
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+            if name.trim().is_empty() {
+                return Response::error("invalid_project_name", "project name cannot be empty");
+            }
+            let projects = match app_server_list_all(
+                write_backend,
+                "project/list",
+                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+            ) {
+                Ok(projects) => projects,
+                Err(error) => return Response::error(error.code, error.message),
+            };
+            if let Some(project) = projects.iter().find(|project| {
+                project
+                    .get("roots")
+                    .and_then(Value::as_array)
+                    .is_some_and(|roots| {
+                        roots.iter().any(|root| {
+                            root.get("path")
+                                .and_then(Value::as_str)
+                                .is_some_and(|path| {
+                                    fs::canonicalize(path).is_ok_and(|path| path == canonical)
+                                })
+                        })
+                    })
+            }) {
+                return Response::success(json!({
+                    "action": "project_create", "status": "existing",
+                    "project": project,
+                }));
+            }
+            let mut random = [0u8; 16];
+            if let Err(error) = getrandom::fill(&mut random) {
+                return Response::error(
+                    "project_create_unavailable",
+                    format!("cannot generate idempotency key: {error}"),
+                );
+            }
+            let idempotency_key = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            match write_backend.app_server_rpc(
+                "project/create",
+                json!({
+                    "idempotencyKey": idempotency_key,
+                    "name": name,
+                    "roots": [{"path": canonical}],
+                }),
+            ) {
+                Ok(result) => Response::success(json!({
+                    "action": "project_create", "status": "created", "project": result.get("project"),
+                })),
+                Err(error) => Response::error(error.code, error.message),
             }
         }
         Request::ProjectThreads {
@@ -6800,6 +7303,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 app_server_projects,
                 include_archived,
                 session_store.home(),
+                session_store,
             );
             match session_store.list_project_threads_with_index(
                 &project_path,
@@ -6861,6 +7365,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                         _ => "rollout_jsonl",
                     };
                     let messages = compact_web_message_page(&page.messages, page.start);
+                    let leading_turn_users = page
+                        .leading_turn_users
+                        .iter()
+                        .map(|(index, message)| compact_web_message(message, *index))
+                        .filter(|message| message["category"] == "user")
+                        .collect::<Vec<_>>();
                     Response::success(json!({
                         "source": "rollout_jsonl",
                         "tool_source": tool_source,
@@ -6877,6 +7387,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                             "archived": thread.archived,
                         },
                         "messages": messages,
+                        "leading_turn_users": leading_turn_users,
                         "page": {
                             "start": page.start,
                             "end": page.end,
@@ -7507,7 +8018,86 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "job_id": job_id,
             }))
         }
-        Request::ThreadCreateStatus { job_id } => {
+        Request::ThreadForkStart {
+            thread_id,
+            last_turn_id,
+        } => {
+            if thread_id.is_empty()
+                || thread_id.len() > 256
+                || last_turn_id.is_empty()
+                || last_turn_id.len() > 256
+            {
+                return Response::error(
+                    "invalid_request",
+                    "thread and turn identifiers must contain between 1 and 256 bytes",
+                );
+            }
+            let mut random = [0_u8; 18];
+            if let Err(error) = getrandom::fill(&mut random) {
+                return Response::error(
+                    "thread_fork_unavailable",
+                    format!("failed to allocate a fork job: {error}"),
+                );
+            }
+            let job_id = URL_SAFE_NO_PAD.encode(random);
+            {
+                let mut jobs = match state.thread_create_jobs.entries.write() {
+                    Ok(jobs) => jobs,
+                    Err(_) => {
+                        return Response::error(
+                            "thread_fork_unavailable",
+                            "fork job state is unavailable",
+                        )
+                    }
+                };
+                jobs.retain(|_, job| job.created_at.elapsed() <= THREAD_CREATE_JOB_TTL);
+                if jobs.len() >= THREAD_CREATE_JOB_LIMIT {
+                    return Response::error(
+                        "thread_fork_busy",
+                        "too many creation jobs are still retained",
+                    );
+                }
+                jobs.insert(
+                    job_id.clone(),
+                    ThreadCreateJob {
+                        created_at: Instant::now(),
+                        response: None,
+                    },
+                );
+            }
+            let worker_state = state.clone();
+            let worker_job_id = job_id.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("codex-worktree-fork".to_owned())
+                .spawn(move || {
+                    let response = dispatch(
+                        Request::ThreadFork {
+                            thread_id,
+                            last_turn_id,
+                            worktree: true,
+                        },
+                        &worker_state,
+                    );
+                    if let Ok(mut jobs) = worker_state.thread_create_jobs.entries.write() {
+                        if let Some(job) = jobs.get_mut(&worker_job_id) {
+                            job.response = Some(response);
+                        }
+                    }
+                })
+            {
+                if let Ok(mut jobs) = state.thread_create_jobs.entries.write() {
+                    jobs.remove(&job_id);
+                }
+                return Response::error(
+                    "thread_fork_unavailable",
+                    format!("failed to start the worktree fork job: {error}"),
+                );
+            }
+            Response::success(
+                json!({"action": "thread_fork_start", "status": "running", "job_id": job_id}),
+            )
+        }
+        Request::ThreadCreateStatus { job_id } | Request::ThreadForkStatus { job_id } => {
             if job_id.is_empty() || job_id.len() > 128 {
                 return Response::error("invalid_request", "job id must be non-empty and bounded");
             }
@@ -7569,12 +8159,13 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 },
                 None => None,
             };
-            let app_server_project_list = write_backend
-                .app_server_rpc(
-                    "project/list",
-                    json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
-                )
-                .ok();
+            let app_server_project_list = app_server_list_all(
+                write_backend,
+                "project/list",
+                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+            )
+            .ok()
+            .map(|projects| json!({"data": projects}));
             let project_id = app_server_project_list.as_ref().and_then(|projects| {
                 canonical_project
                     .as_ref()
@@ -7595,7 +8186,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             if !known_project {
                 return Response::error(
                     "unknown_project",
-                    "new threads can only be created for a project already listed by the bridge",
+                    "project is not registered; run `codexctl project create DIRECTORY` first",
                 );
             }
 
@@ -7698,6 +8289,115 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 } else {
                     "current_directory"
                 },
+                "worktree_path": prepared.worktree.as_ref().map(|created| &created.root),
+                "thread": stored_thread.unwrap_or(fallback_thread),
+            }))
+        }
+        Request::ThreadFork {
+            thread_id,
+            last_turn_id,
+            worktree,
+        } => {
+            if thread_id.is_empty()
+                || thread_id.len() > 256
+                || last_turn_id.is_empty()
+                || last_turn_id.len() > 256
+            {
+                return Response::error(
+                    "invalid_request",
+                    "thread and turn identifiers must contain between 1 and 256 bytes",
+                );
+            }
+            let source = match resolve_read_target(
+                Some(thread_id.clone()),
+                session_store,
+                selected_thread,
+            ) {
+                Ok(resolved) => resolved.thread,
+                Err(response) => return response,
+            };
+            let read = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": true}),
+            ) {
+                Ok(read) => read,
+                Err(error) => return write_backend_error(error),
+            };
+            if !fork_turn_is_completed(&read, &last_turn_id) {
+                return Response::error(
+                    "fork_turn_not_ready",
+                    "the selected turn must exist and be completed before forking",
+                );
+            }
+            let prepared = match prepare_thread_cwd(&source.cwd, worktree, session_store.home()) {
+                Ok(prepared) => prepared,
+                Err(error) => return Response::error(error.code, error.message),
+            };
+            let params = json!({
+                "threadId": thread_id,
+                "lastTurnId": last_turn_id,
+                "cwd": prepared.cwd,
+                "ephemeral": false,
+                "excludeTurns": false,
+                "deferGoalContinuation": true,
+            });
+            let result = match write_backend.app_server_rpc("thread/fork", params) {
+                Ok(result) => result,
+                Err(error) => {
+                    let rollback_is_safe =
+                        matches!(error.code, "app_server_unavailable" | "app_server_rejected");
+                    let message = match (&prepared.worktree, rollback_is_safe) {
+                        (Some(created), true) => match remove_created_worktree(created) {
+                            Some(cleanup) => format!(
+                                "{}; worktree rollback also failed: {cleanup}",
+                                error.message
+                            ),
+                            None => error.message,
+                        },
+                        (Some(created), false) => format!(
+                            "{}; fork outcome is ambiguous, so the new worktree was retained at {}",
+                            error.message,
+                            created.root.display()
+                        ),
+                        (None, _) => error.message,
+                    };
+                    return Response::error(error.code, message);
+                }
+            };
+            let Some(fallback_thread) = thread_summary_from_start(&result, &prepared.cwd) else {
+                return Response::error("app_server_protocol_error", "thread/fork returned no valid thread; any new worktree was retained because the outcome is ambiguous");
+            };
+            let fork_id = fallback_thread["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            session_store.register_ephemeral_thread(
+                fork_id.clone(),
+                prepared.cwd.clone(),
+                fallback_thread["title"].as_str().map(str::to_owned),
+                fallback_thread["updated_at_ms"].as_u64().unwrap_or(0),
+                !worktree
+                    && source
+                        .cwd
+                        .starts_with(state.projectless_workspace_root.as_path()),
+            );
+            if let Ok(mut selected) = selected_thread.write() {
+                *selected = Some(fork_id.clone());
+            }
+            let mut stored_thread = None;
+            for attempt in 0..5 {
+                session_store.invalidate_summary_cache();
+                if let Ok(Some(thread)) = session_store.find_thread(&fork_id) {
+                    stored_thread = serde_json::to_value(thread).ok();
+                    break;
+                }
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            }
+            Response::success(json!({
+                "action": "thread_fork", "source_thread_id": thread_id, "last_turn_id": last_turn_id,
+                "location": if worktree { "worktree" } else { "current_directory" },
                 "worktree_path": prepared.worktree.as_ref().map(|created| &created.root),
                 "thread": stored_thread.unwrap_or(fallback_thread),
             }))
@@ -7865,6 +8565,126 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => write_backend_error(error),
             }
         }
+        Request::ThreadCwdUpdate { thread_id, cwd } => {
+            if matches!(
+                write_backend.thread_writer_state(&thread_id),
+                ThreadWriterState::External | ThreadWriterState::Released
+            ) {
+                return Response::error(
+                    "thread_writer_not_owned",
+                    "another app-server owns this session, or its writer was released",
+                );
+            }
+            let active_turn = match session_store.active_turn_id(&thread_id) {
+                Ok(active_turn) => active_turn,
+                Err(error) => return backend_error(error),
+            };
+            if active_turn.is_some() {
+                return Response::error(
+                    "thread_busy",
+                    "wait for the current turn to finish before changing the session directory",
+                );
+            }
+            let target = match prepare_thread_cwd(&cwd, false, session_store.home()) {
+                Ok(prepared) => prepared.cwd,
+                Err(error) => return Response::error(error.code, error.message),
+            };
+            let before = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            let Some(old_cwd) = before.pointer("/thread/cwd").and_then(Value::as_str) else {
+                return Response::error("app_server_protocol_error", "thread/read returned no cwd");
+            };
+            let workspace_roots =
+                relocated_workspace_roots(&before["thread"], Path::new(old_cwd), &target);
+            if before
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                == Some("notLoaded")
+            {
+                if let Err(error) = write_backend.app_server_rpc(
+                    "thread/resume",
+                    json!({
+                        "threadId": thread_id,
+                        "cwd": target,
+                        "runtimeWorkspaceRoots": workspace_roots,
+                        "excludeTurns": true,
+                    }),
+                ) {
+                    return write_backend_error(error);
+                }
+            }
+            if let Err(error) = write_backend.app_server_rpc(
+                "thread/settings/update",
+                json!({"threadId": thread_id, "cwd": target}),
+            ) {
+                return write_backend_error(error);
+            }
+            let after = match write_backend.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            ) {
+                Ok(result) => result,
+                Err(error) => return write_backend_error(error),
+            };
+            if after.pointer("/thread/cwd").and_then(Value::as_str) != target.to_str() {
+                return Response::error(
+                    "app_server_protocol_error",
+                    "thread/settings/update did not persist the requested directory",
+                );
+            }
+            let workspace_roots_applied = after
+                .pointer("/thread/environments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|environment| {
+                    environment.get("cwd").and_then(Value::as_str) == target.to_str()
+                })
+                .flat_map(|environment| {
+                    environment
+                        .get("runtimeWorkspaceRoots")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(Value::as_str)
+                .any(|root| target.starts_with(root));
+            let project_id = app_server_list_all(
+                write_backend,
+                "project/list",
+                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+            )
+            .ok()
+            .and_then(|projects| project_id_for_path(&json!({"data": projects}), &target));
+            let project_assigned = if let Some(project_id) = &project_id {
+                write_backend
+                    .app_server_rpc(
+                        "thread/metadata/update",
+                        json!({"threadId": thread_id, "projectId": project_id}),
+                    )
+                    .is_ok()
+            } else {
+                false
+            };
+            if let Ok(mut cached) = app_server_projects.index.write() {
+                *cached = None;
+            }
+            session_store.set_thread_cwd(&thread_id, target.clone());
+            let _ = write_backend.watch_thread(&thread_id);
+            Response::success(json!({
+                "action": "thread_cwd_update",
+                "thread_id": thread_id,
+                "old_cwd": old_cwd,
+                "cwd": target,
+                "project_assigned": project_assigned,
+                "workspace_roots_applied": workspace_roots_applied,
+            }))
+        }
         Request::ThreadRename { thread_id, name } => {
             let name = name.trim();
             if name.is_empty() || name.chars().count() > 200 {
@@ -7994,6 +8814,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     app_server_projects,
                     false,
                     session_store.home(),
+                    session_store,
                 );
                 let mut threads = Vec::new();
                 for thread_id in &thread_ids {
@@ -8959,6 +9780,8 @@ fn backend_error(error: anyhow::Error) -> Response {
 fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
     let mut content = Vec::new();
     let mut has_visible_text = false;
+    let mut has_user_attachment = false;
+    let mut has_injected_context = false;
     let mut content_index = 0;
     while content_index < message.content.len() {
         let item = &message.content[content_index];
@@ -9008,6 +9831,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                     content_index,
                 ));
             } else if let Some(label) = transcript_block_label(text) {
+                has_injected_context = true;
                 let content_end = transcript_block_end(&message.content, content_index);
                 content.push(lazy_content_range_summary(
                     label,
@@ -9021,7 +9845,8 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
             } else if let Some(wrapper) = pasted_text::parse_wrapper(text) {
                 content.extend(wrapper.paths.into_iter().map(|path| {
                     json!({
-                        "kind": "pasted_text",
+                        "kind": if pasted_text::is_upload_path(path) { "uploaded_file" } else { "pasted_text" },
+                        "name": Path::new(path).file_name().and_then(|part| part.to_str()),
                         "path": path,
                         "message_index": message_index,
                     })
@@ -9031,6 +9856,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                     content.push(json!({"kind": "text", "text": wrapper.request.trim()}));
                 }
             } else if let Some(request) = user_request_from_file_wrapper(text) {
+                has_user_attachment = true;
                 let content_end = attachment_block_end(&message.content, content_index);
                 let label = if message.content[content_index..content_end]
                     .iter()
@@ -9080,6 +9906,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                     has_visible_text = true;
                 }
             } else if let Some(label) = injected_text_label(text) {
+                has_injected_context = true;
                 content.push(lazy_content_summary(
                     label,
                     item,
@@ -9091,6 +9918,9 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
                 has_visible_text = true;
             }
         } else {
+            if matches!(item_type, "input_image" | "input_audio") {
+                has_user_attachment = true;
+            }
             let label = match item_type {
                 "input_image" => "Image attachment",
                 "input_audio" => "Audio attachment",
@@ -9108,7 +9938,7 @@ fn compact_web_message(message: &ThreadMessage, message_index: usize) -> Value {
 
     let category = match (message.role.as_str(), message.phase.as_deref()) {
         (_, Some("context_compaction")) => "compaction",
-        ("user", _) if has_visible_text => "user",
+        ("user", _) if has_visible_text || (has_user_attachment && !has_injected_context) => "user",
         ("assistant", _) => "assistant",
         _ => "context",
     };
@@ -9769,6 +10599,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_last_interrupted_turn_without_steer_offers_prompt_edit() {
+        let prompt = json!({"type":"userMessage", "content":[{"type":"text", "text":"original"}, {"type":"localImage", "path":"/tmp/image.png"}]});
+        let page = json!({"data":[{"id":"last", "status":"interrupted", "itemsView":"full", "items":[prompt.clone()]}]});
+        let editable = interrupted_prompt_from_turn_page(&page).unwrap();
+        assert_eq!(editable["turn_id"], "last");
+        assert_eq!(editable["text"], "original");
+        assert_eq!(editable["input"][1]["type"], "localImage");
+        let steered = json!({"data":[{"id":"last", "status":"interrupted", "itemsView":"full", "items":[prompt.clone(), prompt]}]});
+        assert!(interrupted_prompt_from_turn_page(&steered).is_none());
+        let annotated = json!({"data":[{"id":"last", "status":"interrupted", "itemsView":"full", "items":[{"type":"userMessage", "content":[{"type":"text", "text":"@file", "text_elements":[{"start":0,"end":5}]}]}]}]});
+        assert!(interrupted_prompt_from_turn_page(&annotated).is_none());
+        assert!(interrupted_prompt_from_turn_page(
+            &json!({"data":[{"id":"new", "status":"completed", "itemsView":"full", "items":[]}]})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn relocated_workspace_roots_replace_old_root_and_keep_other_directories() {
+        let thread = json!({"environments":[{
+            "cwd":"/tmp/chat",
+            "runtimeWorkspaceRoots":["/tmp/chat","/tmp/shared"]
+        }]});
+        assert_eq!(
+            relocated_workspace_roots(
+                &thread,
+                Path::new("/tmp/chat"),
+                Path::new("/tmp/projects/new-project"),
+            ),
+            [
+                PathBuf::from("/tmp/projects/new-project"),
+                PathBuf::from("/tmp/shared")
+            ]
+        );
+    }
+
+    #[test]
     fn temporary_fork_uses_the_last_completed_turn_when_selection_is_in_progress() {
         let thread = json!({"thread": {"turns": [
             {"id": "turn-1", "status": "completed"},
@@ -9791,6 +10658,18 @@ mod tests {
             {"id": "turn-1", "status": "inProgress"}
         ]}});
         assert!(temporary_fork_turn_id(&first_turn, "turn-1").is_err());
+    }
+
+    #[test]
+    fn permanent_fork_requires_the_exact_completed_turn() {
+        let thread = json!({"thread": {"turns": [
+            {"id": "done", "status": "completed"},
+            {"id": "active", "status": "inProgress"}
+        ]}});
+        assert!(fork_turn_is_completed(&thread, "done"));
+        assert!(!fork_turn_is_completed(&thread, "active"));
+        assert!(!fork_turn_is_completed(&thread, "missing"));
+        assert!(!fork_turn_is_completed(&json!({}), "done"));
     }
 
     fn fixture_store() -> SessionStore {
@@ -11102,6 +11981,28 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn login_page_exposes_password_manager_fields_without_a_basic_challenge() {
+        let markup = WEB_LOGIN.split_whitespace().collect::<Vec<_>>().join(" ");
+        let page = web_login_page(false);
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert!(markup.contains("name=\"username\" type=\"text\" autocomplete=\"username\""));
+        assert!(markup
+            .contains("name=\"password\" type=\"password\" autocomplete=\"current-password\""));
+        assert!(markup.contains("<form method=\"post\" action=\"/login\""));
+        assert!(!page.headers().contains_key(header::WWW_AUTHENTICATE));
+        let rejected = web_login_page(true);
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert!(!rejected.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert!(!basic_auth_required()
+            .headers()
+            .contains_key(header::WWW_AUTHENTICATE));
+    }
+
+    #[test]
     fn unauthenticated_web_ui_is_restricted_to_loopback() {
         assert!(validate_web_ui_auth_config(false, "0.0.0.0:47653".parse().unwrap()).is_ok());
         assert!(validate_web_ui_auth_config(true, "127.0.0.1:47653".parse().unwrap()).is_ok());
@@ -11804,6 +12705,34 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn attachment_only_user_prompt_remains_visible_after_turn_completion() {
+        let user = ThreadMessage {
+            timestamp: None,
+            id: Some("image-only".into()),
+            turn_id: Some("turn-image".into()),
+            role: "user".into(),
+            phase: None,
+            content: vec![
+                json!({"type":"input_image","image_url":"data:image/png;base64,private"}),
+            ],
+            tools: Vec::new(),
+        };
+        let final_answer = ThreadMessage {
+            timestamp: None,
+            id: Some("final".into()),
+            turn_id: Some("turn-image".into()),
+            role: "assistant".into(),
+            phase: Some("final_answer".into()),
+            content: vec![json!({"type":"output_text","text":"Done"})],
+            tools: Vec::new(),
+        };
+        let page = compact_web_message_page(&[user, final_answer], 10);
+        assert_eq!(page[0]["category"], "user");
+        assert_eq!(page[0]["content"][0]["label"], "Image attachment");
+        assert_eq!(page[0]["content"][0]["message_index"], 10);
+    }
+
+    #[test]
     fn web_tool_summary_keeps_arguments_and_output_lazy() {
         let message = ThreadMessage {
             timestamp: None,
@@ -12295,6 +13224,30 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert_eq!(compact["category"], "user");
         assert_eq!(compact["content"][0]["label"], "Attached-file context");
         assert_eq!(compact["content"][1]["text"], "参考 Codex 的风格");
+    }
+
+    #[test]
+    fn uploaded_binary_file_is_a_history_attachment_card() {
+        let message = ThreadMessage {
+            timestamp: None,
+            id: None,
+            turn_id: None,
+            role: "user".into(),
+            phase: None,
+            content: vec![json!({
+                "type": "input_text",
+                "text": "# Files mentioned by the user:\n\n## firmware.bin: /tmp/attachments/bridge-upload-0123456789abcdef0123456789abcdef/firmware.bin\n\n## My request:\nInspect this"
+            })],
+            tools: Vec::new(),
+        };
+        let compact = compact_web_message(&message, 4);
+        assert_eq!(compact["content"][0]["kind"], "uploaded_file");
+        assert_eq!(compact["content"][0]["name"], "firmware.bin");
+        assert_eq!(compact["content"][1]["text"], "Inspect this");
+        assert_eq!(
+            thread_message_input_summary(&message).as_deref(),
+            Some("Inspect this\n[File attachment]")
+        );
     }
 
     #[test]

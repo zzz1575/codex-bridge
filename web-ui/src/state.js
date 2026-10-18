@@ -44,6 +44,7 @@ export const state = {
   loadingHistory: false,
   messageCache: new SessionMessageCache(3),
   visibleMessages: [],
+  leadingTurnUsers: [],
   expandedTurnIds: new Set(),
   expandedLongMessageIds: new Set(),
   expandedToolGroupIds: new Set(),
@@ -81,6 +82,7 @@ export const state = {
   goalBusy: false,
   activityFileLen: null,
   activeTurnId: null,
+  editableInterruptedTurn: null,
   activityPhase: null,
   activeTool: null,
   activeToolCallId: null,
@@ -109,10 +111,10 @@ export const state = {
   historyTotal: null,
   lastMessageRefresh: 0,
   selectedMessageText: null,
-  temporarySelection: null,
   temporaryCreating: false,
   temporaryThread: null,
   temporaryThreads: new Map(),
+  activeTemporaryBySource: new Map(),
   subagentConversation: null,
 };
 
