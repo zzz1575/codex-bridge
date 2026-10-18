@@ -3156,6 +3156,7 @@ test("a slow history page does not delay writer or queue state", async () => {
     snapshotIsCurrent,
     $: (id) => ({ textContent: "", id }),
     renderAsyncQuestion: () => {},
+    serverRequestTray: { render: () => {} },
     applyThreadWriterLock: (lock) => locks.push(lock.state),
     syncTemporaryForCurrent: () => {},
     resetThreadViewState: () => {},

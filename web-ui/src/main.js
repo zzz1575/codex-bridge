@@ -6720,6 +6720,14 @@ async function materializeProjectlessDraft(prompt) {
   void loadProjects().catch(() => {});
   return thread;
 }
+const serverRequestTray = createServerRequestTray({
+  document,
+  getContainer: () => document.querySelector(".composer-shell"),
+  getThreadId: () => state.current?.id,
+  command: (request) => command(request, false),
+  isChinese: () => getLanguage() === "zh",
+  enabled: () => !demoMode,
+});
 async function write(name) {
   if (state.composerAttachments.some((attachment) => attachment.type === "uploading"))
     throw new Error(tr("fileUploadInProgress"));
@@ -6830,14 +6838,6 @@ async function write(name) {
     setComposerSubmitting(false);
   }
 }
-const serverRequestTray = createServerRequestTray({
-  document,
-  getContainer: () => document.querySelector(".composer-shell"),
-  getThreadId: () => state.current?.id,
-  command: (request) => command(request, false),
-  isChinese: () => getLanguage() === "zh",
-  enabled: () => !demoMode,
-});
 let approvalGeneration = 0;
 let approvalSnapshot = [];
 const approvalInFlight = new Set();
