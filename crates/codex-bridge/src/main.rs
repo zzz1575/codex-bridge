@@ -5796,31 +5796,101 @@ fn legacy_thread_cwd_response(response: Response) -> Response {
     }))
 }
 
+// Acknowledgements precede application in some Codex versions. Retry reads only:
+// the mutation must never be replayed to make a delayed snapshot catch up.
+fn poll_relocation_readback(
+    subject: &str,
+    mut read: impl FnMut() -> Result<Value, BackendFailure>,
+    mut confirmed: impl FnMut(&Value) -> bool,
+    mut pause: impl FnMut(Duration),
+) -> Result<Value, BackendFailure> {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(2500);
+    let mut wait_budget = timeout;
+    for attempt in 0..13 {
+        let snapshot = read()?;
+        if confirmed(&snapshot) {
+            return Ok(snapshot);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed()).min(wait_budget);
+        if attempt == 12 || remaining.is_zero() {
+            break;
+        }
+        let delay = Duration::from_millis((50u64 << attempt).min(250)).min(remaining);
+        pause(delay);
+        wait_budget = wait_budget.saturating_sub(delay);
+    }
+    Err(BackendFailure {
+        code: "app_server_protocol_error",
+        message: format!("{subject} was not confirmed within the read-back window; settings may already have changed, refresh before retrying"),
+    })
+}
+
+fn apply_relocated_cwd(
+    thread_id: &str,
+    target: &Path,
+    mut rpc: impl FnMut(&str, Value) -> Result<Value, BackendFailure>,
+    pause: impl FnMut(Duration),
+) -> Result<(Value, Value), BackendFailure> {
+    let acknowledgement = rpc(
+        "thread/settings/update",
+        json!({"threadId": thread_id, "cwd": target}),
+    )?;
+    let snapshot = poll_relocation_readback(
+        "session directory",
+        || {
+            rpc(
+                "thread/read",
+                json!({"threadId":thread_id, "includeTurns":false}),
+            )
+        },
+        |result| {
+            result.pointer("/thread/id").and_then(Value::as_str) == Some(thread_id)
+                && result.pointer("/thread/cwd").and_then(Value::as_str) == target.to_str()
+        },
+        pause,
+    )?;
+    Ok((acknowledgement, snapshot))
+}
+
 fn sync_relocated_project(
     thread_id: &str,
     project_id: Option<&str>,
     mut rpc: impl FnMut(&str, Value) -> Result<Value, BackendFailure>,
+    pause: impl FnMut(Duration),
 ) -> Result<(), BackendFailure> {
     // Codex 0.163: an empty string clears membership; null leaves it unchanged.
-    let result = rpc(
+    rpc(
         "thread/metadata/update",
         json!({"threadId": thread_id, "projectId": project_id.unwrap_or("")}),
     )?;
-    let applied = result.pointer("/thread/projectId");
-    let membership_matches = match project_id {
-        Some(expected) => applied.and_then(Value::as_str) == Some(expected),
-        None => applied.is_some_and(|value| value.is_null() || value.as_str() == Some("")),
-    };
-    if result.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id)
-        || !membership_matches
-    {
-        return Err(BackendFailure {
-            code: "app_server_protocol_error",
-            message: "thread/metadata/update did not confirm the requested project membership"
-                .to_owned(),
-        });
-    }
+    poll_relocation_readback(
+        "project membership",
+        || {
+            rpc(
+                "thread/read",
+                json!({"threadId":thread_id, "includeTurns":false}),
+            )
+        },
+        |result| {
+            let applied = result.pointer("/thread/projectId");
+            let membership_matches = match project_id {
+                Some(expected) => applied.and_then(Value::as_str) == Some(expected),
+                None => applied.is_some_and(|value| value.is_null() || value.as_str() == Some("")),
+            };
+            result.pointer("/thread/id").and_then(Value::as_str) == Some(thread_id)
+                && membership_matches
+        },
+        pause,
+    )?;
     Ok(())
+}
+
+fn relocation_directory_error(target: &Path, error: BackendFailure) -> Response {
+    Response::error(
+        "thread_relocation_incomplete",
+        format!("session directory change to {} could not be confirmed ({}: {}); the directory may already have changed, refresh the session before retrying", target.display(), error.code, error.message),
+    )
 }
 
 fn relocation_membership_error(target: &Path, error: BackendFailure) -> Response {
@@ -9084,26 +9154,20 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     return write_backend_error(error);
                 }
             }
-            let settings_result = match write_backend.app_server_rpc(
-                "thread/settings/update",
-                json!({"threadId": thread_id, "cwd": target}),
+            let (settings_result, after) = match apply_relocated_cwd(
+                &thread_id,
+                &target,
+                |method, params| write_backend.app_server_rpc(method, params),
+                std::thread::sleep,
             ) {
-                Ok(result) => result,
-                Err(error) => return write_backend_error(error),
+                Ok(confirmed) => confirmed,
+                Err(error) => {
+                    if let Ok(mut cached) = app_server_projects.index.write() {
+                        *cached = None;
+                    }
+                    return relocation_directory_error(&target, error);
+                }
             };
-            let after = match write_backend.app_server_rpc(
-                "thread/read",
-                json!({"threadId": thread_id, "includeTurns": false}),
-            ) {
-                Ok(result) => result,
-                Err(error) => return write_backend_error(error),
-            };
-            if after.pointer("/thread/cwd").and_then(Value::as_str) != target.to_str() {
-                return Response::error(
-                    "app_server_protocol_error",
-                    "thread/settings/update did not persist the requested directory",
-                );
-            }
             let workspace_roots_applied = after
                 .pointer("/thread/environments")
                 .and_then(Value::as_array)
@@ -9127,10 +9191,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 *cached = None;
             }
             session_store.set_thread_cwd(&thread_id, target.clone());
-            let membership =
-                sync_relocated_project(&thread_id, project_id.as_deref(), |method, params| {
-                    write_backend.app_server_rpc(method, params)
-                });
+            let membership = sync_relocated_project(
+                &thread_id,
+                project_id.as_deref(),
+                |method, params| write_backend.app_server_rpc(method, params),
+                std::thread::sleep,
+            );
             let _ = write_backend.watch_thread(&thread_id);
             if let Err(error) = membership {
                 return relocation_membership_error(&target, error);
@@ -11193,92 +11259,209 @@ mod tests {
     }
 
     #[test]
-    fn relocation_project_assignment_is_verified_from_the_native_response() {
-        let mut requests = Vec::new();
-        sync_relocated_project("thread-1", Some("project-2"), |method, params| {
-            requests.push((method.to_owned(), params));
-            Ok(json!({"thread":{"id":"thread-1", "projectId":"project-2"}}))
-        })
-        .unwrap();
+    fn relocation_directory_waits_for_stale_reads_without_replaying_the_write() {
+        let mut writes = 0;
+        let mut reads = 0;
+        let mut delays = Vec::new();
+        let (ack, after) = apply_relocated_cwd("thread-1", Path::new("/workspace/new"), |method, params| {
+            assert_eq!(params["threadId"], "thread-1");
+            match method {
+                "thread/settings/update" => { writes += 1; Ok(json!({"ack":"native"})) },
+                "thread/read" => {
+                    reads += 1;
+                    Ok(json!({"thread":{"id":"thread-1", "cwd":if reads < 3 {"/workspace/old"} else {"/workspace/new"}}}))
+                },
+                _ => panic!("unexpected mutation"),
+            }
+        }, |delay| delays.push(delay)).unwrap();
+        assert_eq!(writes, 1);
+        assert_eq!(reads, 3);
+        assert_eq!(ack, json!({"ack":"native"}));
+        assert_eq!(after["thread"]["cwd"], "/workspace/new");
         assert_eq!(
-            requests,
-            vec![(
-                "thread/metadata/update".to_owned(),
-                json!({"threadId":"thread-1", "projectId":"project-2"})
-            )]
+            delays,
+            vec![Duration::from_millis(50), Duration::from_millis(100)]
         );
     }
 
     #[test]
-    fn relocation_chats_clear_uses_empty_string_not_null() {
+    fn relocation_project_assignment_waits_for_the_read_side_not_just_the_ack() {
+        let mut writes = 0;
+        let mut reads = 0;
+        let mut delays = Vec::new();
+        sync_relocated_project("thread-1", Some("project-2"), |method, params| {
+            match method {
+                "thread/metadata/update" => {
+                    writes += 1;
+                    assert_eq!(params, json!({"threadId":"thread-1", "projectId":"project-2"}));
+                    Ok(json!({"thread":{"id":"thread-1", "projectId":"project-2"}}))
+                },
+                "thread/read" => {
+                    reads += 1;
+                    Ok(json!({"thread":{"id":"thread-1", "projectId":if reads < 2 {"old-project"} else {"project-2"}}}))
+                },
+                _ => panic!("unexpected mutation"),
+            }
+        }, |delay| delays.push(delay)).unwrap();
+        assert_eq!((writes, reads), (1, 2));
+        assert_eq!(delays, vec![Duration::from_millis(50)]);
+    }
+
+    #[test]
+    fn relocation_chats_clear_uses_empty_string_and_verifies_read_back_null() {
         for cleared in [Value::Null, json!("")] {
-            let mut requests = Vec::new();
-            sync_relocated_project("thread-1", None, |method, params| {
-                requests.push((method.to_owned(), params));
-                Ok(json!({"thread":{"id":"thread-1", "projectId":cleared}}))
-            })
+            let mut writes = 0;
+            let mut reads = 0;
+            sync_relocated_project(
+                "thread-1",
+                None,
+                |method, params| {
+                    if method == "thread/metadata/update" {
+                        writes += 1;
+                        assert_eq!(params, json!({"threadId":"thread-1", "projectId":""}));
+                        Ok(json!({}))
+                    } else {
+                        assert_eq!(method, "thread/read");
+                        reads += 1;
+                        Ok(json!({"thread":{"id":"thread-1", "projectId":cleared}}))
+                    }
+                },
+                |_| panic!("immediate confirmation must not wait"),
+            )
             .unwrap();
-            assert_eq!(
-                requests,
-                vec![(
-                    "thread/metadata/update".to_owned(),
-                    json!({"threadId":"thread-1", "projectId":""})
-                )]
-            );
+            assert_eq!((writes, reads), (1, 1));
         }
     }
 
     #[test]
-    fn relocation_metadata_failure_is_not_retried_or_reported_as_success() {
+    fn relocation_metadata_write_failure_is_never_retried_or_read_as_success() {
         let mut attempts = 0;
-        let error = sync_relocated_project("thread-1", None, |_, _| {
-            attempts += 1;
-            Err(BackendFailure {
-                code: "app_server_rejected",
-                message: "synthetic refusal".to_owned(),
-            })
-        })
+        let error = sync_relocated_project(
+            "thread-1",
+            None,
+            |method, _| {
+                attempts += 1;
+                assert_eq!(method, "thread/metadata/update");
+                Err(BackendFailure {
+                    code: "app_server_rejected",
+                    message: "synthetic refusal".to_owned(),
+                })
+            },
+            |_| panic!("a rejected mutation must not wait"),
+        )
         .unwrap_err();
         assert_eq!(attempts, 1);
-        let response = relocation_membership_error(Path::new("/workspace/new-project"), error);
+        let response = relocation_membership_error(Path::new("/workspace/new"), error);
         assert!(!response.ok);
-        let error = response.error.unwrap();
-        assert_eq!(error.code, "thread_relocation_incomplete");
-        assert!(error
-            .message
-            .contains("directory changed to /workspace/new-project"));
-        assert!(error.message.contains("refresh the session"));
+        assert_eq!(response.error.unwrap().code, "thread_relocation_incomplete");
     }
 
     #[test]
-    fn relocation_metadata_ack_must_confirm_the_same_thread_and_membership() {
-        for (target, result) in [
-            (
-                None,
-                json!({"thread":{"id":"thread-1", "projectId":"old-project"}}),
-            ),
-            (None, json!({"thread":{"id":"thread-1"}})),
-            (
-                None,
-                json!({"thread":{"id":"other-thread", "projectId":null}}),
-            ),
-            (
-                Some("new-project"),
-                json!({"thread":{"id":"thread-1", "projectId":null}}),
-            ),
-            (
-                Some("new-project"),
-                json!({"thread":{"id":"thread-1", "projectId":"old-project"}}),
-            ),
+    fn relocation_read_back_timeout_is_bounded_and_keeps_exactly_one_write() {
+        let mut writes = 0;
+        let mut reads = 0;
+        let mut delays = Vec::new();
+        let error = apply_relocated_cwd(
+            "thread-1",
+            Path::new("/workspace/new"),
+            |method, _| {
+                if method == "thread/settings/update" {
+                    writes += 1;
+                    Ok(json!({}))
+                } else {
+                    assert_eq!(method, "thread/read");
+                    reads += 1;
+                    Ok(json!({"thread":{"id":"thread-1", "cwd":"/workspace/old"}}))
+                }
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+        assert_eq!((writes, reads), (1, 13));
+        assert_eq!(
+            delays.iter().copied().sum::<Duration>(),
+            Duration::from_millis(2500)
+        );
+        let response = relocation_directory_error(Path::new("/workspace/new"), error);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            "thread_relocation_incomplete"
+        );
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("may already have changed"));
+    }
+
+    #[test]
+    fn relocation_read_error_stops_without_a_second_write_or_fallback() {
+        for metadata in [false, true] {
+            let mut writes = 0;
+            let mut reads = 0;
+            let mut rpc = |method: &str, _: Value| {
+                if method == "thread/read" {
+                    reads += 1;
+                    Err(BackendFailure {
+                        code: "app_server_unavailable",
+                        message: "synthetic read error".to_owned(),
+                    })
+                } else {
+                    writes += 1;
+                    assert_eq!(
+                        method,
+                        if metadata {
+                            "thread/metadata/update"
+                        } else {
+                            "thread/settings/update"
+                        }
+                    );
+                    Ok(json!({}))
+                }
+            };
+            let error = if metadata {
+                sync_relocated_project("thread-1", None, &mut rpc, |_| {
+                    panic!("read errors must not wait")
+                })
+                .unwrap_err()
+            } else {
+                apply_relocated_cwd("thread-1", Path::new("/workspace/new"), &mut rpc, |_| {
+                    panic!("read errors must not wait")
+                })
+                .unwrap_err()
+            };
+            assert_eq!(error.code, "app_server_unavailable");
+            assert_eq!((writes, reads), (1, 1));
+        }
+    }
+
+    #[test]
+    fn relocation_metadata_stale_or_mismatched_reads_never_confirm_membership() {
+        for result in [
+            json!({"thread":{"id":"thread-1", "projectId":"old-project"}}),
+            json!({"thread":{"id":"thread-1"}}),
+            json!({"thread":{"id":"other-thread", "projectId":null}}),
         ] {
-            let mut attempts = 0;
-            let error = sync_relocated_project("thread-1", target, |_, _| {
-                attempts += 1;
-                Ok(result.clone())
-            })
+            let mut writes = 0;
+            let mut reads = 0;
+            let error = sync_relocated_project(
+                "thread-1",
+                None,
+                |method, _| {
+                    if method == "thread/metadata/update" {
+                        writes += 1;
+                        Ok(json!({}))
+                    } else {
+                        assert_eq!(method, "thread/read");
+                        reads += 1;
+                        Ok(result.clone())
+                    }
+                },
+                |_| {},
+            )
             .unwrap_err();
             assert_eq!(error.code, "app_server_protocol_error");
-            assert_eq!(attempts, 1);
+            assert_eq!((writes, reads), (1, 13));
         }
     }
 
