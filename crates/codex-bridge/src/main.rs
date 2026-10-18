@@ -2828,7 +2828,140 @@ async fn supervise_managed_process(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedSocketIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+fn managed_socket_identity(metadata: &fs::Metadata) -> ManagedSocketIdentity {
+    ManagedSocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        group: metadata.gid(),
+        mode: metadata.mode(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodexDaemonAliasSnapshot {
+    target: PathBuf,
+    parent: ManagedSocketIdentity,
+    directory: ManagedSocketIdentity,
+    socket: Option<ManagedSocketIdentity>,
+}
+
+fn codex_daemon_alias_snapshot(
+    alias: &Path,
+    daemon_root: Option<&Path>,
+) -> Result<Option<CodexDaemonAliasSnapshot>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (alias, daemon_root);
+        Ok(None)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(root) = daemon_root else {
+            return Ok(None);
+        };
+        let target = fs::read_link(alias).context("cannot inspect managed socket alias")?;
+        let valid_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+        if !target.is_absolute() || target.parent() != Some(root) || !valid_name {
+            return Ok(None);
+        }
+        let parent = root.parent().context("daemon directory has no parent")?;
+        let parent_metadata =
+            fs::symlink_metadata(parent).context("cannot inspect daemon directory parent")?;
+        let parent_owner = if parent == Path::new("/tmp") {
+            0
+        } else {
+            unsafe { libc::geteuid() }
+        };
+        if !parent_metadata.is_dir()
+            || parent_metadata.file_type().is_symlink()
+            || parent_metadata.uid() != parent_owner
+        {
+            bail!("refusing unsafe Codex daemon parent");
+        }
+        let directory =
+            fs::symlink_metadata(root).context("cannot inspect Codex daemon directory")?;
+        if !directory.is_dir()
+            || directory.file_type().is_symlink()
+            || directory.uid() != unsafe { libc::geteuid() }
+            || directory.mode() & 0o7777 != 0o700
+        {
+            bail!("refusing unsafe Codex daemon directory");
+        }
+        let socket = match fs::symlink_metadata(&target) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() }
+                {
+                    bail!("refusing non-socket or foreign Codex daemon target");
+                }
+                Some(managed_socket_identity(&metadata))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("cannot inspect Codex daemon target"),
+        };
+        Ok(Some(CodexDaemonAliasSnapshot {
+            target,
+            parent: managed_socket_identity(&parent_metadata),
+            directory: managed_socket_identity(&directory),
+            socket,
+        }))
+    }
+}
+
+fn managed_socket_refusal(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+    )
+}
+
+fn revalidate_managed_socket(
+    path: &Path,
+    original: &ManagedSocketIdentity,
+    daemon_root: Option<&Path>,
+    alias_snapshot: Option<&CodexDaemonAliasSnapshot>,
+) -> Result<()> {
+    let current = fs::symlink_metadata(path).context("managed socket changed before cleanup")?;
+    if managed_socket_identity(&current) != *original {
+        bail!("managed socket changed before cleanup");
+    }
+    if let Some(snapshot) = alias_snapshot {
+        if codex_daemon_alias_snapshot(path, daemon_root)?.as_ref() != Some(snapshot) {
+            bail!("Codex daemon alias or target changed before cleanup");
+        }
+    }
+    Ok(())
+}
+
 async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketState> {
+    #[cfg(target_os = "linux")]
+    let daemon_root = Some(PathBuf::from(format!("/tmp/codex-daemon-{}", unsafe {
+        libc::geteuid()
+    })));
+    #[cfg(not(target_os = "linux"))]
+    let daemon_root: Option<PathBuf> = None;
+    prepare_managed_process_socket_with_daemon_root(path, daemon_root.as_deref(), || Ok(())).await
+}
+
+async fn prepare_managed_process_socket_with_daemon_root(
+    path: &Path,
+    daemon_root: Option<&Path>,
+    before_cleanup: impl FnOnce() -> Result<()>,
+) -> Result<ManagedSocketState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(ManagedSocketState::Vacant),
@@ -2836,6 +2969,7 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     };
+    let original = managed_socket_identity(&metadata);
     let is_symlink = metadata.file_type().is_symlink();
     if metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
@@ -2843,48 +2977,69 @@ async fn prepare_managed_process_socket(path: &Path) -> Result<ManagedSocketStat
             path.display()
         );
     }
-    let socket_metadata = if is_symlink {
-        fs::metadata(path).with_context(|| {
-            format!("failed to inspect managed socket target {}", path.display())
-        })?
+    let alias_snapshot = if is_symlink {
+        codex_daemon_alias_snapshot(path, daemon_root)?
     } else {
-        metadata
+        None
     };
-    if !socket_metadata.file_type().is_socket() {
-        bail!("refusing to replace non-socket path {}", path.display());
-    }
-    if socket_metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "refusing to replace socket not owned by this user: {}",
-            path.display()
-        );
+    let socket_metadata = if is_symlink {
+        match fs::metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == ErrorKind::NotFound && alias_snapshot.is_some() => None,
+            Err(error) => return Err(error).context("cannot inspect managed socket target"),
+        }
+    } else {
+        Some(metadata)
+    };
+    if let Some(metadata) = socket_metadata {
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("refusing non-socket or foreign managed socket target");
+        }
     }
     let mut connected = 0;
     let mut refused = 0;
     for attempt in 0..3 {
-        if UnixStream::connect(path).await.is_ok() {
-            connected += 1;
-            if connected == 2 {
-                return Ok(ManagedSocketState::Active);
+        match UnixStream::connect(path).await {
+            Ok(_) => {
+                connected += 1;
+                if connected == 2 {
+                    return Ok(ManagedSocketState::Active);
+                }
             }
-        } else {
-            refused += 1;
-            if refused == 2 {
-                break;
+            Err(error) if managed_socket_refusal(&error) => {
+                refused += 1;
+                if refused == 2 {
+                    break;
+                }
+            }
+            Err(error) => {
+                return Err(error).context("managed socket probe failed; path was retained")
             }
         }
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
-    if is_symlink {
+    if is_symlink && alias_snapshot.is_none() {
         bail!(
             "refusing to remove inactive managed socket symlink {}",
             path.display()
         );
     }
+    before_cleanup()?;
+    revalidate_managed_socket(path, &original, daemon_root, alias_snapshot.as_ref())?;
+    match UnixStream::connect(path).await {
+        Ok(_) => return Ok(ManagedSocketState::Active),
+        Err(error) if managed_socket_refusal(&error) => {}
+        Err(error) => {
+            return Err(error).context("final managed socket probe failed; path was retained")
+        }
+    }
+    // Recheck after the final probe, then unlink only the configured name. A symlink's
+    // daemon target is intentionally retained for the Codex daemon to manage itself.
+    revalidate_managed_socket(path, &original, daemon_root, alias_snapshot.as_ref())?;
     fs::remove_file(path)
-        .with_context(|| format!("failed to remove stale socket {}", path.display()))?;
+        .with_context(|| format!("failed to remove stale socket alias {}", path.display()))?;
     Ok(ManagedSocketState::Vacant)
 }
 
@@ -12573,6 +12728,214 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         fs::remove_file(linked_socket).unwrap();
         fs::remove_file(target_socket).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn daemon_socket_fixture() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        // Short isolated paths keep the 64-hex filename below Unix socket path limits.
+        let root = env::temp_dir().join(format!(
+            "cbds-{}-{}",
+            std::process::id(),
+            NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let daemon = root.join("d");
+        fs::DirBuilder::new().mode(0o700).create(&daemon).unwrap();
+        let target = daemon.join("a".repeat(64));
+        let alias = root.join("a.sock");
+        (root, daemon, target, alias)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_stale_socket_unlinks_only_the_alias() {
+        let (root, daemon, target, alias) = daemon_socket_fixture();
+        drop(tokio::net::UnixListener::bind(&target).unwrap());
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert_eq!(
+            prepare_managed_process_socket_with_daemon_root(&alias, Some(&daemon), || Ok(()))
+                .await
+                .unwrap(),
+            ManagedSocketState::Vacant
+        );
+        assert!(fs::symlink_metadata(&alias).is_err());
+        assert!(fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_missing_target_is_recoverable() {
+        let (root, daemon, target, alias) = daemon_socket_fixture();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert_eq!(
+            prepare_managed_process_socket_with_daemon_root(&alias, Some(&daemon), || Ok(()))
+                .await
+                .unwrap(),
+            ManagedSocketState::Vacant
+        );
+        assert!(fs::symlink_metadata(&alias).is_err());
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_active_target_is_adopted_and_preserved() {
+        let (root, daemon, target, alias) = daemon_socket_fixture();
+        let listener = tokio::net::UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert_eq!(
+            prepare_managed_process_socket_with_daemon_root(&alias, Some(&daemon), || panic!(
+                "active alias must never be cleaned up"
+            ))
+            .await
+            .unwrap(),
+            ManagedSocketState::Active
+        );
+        assert_eq!(fs::read_link(&alias).unwrap(), target);
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_rejects_wrong_name_external_path_and_non_socket_target() {
+        for scenario in ["wrong-name", "external", "regular", "target-symlink"] {
+            let (root, daemon, target, alias) = daemon_socket_fixture();
+            let target = match scenario {
+                "wrong-name" => daemon.join("not-a-daemon-socket"),
+                "external" => root.join("b".repeat(64)),
+                _ => target,
+            };
+            if scenario == "target-symlink" {
+                let outside = root.join("outside");
+                fs::write(&outside, b"untouched").unwrap();
+                std::os::unix::fs::symlink(outside, &target).unwrap();
+            } else if scenario == "regular" {
+                fs::write(&target, b"untouched").unwrap();
+            } else {
+                drop(tokio::net::UnixListener::bind(&target).unwrap());
+            }
+            std::os::unix::fs::symlink(&target, &alias).unwrap();
+            assert!(prepare_managed_process_socket_with_daemon_root(
+                &alias,
+                Some(&daemon),
+                || panic!("unsafe alias must not reach cleanup")
+            )
+            .await
+            .is_err());
+            assert_eq!(fs::read_link(&alias).unwrap(), target);
+            assert!(fs::symlink_metadata(&target).is_ok());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_rejects_unsafe_daemon_permissions_and_symlink_parents() {
+        for mode in [0o770, 0o707] {
+            let (root, daemon, target, alias) = daemon_socket_fixture();
+            fs::set_permissions(&daemon, fs::Permissions::from_mode(mode)).unwrap();
+            std::os::unix::fs::symlink(&target, &alias).unwrap();
+            assert!(
+                prepare_managed_process_socket_with_daemon_root(&alias, Some(&daemon), || Ok(()))
+                    .await
+                    .is_err()
+            );
+            assert!(fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_dir_all(root).unwrap();
+        }
+        for parent_link in [false, true] {
+            let (root, daemon, _, alias) = daemon_socket_fixture();
+            let linked_root = root.join("linked");
+            std::os::unix::fs::symlink(if parent_link { &root } else { &daemon }, &linked_root)
+                .unwrap();
+            let candidate = if parent_link {
+                linked_root.join("d")
+            } else {
+                linked_root
+            };
+            std::os::unix::fs::symlink(candidate.join("a".repeat(64)), &alias).unwrap();
+            assert!(prepare_managed_process_socket_with_daemon_root(
+                &alias,
+                Some(&candidate),
+                || Ok(())
+            )
+            .await
+            .is_err());
+            assert!(fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_changed_before_unlink_is_never_removed() {
+        let (root, daemon, target, alias) = daemon_socket_fixture();
+        drop(tokio::net::UnixListener::bind(&target).unwrap());
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let replacement = daemon.join("b".repeat(64));
+        let result = prepare_managed_process_socket_with_daemon_root(&alias, Some(&daemon), || {
+            fs::remove_file(&alias)?;
+            std::os::unix::fs::symlink(&replacement, &alias)?;
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(fs::read_link(&alias).unwrap(), replacement);
+        assert!(target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_codex_alias_target_or_directory_changed_before_unlink_is_retained() {
+        for directory_changed in [false, true] {
+            let (root, daemon, target, alias) = daemon_socket_fixture();
+            drop(tokio::net::UnixListener::bind(&target).unwrap());
+            std::os::unix::fs::symlink(&target, &alias).unwrap();
+            let result =
+                prepare_managed_process_socket_with_daemon_root(&alias, Some(&daemon), || {
+                    if directory_changed {
+                        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o770))?;
+                    } else {
+                        fs::remove_file(&target)?;
+                        fs::write(&target, b"replacement")?;
+                    }
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(fs::read_link(&alias).unwrap(), target);
+            assert!(target.exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_socket_probe_does_not_treat_permission_or_other_errors_as_stale() {
+        for kind in [ErrorKind::ConnectionRefused, ErrorKind::NotFound] {
+            assert!(managed_socket_refusal(&std::io::Error::from(kind)));
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert!(!managed_socket_refusal(&std::io::Error::from(kind)));
+        }
     }
 
     #[tokio::test]
