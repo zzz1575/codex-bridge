@@ -6392,6 +6392,13 @@ fn overlay_app_server_tools(
             continue;
         }
         let previous = message.tools.clone();
+        // Exact identities belong to their original invocation even when an
+        // earlier, distinct call has identical arguments. Reserve them before
+        // performing any cross-source fingerprint matches.
+        let rollout_ids = previous
+            .iter()
+            .map(|tool| tool.call_id.as_str())
+            .collect::<HashSet<_>>();
         let mut used = vec![false; typed.len()];
         let mut merged = Vec::with_capacity(previous.len().max(typed.len()));
         for rollout in &previous {
@@ -6403,6 +6410,7 @@ fn overlay_app_server_tools(
                     let fingerprint = tool_overlay_fingerprint(rollout)?;
                     typed.iter().enumerate().find(|(index, tool)| {
                         !used[*index]
+                            && !rollout_ids.contains(tool.call_id.as_str())
                             && !output_only_tool(tool)
                             && tool_overlay_fingerprint(tool).as_ref() == Some(&fingerprint)
                     })
@@ -13856,6 +13864,42 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         })).unwrap();
         apply_fixture_overlay(&mut message, vec![other]);
         assert_eq!(message.tools.len(), 4);
+    }
+
+    #[test]
+    fn overlay_reserves_later_exact_ids_before_matching_identical_earlier_commands() {
+        let mut earlier = overlay_fixture_tool(
+            "call-a",
+            "exec_command",
+            json!({"command":"pwd","cwd":"/workspace"}),
+        );
+        earlier.output = Some(json!({"aggregatedOutput":"earlier invocation output"}));
+        let later = overlay_fixture_tool(
+            "call-b",
+            "exec_command",
+            json!({"command":"pwd","cwd":"/workspace"}),
+        );
+        let typed_later = typed_thread_tool(&json!({
+            "type":"commandExecution", "id":"call-b", "command":"pwd", "cwd":"/workspace",
+            "status":"completed", "aggregatedOutput":"later invocation new output"
+        }))
+        .unwrap();
+        let mut message = overlay_fixture_message(vec![earlier, later]);
+        apply_fixture_overlay(&mut message, vec![typed_later.clone()]);
+        assert_eq!(message.tools.len(), 2);
+        assert_eq!(message.tools[0].call_id, "call-a");
+        assert_eq!(
+            message.tools[0].output.as_ref().unwrap()["aggregatedOutput"],
+            "earlier invocation output"
+        );
+        assert_eq!(message.tools[1].call_id, "call-b");
+        assert_eq!(
+            message.tools[1].output.as_ref().unwrap()["aggregatedOutput"],
+            "later invocation new output"
+        );
+        let previous = message.clone();
+        assert_eq!(apply_fixture_overlay(&mut message, vec![typed_later]), 0);
+        assert_eq!(message, previous);
     }
 
     #[test]
