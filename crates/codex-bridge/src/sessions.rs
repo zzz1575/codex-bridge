@@ -1707,6 +1707,10 @@ impl SessionStore {
         let Some(mut message) = messages.get(message_index).cloned() else {
             return Ok(None);
         };
+        // Lazy details and image authorization use the indices emitted by message pages.
+        // Compute activity positions across the full thread, even for an older single message.
+        let latest = latest_tool_activity_positions(&messages);
+        retain_message_tool_activities(&mut message, message_index, &latest);
         self.hydrate_tool_outputs(&summary.rollout_path, &mut message)?;
         Ok(Some(message))
     }
@@ -5144,6 +5148,143 @@ mod tests {
         let store = SessionStore::new(fixture.path.clone());
         let snapshot = store.read_thread("thread-opaque-patch").unwrap().unwrap();
         assert!(snapshot.messages[0].tools.is_empty());
+    }
+
+    fn write_activity_index_rollout(fixture: &Fixture, split_messages: bool) {
+        let mut records = vec![
+            json!({"type":"session_meta","payload":{"id":"thread-tool-index","cwd":"/workspace","source":"fixture"}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"first-message","role":"assistant","content":[{"type":"output_text","text":"Inspect the first image."}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-index"}}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wait-old","name":"wait","status":"completed","input":{"receiverThreadIds":["agent-fixture"]}}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wait-old","output":"older wait result"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"image-first","name":"view_image","status":"completed","input":{"path":"/workspace/first.png"}}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"image-first","output":{"image_url":"data:image/png;base64,c3ludGhldGlj","caption":"first fixture image"}}}),
+        ];
+        if split_messages {
+            records.push(json!({"type":"response_item","payload":{"type":"message","id":"second-message","role":"assistant","content":[{"type":"output_text","text":"Inspect the second image."}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-index"}}}));
+        }
+        records.extend([
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wait-latest","name":"wait","status":"completed","input":{"receiverThreadIds":["agent-fixture"]}}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wait-latest","output":"latest wait result"}}),
+        ]);
+        if split_messages {
+            records.extend([
+                json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"image-second","name":"view_image","status":"completed","input":{"path":"/workspace/second.png"}}}),
+                json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"image-second","output":{"image_url":"data:image/png;base64,c3ludGhldGlj","caption":"second fixture image"}}}),
+            ]);
+        }
+        let lines = records.iter().map(Value::to_string).collect::<Vec<_>>();
+        fixture.write_rollout(
+            "rollout-tool-index.jsonl",
+            &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn message_page_and_hydrated_detail_share_filtered_tool_indices_and_image_paths() {
+        let fixture = Fixture::new();
+        write_activity_index_rollout(&fixture, false);
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, page) = store
+            .read_message_page("thread-tool-index", None, 30)
+            .unwrap()
+            .unwrap();
+        let summary = &page.messages[0];
+        assert_eq!(
+            summary
+                .tools
+                .iter()
+                .map(|tool| tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image-first", "wait-latest"]
+        );
+        assert_eq!(
+            summary.tools[0].output.as_ref().unwrap()["_codex_bridge_lazy"],
+            true
+        );
+        let detail = store
+            .read_message("thread-tool-index", page.start)
+            .unwrap()
+            .unwrap();
+        for (index, tool) in summary.tools.iter().enumerate() {
+            assert_eq!(detail.tools[index].call_id, tool.call_id);
+            assert_eq!(detail.tools[index].name, tool.name);
+            assert_eq!(detail.tools[index].input, tool.input);
+        }
+        // Both ToolContent and external image authorization resolve this same displayed index.
+        assert_eq!(detail.tools[0].input["path"], "/workspace/first.png");
+        assert!(detail.tools[0].has_image);
+        assert_eq!(
+            detail.tools[0].output.as_ref().unwrap()["caption"],
+            "first fixture image"
+        );
+        assert_eq!(
+            detail.tools[1].output.as_ref().and_then(Value::as_str),
+            Some("latest wait result")
+        );
+        let turn = store
+            .read_turn_messages("thread-tool-index", "turn-index")
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn[0].1.tools, summary.tools);
+        // Filtering a cloned display message must not discard persisted/raw history.
+        let full = store.read_thread("thread-tool-index").unwrap().unwrap();
+        assert_eq!(full.messages[0].tools.len(), 3);
+        assert_eq!(full.messages[0].tools[0].call_id, "wait-old");
+    }
+
+    #[test]
+    fn historical_page_and_detail_filter_waits_using_the_entire_thread() {
+        let fixture = Fixture::new();
+        write_activity_index_rollout(&fixture, true);
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, older) = store
+            .read_message_page("thread-tool-index", Some(1), 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!((older.start, older.end, older.total), (0, 1, 2));
+        assert_eq!(older.messages[0].tools.len(), 1);
+        assert_eq!(older.messages[0].tools[0].call_id, "image-first");
+        let earlier_detail = store
+            .read_message("thread-tool-index", older.start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(earlier_detail.tools.len(), 1);
+        assert_eq!(
+            earlier_detail.tools[0].call_id,
+            older.messages[0].tools[0].call_id
+        );
+        assert_eq!(
+            earlier_detail.tools[0].input["path"],
+            "/workspace/first.png"
+        );
+        let (_, latest) = store
+            .read_message_page("thread-tool-index", None, 1)
+            .unwrap()
+            .unwrap();
+        let latest_detail = store
+            .read_message("thread-tool-index", latest.start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest.messages[0]
+                .tools
+                .iter()
+                .map(|tool| tool.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wait-latest", "image-second"]
+        );
+        for (index, tool) in latest.messages[0].tools.iter().enumerate() {
+            assert_eq!(latest_detail.tools[index].call_id, tool.call_id);
+            assert_eq!(latest_detail.tools[index].input, tool.input);
+        }
+        assert_eq!(
+            latest_detail.tools[1].input["path"],
+            "/workspace/second.png"
+        );
+        assert_eq!(
+            latest_detail.tools[1].output.as_ref().unwrap()["caption"],
+            "second fixture image"
+        );
     }
 
     #[test]
