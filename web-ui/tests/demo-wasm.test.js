@@ -2627,6 +2627,7 @@ test("a lost Steer response reconciles server acceptance without trapping the co
   const message = { value: "Check the mounting slope" };
   const state = {
     current: { id: "manta" },
+    activeTurnId: "active-turn",
     composerAttachments: [],
     composerReference: null,
     pending: [],

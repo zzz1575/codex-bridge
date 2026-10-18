@@ -1857,7 +1857,7 @@ function openProjectlessDraft() {
   renderApprovals();
   resetThreadViewState(thread);
   applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
-  setSendMode("send", true);
+  setSendMode("steer", true);
   syncTemporaryForCurrent();
   state.userScrolled = false;
   state.followMessageTail = true;
@@ -2345,7 +2345,7 @@ async function refreshSubagentConversation(threadId) {
 function setTemporarySelection(selection = null) {
   state.temporarySelection = selection?.turnId ? { ...selection } : null;
   if (state.temporarySelection) setSendMode("temp", false);
-  else if ($("sendMode").value === "temp") setSendMode(state.activeTurnId ? "steer" : "send", true);
+  else if ($("sendMode").value === "temp") setSendMode("steer", true);
 }
 
 async function createTemporaryThread(selection, draft = "") {
@@ -4936,8 +4936,7 @@ function applyMessagePageState(result) {
   state.historyTotal = result.page.total;
 }
 function setSendMode(mode, automatic = false) {
-  if (mode === "temp" && !state.temporarySelection?.turnId)
-    mode = state.activeTurnId ? "steer" : "send";
+  if (mode === "temp" && !state.temporarySelection?.turnId) mode = "steer";
   $("sendMode").value = mode;
   state.modeAutomatic = automatic;
   const button = $("sendModeToggle"),
@@ -5325,8 +5324,7 @@ async function refreshActivity() {
   else if (state.threadRunStates.get(threadId) === "active")
     setThreadRunState(threadId, "completed");
   renderPending();
-  if (!state.activeTurnId && $("sendMode").value === "steer") setSendMode("send", true);
-  else if (state.activeTurnId && state.modeAutomatic) setSendMode("steer", true);
+  if (state.activeTurnId && state.modeAutomatic) setSendMode("steer", true);
   showActivity();
   renderAsyncQuestion();
   return { activity, changed: previous !== null && previous !== activity.file_len };
@@ -5637,7 +5635,6 @@ function updateThreadLiveFromStatus(threadId, status) {
       state.activeTool = null;
       state.activeToolCallId = null;
       state.liveActivityOverlay = completedActivityOverlay();
-      if ($("sendMode").value === "steer") setSendMode("send", true);
       showActivity();
       renderAsyncQuestion();
     }
@@ -6317,7 +6314,7 @@ async function write(name) {
       setComposerReference();
     } catch (error) {
       if (state.current?.id === sourceThreadId && $("sendMode").value === "temp")
-        setSendMode(state.activeTurnId ? "steer" : "send", true);
+        setSendMode("steer", true);
       throw error;
     } finally {
       setComposerSubmitting(false);
@@ -6360,7 +6357,6 @@ async function write(name) {
         optimistic.status = "queueing";
         renderPending();
       }
-      setSendMode("send", true);
       notify(tr("noActiveTurnQueued"));
     };
     const submit = () =>
