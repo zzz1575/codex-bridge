@@ -728,6 +728,8 @@ struct PendingMessage {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     start_error: Option<BackendFailure>,
+    #[serde(skip)]
+    failure: Option<BackendFailure>,
 }
 
 #[derive(Debug, Default)]
@@ -798,6 +800,7 @@ impl PendingMessages {
                 after_message_index,
                 error: None,
                 start_error: None,
+                failure: None,
             });
         }
         Ok((id, true))
@@ -820,6 +823,7 @@ impl PendingMessages {
                 entry.queued_submission_id = Some(queued_submission_id);
                 entry.error = None;
                 entry.start_error = None;
+                entry.failure = None;
             }
         }
     }
@@ -831,7 +835,34 @@ impl PendingMessages {
                 entry.turn_id = turn_id.or_else(|| entry.turn_id.clone());
                 entry.error = None;
                 entry.start_error = None;
+                entry.failure = None;
             }
+        }
+    }
+
+    fn fail(&self, id: &str, error: &BackendFailure) {
+        if let Ok(mut entries) = self.entries.write() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.status = "failed".to_owned();
+                entry.error = Some(error.message.clone());
+                entry.start_error = None;
+                entry.failure = Some(error.clone());
+            }
+        }
+    }
+
+    fn failed_replay(
+        &self,
+        thread_id: &str,
+        text: &str,
+        action: &str,
+        submission_id: Option<&str>,
+    ) -> Option<Response> {
+        let entry = self.get(submission_id?)?;
+        if entry.thread_id == thread_id && entry.text == text && entry.action == action {
+            failed_pending_replay(&entry)
+        } else {
+            None
         }
     }
 
@@ -905,6 +936,7 @@ impl PendingMessages {
                     completed.status = "applied".to_owned();
                     completed.error = None;
                     completed.start_error = None;
+                    completed.failure = None;
                     completed
                 })
             })
@@ -978,6 +1010,19 @@ impl PendingMessages {
     }
 }
 
+fn failed_pending_replay(entry: &PendingMessage) -> Option<Response> {
+    if entry.status != "failed" {
+        return None;
+    }
+    let error = entry.failure.clone().unwrap_or_else(|| BackendFailure {
+        code: "previous_submission_failed",
+        message: entry.error.clone().unwrap_or_else(|| {
+            "The original submission failed; it has not been retried".to_owned()
+        }),
+    });
+    Some(write_backend_error(error))
+}
+
 fn queue_read_error() -> BackendFailure {
     BackendFailure {
         code: "queue_read_unavailable",
@@ -1023,6 +1068,7 @@ fn read_codex_queue(codex_home: &Path) -> Result<Vec<PendingMessage>, BackendFai
             turn_id: None,
             error: None,
             start_error: None,
+            failure: None,
         })
     })
     .collect()
@@ -1093,6 +1139,7 @@ fn native_queue_page(
                 after_message_index: -1,
                 error: None,
                 start_error: None,
+                failure: None,
             })
         })
         .collect()
@@ -9854,6 +9901,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 let entry = pending_messages
                     .get(&pending_id)
                     .expect("existing pending entry");
+                if let Some(response) = failed_pending_replay(&entry) {
+                    return response;
+                }
                 return Response::success(json!({
                     "action": "send",
                     "status": entry.status,
@@ -9915,16 +9965,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                                 }))
                             }
                             Err(fallback_error) => {
-                                pending_messages.finish(
-                                    &pending_id,
-                                    "failed",
-                                    Some(fallback_error.message.clone()),
-                                );
+                                pending_messages.fail(&pending_id, &fallback_error);
                                 write_backend_error(fallback_error)
                             }
                         }
                     } else {
-                        pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
+                        pending_messages.fail(&pending_id, &error);
                         write_backend_error(error)
                     }
                 }
@@ -9948,6 +9994,17 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             let pending_text = pending_input_summary(&text, &attachments);
             append_composer_skills(write_backend, &resolved.thread.cwd, &text, &mut input);
             if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
+                return response;
+            }
+            // Replaying a failed steer must return the original failure even if
+            // its old turn has since ended. It must not become no_active_turn and
+            // cause a client to retry the same identity through send.
+            if let Some(response) = pending_messages.failed_replay(
+                &resolved.thread.id,
+                &pending_text,
+                "steer",
+                submission_id.as_deref(),
+            ) {
                 return response;
             }
             let turn_id = match write_backend.active_turn_for_steer(&resolved.thread.id) {
@@ -9991,6 +10048,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 let entry = pending_messages
                     .get(&pending_id)
                     .expect("existing pending entry");
+                if let Some(response) = failed_pending_replay(&entry) {
+                    return response;
+                }
                 return Response::success(json!({
                     "action": "steer",
                     "status": entry.status,
@@ -10014,7 +10074,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     }))
                 }
                 Err(error) => {
-                    pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
+                    pending_messages.fail(&pending_id, &error);
                     write_backend_error(error)
                 }
             }
@@ -10341,6 +10401,9 @@ fn start_empty_thread_turn(
         let entry = pending_messages
             .get(&pending_id)
             .expect("existing pending entry");
+        if let Some(response) = failed_pending_replay(&entry) {
+            return response;
+        }
         return Response::success(json!({
             "action": submission.action.response(),
             "status": entry.status,
@@ -10365,7 +10428,7 @@ fn start_empty_thread_turn(
             }))
         }
         Err(error) => {
-            pending_messages.finish(&pending_id, "failed", Some(error.message.clone()));
+            pending_messages.fail(&pending_id, &error);
             write_backend_error(error)
         }
     }
@@ -13562,6 +13625,154 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn failed_new_thread_replay_is_not_acknowledged_or_written_twice() {
+        for action in [EmptyThreadAction::Queue, EmptyThreadAction::Steer] {
+            let directory = unique_test_dir("failed-replay");
+            let home = directory.join("codex-home");
+            fs::create_dir_all(&home).unwrap();
+            let socket = directory.join("bridge.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut websocket = tungstenite::accept(stream).unwrap();
+                let read_json =
+                    |websocket: &mut tungstenite::WebSocket<std::os::unix::net::UnixStream>| loop {
+                        if let tungstenite::Message::Text(text) = websocket.read().unwrap() {
+                            break serde_json::from_str::<Value>(text.as_ref()).unwrap();
+                        }
+                    };
+                let initialize = read_json(&mut websocket);
+                websocket
+                    .send(tungstenite::Message::Text(
+                        json!({"id":initialize["id"],"result":{}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+                let _initialized = read_json(&mut websocket);
+                let request = read_json(&mut websocket);
+                assert_eq!(request["method"], "turn/start");
+                websocket.send(tungstenite::Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"fixture start denied"}}).to_string().into())).unwrap();
+                vec![request]
+            });
+            let store = SessionStore::new(home.clone());
+            store.register_ephemeral_thread(
+                "thread-failed".to_owned(),
+                directory.clone(),
+                None,
+                1,
+                false,
+            );
+            let resolved = ResolvedThread {
+                thread: store.find_thread("thread-failed").unwrap().unwrap(),
+                method: "explicit",
+                authoritative: true,
+            };
+            let backend =
+                CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(socket.clone()));
+            let pending = PendingMessages::default();
+            let input = [json!({"type":"text","text":"fixture request"})];
+            let submit = || {
+                start_empty_thread_turn(
+                    &store,
+                    &backend,
+                    &pending,
+                    &resolved,
+                    &input,
+                    EmptyThreadSubmission {
+                        text: "fixture request",
+                        action,
+                        id: Some("web-failed-replay"),
+                    },
+                )
+            };
+            let first = submit();
+            let requests = server.join().unwrap();
+            assert!(!first.ok);
+            assert_eq!(first.error.as_ref().unwrap().code, "app_server_rejected");
+            let replay = submit();
+            drop(backend);
+            fs::remove_dir_all(directory).unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "only the original start mutation was sent"
+            );
+            assert!(
+                !replay.ok,
+                "failed replay must never acknowledge or clear a client draft"
+            );
+            assert_eq!(replay.error, first.error);
+            assert!(replay.result.is_none());
+        }
+    }
+
+    #[test]
+    fn failed_queue_and_steer_replays_keep_original_errors_and_match_exact_input() {
+        for action in ["queue", "steer"] {
+            let pending = PendingMessages::default();
+            let (id, _) = pending
+                .begin(
+                    "thread-failed",
+                    "fixture request",
+                    action,
+                    -1,
+                    Some("web-failed-once"),
+                )
+                .unwrap();
+            let error = BackendFailure {
+                code: "app_server_rejected",
+                message: "fixture mutation denied".to_owned(),
+            };
+            pending.fail(&id, &error);
+            let (replayed, is_new) = pending
+                .begin(
+                    "thread-failed",
+                    "fixture request",
+                    action,
+                    -1,
+                    Some("web-failed-once"),
+                )
+                .unwrap();
+            assert!(!is_new, "the mutation branch must not run again");
+            assert_eq!(replayed, id);
+            let response = pending
+                .failed_replay("thread-failed", "fixture request", action, Some(&id))
+                .unwrap();
+            assert!(!response.ok);
+            assert_eq!(response.error.as_ref().unwrap().code, error.code);
+            assert_eq!(response.error.as_ref().unwrap().message, error.message);
+            assert!(response.result.is_none());
+            assert!(pending
+                .failed_replay("other-thread", "fixture request", action, Some(&id))
+                .is_none());
+            assert!(pending
+                .failed_replay("thread-failed", "other text", action, Some(&id))
+                .is_none());
+            assert!(pending
+                .failed_replay(
+                    "thread-failed",
+                    "fixture request",
+                    "other-action",
+                    Some(&id)
+                )
+                .is_none());
+            let entry = pending.get(&id).unwrap();
+            assert_eq!(entry.status, "failed");
+            assert_eq!(
+                serde_json::to_value(&entry).unwrap().get("failure"),
+                None,
+                "private replay error must not change the pending API schema"
+            );
+            pending.accept(&id, Some("turn-recovered".to_owned()));
+            assert!(failed_pending_replay(&pending.get(&id).unwrap()).is_none());
+        }
+    }
+
+    #[test]
     fn partial_queue_start_receipt_remains_idempotent_and_does_not_become_failed() {
         let pending = PendingMessages::default();
         let (id, is_new) = pending
@@ -13859,6 +14070,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             after_message_index: -1,
             error: None,
             start_error: None,
+            failure: None,
         }];
         let store = fixture_store();
         let entries = pending.reconcile(&store, queued, Some("thread-1"), true);
@@ -13887,6 +14099,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 after_message_index: -1,
                 error: None,
                 start_error: None,
+                failure: None,
             }],
             Some("thread-1"),
             true,
@@ -13908,6 +14121,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 after_message_index: -1,
                 error: None,
                 start_error: None,
+                failure: None,
             }],
             Some("thread-1"),
             false,
