@@ -29,6 +29,8 @@ still use the account and network configured by Codex itself.
 - Edit and rerun the latest interrupted prompt when that turn has no Steer input.
 - Fork a completed turn into a new session in the current directory or a new Git worktree.
 - Create a session directly from a project row, choosing the current directory or a new worktree.
+- Create a server project from the session dialog: allocate a directory, initialize Git with an
+  empty commit, register the project, then choose a new worktree.
 - Editable voice transcription through app-server, with an optional managed local whisper.cpp
   fallback for private Mac, Linux, homelab, and NAS deployments.
 - Bounded caches and authenticated file preview and downloads for long-running hosts.

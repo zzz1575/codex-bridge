@@ -693,7 +693,39 @@
           <button class="primary create-next" id="createProjectNextBtn" type="button">
             <span data-i18n="continue">Continue</span>
           </button>
+          <button class="create-next" id="createNewProjectBtn" type="button" data-i18n="newProject">
+            New project
+          </button>
         </div>
+        <form class="create-step" id="createNewProjectStep" hidden>
+          <p class="create-step-help" id="createNewProjectHelp" data-i18n="newProjectHelp">
+            Create an empty Git project on the server, then choose how to start a session.
+          </p>
+          <label for="createProjectName" data-i18n="projectName">Project name</label>
+          <input id="createProjectName" type="text" required maxlength="256" autocomplete="off" />
+          <label for="createProjectDirectory" data-i18n="serverProjectDirectory">Server directory</label>
+          <input
+            id="createProjectDirectory"
+            type="text"
+            required
+            maxlength="4096"
+            placeholder="/path/to/projects/new-project"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            aria-describedby="createProjectDirectoryHelp"
+          />
+          <p class="create-step-help" id="createProjectDirectoryHelp" data-i18n="serverProjectDirectoryHelp">
+            Use an absolute path. Its parent directory must already exist; the new directory must not exist.
+          </p>
+          <p class="create-error" id="createProjectError" role="alert" aria-live="polite" hidden></p>
+          <button class="primary create-next" id="createProjectSubmitBtn" type="submit" data-i18n="initializeProject">
+            Create project
+          </button>
+          <button class="create-back" id="createNewProjectBackBtn" type="button" data-i18n="back">
+            Back
+          </button>
+        </form>
         <div class="create-step" id="createModeStep" hidden>
           <div class="create-project" id="createProject"></div>
           <div class="create-options">
@@ -716,7 +748,7 @@
           </button>
         </div>
         <div class="create-actions">
-          <span class="create-progress" id="createProgress"></span
+          <span class="create-progress" id="createProgress" role="status" aria-live="polite"></span
           ><button id="createCancelBtn" data-i18n="cancel">Cancel</button>
         </div>
       </div>

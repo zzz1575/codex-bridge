@@ -28,7 +28,7 @@ pub use write_backend::{
     StartedTurnReceipt, ThreadWriterState, APP_SERVER_SOCKET_ENV, CODEX_BIN_ENV,
 };
 
-pub const PROTOCOL_VERSION: u32 = 43;
+pub const PROTOCOL_VERSION: u32 = 44;
 pub const SOCKET_ENV: &str = "CODEX_BRIDGE_SOCKET";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +45,12 @@ pub enum Request {
     ProjectCreate {
         path: PathBuf,
         name: Option<String>,
+    },
+    ProjectInitialize {
+        parent_path: PathBuf,
+        directory_name: String,
+        name: Option<String>,
+        request_id: String,
     },
     ProjectThreads {
         project_path: PathBuf,
@@ -321,6 +327,7 @@ impl Request {
             Self::Ls { .. } => "ls",
             Self::Projects { .. } => "projects",
             Self::ProjectCreate { .. } => "project_create",
+            Self::ProjectInitialize { .. } => "project_initialize",
             Self::ProjectThreads { .. } => "project_threads",
             Self::Messages { .. } => "messages",
             Self::SubagentMessages { .. } => "subagent_messages",
@@ -465,6 +472,26 @@ mod tests {
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json["command"], "scroll");
         assert_eq!(json["direction"], "down");
+    }
+
+    #[test]
+    fn project_initialization_is_a_separate_typed_operation() {
+        let legacy = serde_json::from_value::<Request>(serde_json::json!({
+            "command": "project_create", "path": "/workspace/existing"
+        })).unwrap();
+        assert_eq!(legacy, Request::ProjectCreate {
+            path: PathBuf::from("/workspace/existing"), name: None,
+        });
+        let initialize = serde_json::from_value::<Request>(serde_json::json!({
+            "command": "project_initialize", "parent_path": "/workspace",
+            "directory_name": "new-project", "name": "New project",
+            "request_id": "fixture-request-00000001"
+        })).unwrap();
+        assert_eq!(serde_json::to_value(initialize).unwrap()["command"], "project_initialize");
+        assert!(serde_json::from_value::<Request>(serde_json::json!({
+            "command": "project_initialize", "parent_path": "/workspace",
+            "directory_name": "new-project"
+        })).is_err());
     }
 
     #[test]

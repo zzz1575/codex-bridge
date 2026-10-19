@@ -4226,6 +4226,18 @@ label.caption {
 .create-step select {
   width: 100%;
 }
+.create-step input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  margin-bottom: 12px;
+}
+.create-error {
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 .create-next {
   width: 100%;
   margin-top: 12px;

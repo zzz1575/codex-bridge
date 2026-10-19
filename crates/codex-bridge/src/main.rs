@@ -42,6 +42,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 
 mod pasted_text;
+mod project_creation;
 #[cfg(feature = "whisper")]
 mod whisper;
 
@@ -6043,6 +6044,54 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
 }
 
 
+fn registered_project_matches(project: &Value, canonical: &Path) -> bool {
+    project.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
+        && project.get("roots").and_then(Value::as_array).is_some_and(|roots| {
+            roots.iter().any(|root| root.get("path").and_then(Value::as_str)
+                .is_some_and(|path| fs::canonicalize(path).is_ok_and(|path| path == canonical)))
+        })
+}
+
+fn register_project(
+    write_backend: &CodexCliBackend,
+    canonical: &Path,
+    name: &str,
+    idempotency_key: Option<&str>,
+) -> Result<(Value, &'static str), BackendFailure> {
+    let projects = app_server_list_all(
+        write_backend, "project/list",
+        json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
+    )?;
+    if let Some(project) = projects.iter().find(|project| registered_project_matches(project, canonical)) {
+        return Ok((project.clone(), "existing"));
+    }
+    let key = if let Some(key) = idempotency_key {
+        key.to_owned()
+    } else {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|error| BackendFailure {
+            code: "project_create_unavailable",
+            message: format!("cannot generate idempotency key: {error}"),
+        })?;
+        random.iter().map(|byte| format!("{byte:02x}")).collect()
+    };
+    let result = write_backend.app_server_rpc("project/create", json!({
+        "idempotencyKey": key, "name": name, "roots": [{"path": canonical}],
+    }))?;
+    let project = result.get("project").filter(|project| registered_project_matches(project, canonical))
+        .ok_or_else(|| BackendFailure {
+            code: "app_server_protocol_error",
+            message: "project/create returned no matching registered project; the creation outcome must be checked before retrying".to_owned(),
+        })?;
+    Ok((project.clone(), "created"))
+}
+
+fn clear_project_cache(cache: &AppServerProjectCache) {
+    if let Ok(mut cached) = cache.index.write() {
+        *cached = None;
+    }
+}
+
 fn creation_project_id(
     projects: &[ProjectSummary],
     index: &ThreadProjectIndex,
@@ -8132,54 +8181,28 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             if name.trim().is_empty() {
                 return Response::error("invalid_project_name", "project name cannot be empty");
             }
-            let projects = match app_server_list_all(
-                write_backend,
-                "project/list",
-                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
-            ) {
-                Ok(projects) => projects,
-                Err(error) => return Response::error(error.code, error.message),
-            };
-            if let Some(project) = projects.iter().find(|project| {
-                project
-                    .get("roots")
-                    .and_then(Value::as_array)
-                    .is_some_and(|roots| {
-                        roots.iter().any(|root| {
-                            root.get("path")
-                                .and_then(Value::as_str)
-                                .is_some_and(|path| {
-                                    fs::canonicalize(path).is_ok_and(|path| path == canonical)
-                                })
-                        })
-                    })
-            }) {
-                return Response::success(json!({
-                    "action": "project_create", "status": "existing",
-                    "project": project,
-                }));
+            match register_project(write_backend, &canonical, &name, None) {
+                Ok((project, status)) => {
+                    clear_project_cache(app_server_projects);
+                    Response::success(json!({"action": "project_create", "status": status, "project": project}))
+                }
+                Err(error) => Response::error(error.code, error.message),
             }
-            let mut random = [0u8; 16];
-            if let Err(error) = getrandom::fill(&mut random) {
-                return Response::error(
-                    "project_create_unavailable",
-                    format!("cannot generate idempotency key: {error}"),
-                );
-            }
-            let idempotency_key = random
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            match write_backend.app_server_rpc(
-                "project/create",
-                json!({
-                    "idempotencyKey": idempotency_key,
-                    "name": name,
-                    "roots": [{"path": canonical}],
-                }),
+        }
+        Request::ProjectInitialize { parent_path, directory_name, name, request_id } => {
+            match project_creation::initialize(
+                session_store.home(), &parent_path, &directory_name, name.as_deref(), &request_id,
+                |canonical, name, key| {
+                    let (project, _) = register_project(write_backend, canonical, name, Some(key))?;
+                    clear_project_cache(app_server_projects);
+                    Ok(project)
+                },
             ) {
-                Ok(result) => Response::success(json!({
-                    "action": "project_create", "status": "created", "project": result.get("project"),
+                Ok(initialized) => Response::success(json!({
+                    "action": "project_initialize", "status": "complete",
+                    "project_path": initialized.project_path, "name": initialized.name,
+                    "git_head": initialized.git_head, "request_id": initialized.request_id,
+                    "project": initialized.project,
                 })),
                 Err(error) => Response::error(error.code, error.message),
             }
@@ -12532,6 +12555,37 @@ mod tests {
     }
 
     #[test]
+    fn initialized_empty_project_can_create_its_first_isolated_worktree() {
+        let root = unique_test_dir("initialized-project-worktree");
+        let parent = root.join("projects");
+        let home = root.join("home");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let initialized = project_creation::initialize(
+            &home, &parent, "new-project", Some("New project"), "worktree-fixture-request-0001",
+            |path, _, _| Ok(json!({"id":"native-project", "roots":[{"path":path}]})),
+        ).unwrap();
+        let prepared = prepare_thread_cwd(&initialized.project_path, true, &home).unwrap();
+        assert_ne!(prepared.cwd, initialized.project_path);
+        assert_eq!(git_output(&prepared.cwd, &["rev-parse", "HEAD"]).unwrap().trim(), initialized.git_head);
+        assert_eq!(git_output(&prepared.cwd, &["status", "--porcelain"]).unwrap(), "");
+        assert_eq!(remove_created_worktree(prepared.worktree.as_ref().unwrap()), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_registration_response_requires_native_id_and_exact_root() {
+        let root = unique_test_dir("registered-project-contract");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert!(registered_project_matches(&json!({"id":"native-project", "roots":[{"path":canonical}]}), &canonical));
+        assert!(!registered_project_matches(&json!({"id":"", "roots":[{"path":canonical}]}), &canonical));
+        assert!(!registered_project_matches(&json!({"id":"native-project", "roots":[{"path":root.join("child")}]}), &canonical));
+        assert!(!registered_project_matches(&json!({"id":"native-project", "roots":[]}), &canonical));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn saved_project_with_no_threads_can_create_its_first_isolated_worktree() {
         let root = unique_test_dir("first-saved-project");
         let repository = root.join("source");
@@ -14546,7 +14600,11 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(!source.contains("--mobile-code"));
         assert!(!source.contains("project-path"));
         assert!(!source.contains("max-height: min(52dvh, 480px)"));
-        assert!(!source.contains("sessionStorage"));
+        // Pending project initialization may persist its request metadata in this tab.
+        // Conversation history remains an in-memory cache and must not use Web Storage.
+        let message_cache_source = include_str!("../../../web-ui/src/message-cache.js");
+        assert!(!message_cache_source.contains("sessionStorage"));
+        assert!(!message_cache_source.contains("localStorage"));
         assert!(!source.contains("state.delivery"));
     }
 

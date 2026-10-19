@@ -99,6 +99,17 @@ directory or start a session. `new` starts an empty session and selects it as th
 thread. Without options it uses the caller's current directory; `--chat` creates a projectless
 Chats session. Use `send` with the returned thread ID to submit the first prompt.
 
+The Web UI also offers **New project** in the **Create session** project picker. Enter a project
+name and a new absolute server directory whose parent already exists. The bridge creates only
+that new directory, initializes Git with an empty initial commit, and registers it in the same
+project list used to create sessions. The next step offers **New Worktree** immediately. This
+does not submit a prompt or change files in any existing project.
+
+If registration is interrupted, retry with the same form. The bridge resumes the recorded
+request only when its directory identity still matches; it never adopts an unrelated existing
+directory. Keep the fields unchanged when retrying. Existing directories should continue to use
+`codexctl project create` rather than the new-directory form.
+
 `ls --json` and `current --json` include both `cwd` (the task's working directory) and
 `rollout_path` (the session JSONL file, when one exists). `codexctl` has no separate command to
 open the containing session directory.

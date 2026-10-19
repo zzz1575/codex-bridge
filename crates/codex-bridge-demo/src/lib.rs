@@ -24,6 +24,12 @@ struct PendingMessage {
     attachments: Vec<Value>,
 }
 
+struct DemoWorktreeJob {
+    project_path: String,
+    polled: bool,
+    result: Option<Value>,
+}
+
 struct DemoState {
     messages: Vec<Value>,
     pending: Vec<PendingMessage>,
@@ -42,7 +48,11 @@ struct DemoState {
     effort: String,
     pinned_thread: Option<String>,
     renamed_threads: HashMap<String, String>,
-    worktree_job_polled: bool,
+    initialized_projects: Vec<Value>,
+    initialization_requests: HashMap<String, (Value, Value)>,
+    created_threads: HashMap<String, Value>,
+    worktree_jobs: HashMap<String, DemoWorktreeJob>,
+    next_worktree_job: u32,
     app_server_restart_count: u64,
     goal: Value,
 }
@@ -67,7 +77,11 @@ impl DemoState {
             effort: "medium".to_owned(),
             pinned_thread: Some(PRIMARY_THREAD.to_owned()),
             renamed_threads: HashMap::new(),
-            worktree_job_polled: false,
+            initialized_projects: Vec::new(),
+            initialization_requests: HashMap::new(),
+            created_threads: HashMap::new(),
+            worktree_jobs: HashMap::new(),
+            next_worktree_job: 1,
             app_server_restart_count: 0,
             goal: json!({
                 "threadId": PRIMARY_THREAD,
@@ -83,6 +97,9 @@ impl DemoState {
     }
 
     fn thread(&self, id: &str) -> Value {
+        if let Some(thread) = self.created_threads.get(id) {
+            return thread.clone();
+        }
         let (default_title, created_at) = if id == SECONDARY_THREAD {
             ("Typed app-server tool items", "2026-09-06T09:38:46.147Z")
         } else {
@@ -107,6 +124,26 @@ impl DemoState {
             "archived": false,
             "pinned": self.pinned_thread.as_deref() == Some(id),
         })
+    }
+
+    fn create_project_thread(&mut self, project_path: &str, worktree: bool) -> Value {
+        let number = self.created_threads.len() + 1;
+        let id = format!("demo-created-thread-{number}");
+        let cwd = if worktree {
+            format!("/demo/worktrees/session-{number}")
+        } else {
+            project_path.to_owned()
+        };
+        let thread = json!({
+            "id": id, "title": "New project session", "cwd": cwd,
+            "project_path": project_path, "git_branch": if worktree { Value::Null } else { json!("main") },
+            "created_at": "2026-09-08T08:00:00.000Z", "updated_at_ms": 1_788_854_400_000_u64,
+            "source": "demo", "archived": false, "pinned": false
+        });
+        self.created_threads.insert(id, thread.clone());
+        json!({"action": "thread_create", "project_path": project_path,
+            "location": if worktree { "worktree" } else { "current" },
+            "worktree_path": if worktree { json!(cwd) } else { Value::Null }, "thread": thread})
     }
 
     fn append_user_message(
@@ -804,6 +841,50 @@ fn error(code: &str, message: impl Into<String>) -> Value {
     json!({"ok": false, "error": {"code": code, "message": message.into()}})
 }
 
+fn initialize_demo_project(request: &Value, state: &mut DemoState) -> Value {
+    let text = |key: &str| request.get(key).and_then(Value::as_str).unwrap_or("");
+    let parent = text("parent_path");
+    let directory = text("directory_name");
+    let name = text("name").trim();
+    let request_id = text("request_id");
+    if !parent.starts_with('/') || parent.starts_with("//") || parent.len() > 4096
+        || parent.contains('\\') || parent.chars().any(char::is_control)
+        || parent.split('/').any(|part| part == "." || part == "..")
+        || directory.is_empty() || directory.trim() != directory || directory.len() > 96
+        || directory.starts_with('.') || directory.contains(['/', '\\'])
+        || directory.chars().any(char::is_control)
+        || name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+        || request_id.len() < 16 || request_id.len() > 128
+        || !request_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return error("project_initialize_invalid", "Use an absolute parent path, a new directory name, a project name, and a request id");
+    }
+    let parent = format!("/{}", parent.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/"));
+    let payload = json!({"parent_path": parent, "directory_name": directory, "name": name});
+    if let Some((previous, result)) = state.initialization_requests.get(request_id) {
+        return if previous == &payload {
+            success(result.clone())
+        } else {
+            error("project_initialize_conflict", "This request id already belongs to another project request")
+        };
+    }
+    let project_path = format!("{}/{directory}", parent.trim_end_matches('/'));
+    if [PROJECT_PATH, HISTORICAL_PROJECT_PATH].contains(&project_path.as_str())
+        || state.initialized_projects.iter().any(|project| project["path"] == project_path)
+    {
+        return error("project_directory_exists", "The requested project directory already exists");
+    }
+    let id = format!("demo-project-{}", state.initialized_projects.len() + 1);
+    let project = json!({"id": id, "name": name, "roots": [{"path": project_path}]});
+    let result = json!({"action": "project_initialize", "status": "complete", "project_path": project_path,
+        "name": name, "git_head": "0123456789abcdef0123456789abcdef01234567", "request_id": request_id,
+        "project": project});
+    state.initialized_projects.push(json!({"id": id, "name": name, "path": project_path,
+        "kind": "project", "thread_count": 0, "archived_count": 0, "updated_at_ms": 1_788_854_400_000_u64}));
+    state.initialization_requests.insert(request_id.to_owned(), (payload, result.clone()));
+    success(result)
+}
+
 fn dispatch(request: Value, state: &mut DemoState) -> Value {
     let Some(command) = request.get("command").and_then(Value::as_str) else {
         return error("invalid_request", "command must be a string");
@@ -824,7 +905,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "status": "ready",
             "demo": true,
             "live_simulation": true,
-            "protocol_version": 35,
+            "protocol_version": 44,
             "capabilities": {
                 "audio_transcription": {
                     "enabled": true,
@@ -850,15 +931,23 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "selected_thread_id": PRIMARY_THREAD,
             "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false}
         }),
-        "projects" => json!({
+        "project_initialize" => return initialize_demo_project(&request, state),
+        "projects" => {
+            let mut projects = vec![
+                json!({"name": "codex-bridge", "path": PROJECT_PATH, "kind": "project", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_541_844_u64}),
+                json!({"name": "previous-project", "path": HISTORICAL_PROJECT_PATH, "kind": "project", "thread_count": 0, "archived_count": 0, "updated_at_ms": 1_788_760_000_000_u64}),
+                json!({"name": "Chats", "path": CHATS_PROJECT_PATH, "kind": "chats", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_500_000_u64}),
+            ];
+            projects.extend(state.initialized_projects.iter().cloned().map(|mut project| {
+                project["thread_count"] = json!(state.created_threads.values().filter(|thread| thread["project_path"] == project["path"]).count());
+                project
+            }));
+            json!({
             "source": "demo_wasm",
             "include_archived": request.get("include_archived").and_then(Value::as_bool).unwrap_or(false),
-            "projects": [
-                {"name": "codex-bridge", "path": PROJECT_PATH, "kind": "project", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_541_844_u64},
-                {"name": "previous-project", "path": HISTORICAL_PROJECT_PATH, "kind": "project", "thread_count": 0, "archived_count": 0, "updated_at_ms": 1_788_760_000_000_u64},
-                {"name": "Chats", "path": CHATS_PROJECT_PATH, "kind": "chats", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_500_000_u64}
-            ]
-        }),
+            "projects": projects
+            })
+        }
         "project_threads" => {
             let project_path = request
                 .get("project_path")
@@ -868,6 +957,8 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 vec![state.thread(SECONDARY_THREAD)]
             } else if project_path == HISTORICAL_PROJECT_PATH {
                 Vec::new()
+            } else if state.initialized_projects.iter().any(|project| project["path"] == project_path) {
+                state.created_threads.values().filter(|thread| thread["project_path"] == project_path).cloned().collect()
             } else {
                 vec![state.thread(PRIMARY_THREAD)]
             };
@@ -1322,21 +1413,38 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "backend": "demo_wasm",
         }),
         "thread_create_start" => {
-            state.worktree_job_polled = false;
-            json!({"action":"thread_create_start", "status":"running", "job_id":"demo-worktree-job"})
+            let job_id = format!("demo-worktree-job-{}", state.next_worktree_job);
+            state.next_worktree_job += 1;
+            state.worktree_jobs.insert(job_id.clone(), DemoWorktreeJob {
+                project_path: request.get("project_path").and_then(Value::as_str).unwrap_or(PROJECT_PATH).to_owned(),
+                polled: false, result: None,
+            });
+            json!({"action":"thread_create_start", "status":"running", "job_id":job_id})
         }
         "thread_create_status" => {
-            if !state.worktree_job_polled {
-                state.worktree_job_polled = true;
-                json!({"action":"thread_create_status", "status":"running", "job_id":"demo-worktree-job", "elapsed_ms":900})
+            let job_id = request.get("job_id").and_then(Value::as_str).unwrap_or("");
+            let Some(job) = state.worktree_jobs.get_mut(job_id) else {
+                return error("thread_create_job_not_found", "The demo worktree job was not found");
+            };
+            if let Some(result) = &job.result {
+                return success(result.clone());
+            }
+            if !job.polled {
+                job.polled = true;
+                json!({"action":"thread_create_status", "status":"running", "job_id":job_id, "elapsed_ms":900})
             } else {
-                json!({
+                let project_path = job.project_path.clone();
+                let result = if state.initialized_projects.iter().any(|project| project["path"] == project_path) {
+                    state.create_project_thread(&project_path, true)
+                } else { json!({
                     "action":"thread_create",
                     "project_path":PROJECT_PATH,
                     "location":"worktree",
                     "worktree_path":"/demo/worktrees/new-session",
                     "thread":state.thread(SECONDARY_THREAD)
-                })
+                }) };
+                state.worktree_jobs.get_mut(job_id).expect("existing worktree job").result = Some(result.clone());
+                result
             }
         }
         "thread_rename" => {
@@ -1385,8 +1493,14 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 "the demo messages are already fully loaded",
             )
         }
-        "thread_create"
-        | "thread_archive"
+        "thread_create" => {
+            let path = request.get("project_path").and_then(Value::as_str).unwrap_or("");
+            if !state.initialized_projects.iter().any(|project| project["path"] == path) {
+                return error("demo_limited", "Current-directory sessions are available only for projects created in this demo");
+            }
+            state.create_project_thread(path, request.get("worktree").and_then(Value::as_bool).unwrap_or(false))
+        }
+        "thread_archive"
         | "thread_repair_ordinals"
         | "approve"
         | "decline"
@@ -1478,7 +1592,7 @@ mod tests {
             serde_json::from_str(&handle_json(r#"{"command":"status"}"#)).unwrap();
         assert_eq!(response["result"]["demo"], true);
         assert_eq!(response["result"]["live_simulation"], true);
-        assert_eq!(response["result"]["protocol_version"], 35);
+        assert_eq!(response["result"]["protocol_version"], 44);
     }
 
     #[test]

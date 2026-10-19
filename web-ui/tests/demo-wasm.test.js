@@ -571,6 +571,269 @@ test("worktree creation uses a background handle and mobile completion has a toa
   assert.match(stylesheet, /\.toast\[data-kind="completion"\]/);
 });
 
+async function newProjectFormFixture({ storage = new Map(), projects = [] } = {}) {
+  const source = await readFile(mainScriptPath, "utf8");
+  const actionsSource = source.slice(
+    source.indexOf("const PROJECT_INITIALIZATION_STORAGE_KEY"),
+    source.indexOf("function openProjectlessDraft()"),
+  );
+  let document;
+  class FormElement {
+    constructor(tag = "button") {
+      this.tagName = tag;
+      this.children = [];
+      this.disabled = false;
+      this.hidden = false;
+      this.value = "";
+      this.attributes = {};
+      this.parts = {};
+    }
+    set textContent(value) { this.text = value; this.children = []; }
+    get textContent() { return this.text || ""; }
+    get options() {
+      return this.children.flatMap((child) => child.tagName === "optgroup" ? child.children : [child]);
+    }
+    appendChild(element) { this.children.push(element); }
+    querySelector(selector) { return (this.parts[selector] ||= new FormElement()); }
+    setAttribute(key, value) { this.attributes[key] = value; }
+    reportValidity() { return true; }
+    focus() { document.activeElement = this; }
+  }
+  const elements = new Map(), requests = [];
+  const $ = (id) => {
+    if (!elements.has(id)) elements.set(id, new FormElement(id === "createProjectSelect" ? "select" : "button"));
+    return elements.get(id);
+  };
+  const opener = new FormElement();
+  document = { activeElement: opener, createElement: (tag) => new FormElement(tag) };
+  $("createModeStep").hidden = true;
+  $("createNewProjectStep").hidden = true;
+  const state = { projects: [...projects], current: null, creatingProject: null };
+  let serverProjects = [...projects], nextId = 1, responder = async (request) => {
+    const path = `${request.parent_path.replace(/\/$/, "")}/${request.directory_name}`;
+    serverProjects = [...serverProjects.filter((project) => project.path !== path),
+      { kind: "project", path, name: request.name }];
+    return { status: "complete", project_path: path, name: request.name, request_id: request.request_id };
+  };
+  const context = {
+    $, state, document, TextEncoder, tr: (key) => key, notify: () => {}, pinnedProject: () => null,
+    sessionStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+    },
+    newSubmissionId: () => `web-fixture-request-${nextId++}`,
+    command: async (request) => { requests.push({ ...request }); return responder(request); },
+    // Production loadProjects refreshes state; it does not populate dialog options.
+    loadProjects: async () => { state.projects = [...serverProjects]; },
+  };
+  const actions = runInNewContext(`${actionsSource}\n({showCreateDialog,showNewProjectForm,initializeProjectFromForm,backToCreateProject,closeCreateDialog,splitProjectDirectory})`, context);
+  return { $, state, actions, requests, opener, document, storage,
+    setResponder: (value) => { responder = value; },
+    setServerProjects: (value) => { serverProjects = value; },
+    fill: (name = "Example project", directory = "/demo/projects/new-project") => {
+      $("createProjectName").value = name;
+      $("createProjectDirectory").value = directory;
+    },
+    submit: () => actions.initializeProjectFromForm({ preventDefault() {} }),
+  };
+}
+
+test("new project form works with no history and restores selectable projects after success and Back", async () => {
+  const f = await newProjectFormFixture();
+  f.actions.showCreateDialog();
+  assert.equal(f.$("createProjectNextBtn").disabled, true);
+  assert.equal(f.document.activeElement, f.$("createNewProjectBtn"));
+  f.actions.showNewProjectForm();
+  f.fill();
+  await f.submit();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].command, "project_initialize");
+  assert.equal(f.state.creatingProject.path, "/demo/projects/new-project");
+  assert.equal(f.$("createModeStep").hidden, false);
+  assert.equal(f.document.activeElement, f.$("createWorktreeBtn"));
+  assert.equal(f.$("createProjectSelect").options.length, 1);
+  assert.equal(f.$("createProjectSelect").value, "/demo/projects/new-project");
+  f.actions.backToCreateProject();
+  assert.equal(f.$("createProjectSelect").disabled, false);
+  assert.equal(f.$("createProjectNextBtn").disabled, false);
+  assert.equal(f.requests.some((request) => request.command.startsWith("thread_create")), false);
+});
+
+test("new project form clears only completed fields before a second new project", async () => {
+  const f = await newProjectFormFixture();
+  f.actions.showCreateDialog();
+  f.actions.showNewProjectForm();
+  f.fill();
+  await f.submit();
+  const firstId = f.requests[0].request_id;
+  f.actions.backToCreateProject();
+  f.actions.showNewProjectForm();
+  assert.equal(f.$("createProjectName").value, "");
+  assert.equal(f.$("createProjectDirectory").value, "");
+  assert.equal(f.storage.size, 0);
+  f.fill("Second project", "/demo/projects/second-project");
+  await f.submit();
+  assert.equal(f.requests.length, 2);
+  assert.notEqual(f.requests[1].request_id, firstId);
+  assert.equal(f.state.creatingProject.path, "/demo/projects/second-project");
+  assert.equal(f.storage.size, 0);
+});
+
+test("new project form submits once, blocks closing while pending, and does not start worktree automatically", async () => {
+  const f = await newProjectFormFixture();
+  let complete;
+  f.setResponder((request) => new Promise((resolve) => { complete = () => {
+    const project = { kind: "project", path: "/demo/projects/new-project", name: request.name };
+    f.setServerProjects([project]);
+    resolve({ status: "complete", project_path: project.path, request_id: request.request_id });
+  }; }));
+  f.actions.showCreateDialog();
+  f.actions.showNewProjectForm();
+  f.fill();
+  const pending = f.submit();
+  await f.submit();
+  f.actions.closeCreateDialog();
+  f.actions.backToCreateProject();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.$("createDialog").hidden, false);
+  assert.equal(f.$("createNewProjectStep").hidden, false);
+  assert.equal(f.$("createCancelBtn").disabled, true);
+  assert.equal(f.$("createNewProjectStep").attributes["aria-busy"], "true");
+  complete();
+  await pending;
+  assert.equal(f.$("createCancelBtn").disabled, false);
+  assert.equal(f.$("createNewProjectStep").attributes["aria-busy"], "false");
+});
+
+test("new project form errors retain fields and request id; changed payload gets a new request", async () => {
+  const f = await newProjectFormFixture();
+  f.actions.showNewProjectForm();
+  f.fill();
+  f.setResponder(async () => { throw new Error("permission denied <script>"); });
+  await f.submit();
+  assert.equal(f.$("createProjectError").hidden, false);
+  assert.equal(f.$("createProjectError").textContent, "permission denied <script>");
+  assert.equal(f.$("createProjectName").value, "Example project");
+  assert.equal(f.$("createProjectDirectory").value, "/demo/projects/new-project");
+  await f.submit();
+  assert.equal(f.requests[0].request_id, f.requests[1].request_id);
+  f.fill("Another project", "/demo/projects/another-project");
+  await f.submit();
+  assert.notEqual(f.requests[1].request_id, f.requests[2].request_id);
+});
+
+test("new project form restores uncertain request after refresh without automatic submission", async () => {
+  const storage = new Map(), first = await newProjectFormFixture({ storage });
+  first.actions.showNewProjectForm();
+  first.fill();
+  first.setResponder(async () => { throw new Error("connection lost after acceptance"); });
+  await first.submit();
+  const refreshed = await newProjectFormFixture({ storage });
+  refreshed.actions.showNewProjectForm();
+  assert.equal(refreshed.$("createProjectDirectory").value, "/demo/projects/new-project");
+  assert.equal(refreshed.requests.length, 0);
+  await refreshed.submit();
+  assert.equal(refreshed.requests[0].request_id, first.requests[0].request_id);
+  assert.equal(storage.size, 0);
+});
+
+test("new project form refuses blank name and unsafe paths before writing", async () => {
+  const f = await newProjectFormFixture();
+  f.actions.showNewProjectForm();
+  for (const [name, path] of [[" ", "/demo/projects/new"], ["Example", "relative/path"],
+    ["Example", "/demo/projects/../new"], ["Example", "/"], ["Example", "/demo/\\new"]]) {
+    f.fill(name, path);
+    await f.submit();
+    assert.equal(f.$("createProjectError").hidden, false);
+  }
+  assert.equal(f.requests.length, 0);
+});
+
+test("new project form cancellation restores focus and makes no directory request", async () => {
+  const f = await newProjectFormFixture();
+  f.actions.showCreateDialog();
+  f.actions.showNewProjectForm();
+  f.fill();
+  f.actions.backToCreateProject();
+  assert.equal(f.$("createProjectStep").hidden, false);
+  f.actions.showNewProjectForm();
+  assert.equal(f.$("createProjectName").value, "Example project");
+  assert.equal(f.$("createProjectDirectory").value, "/demo/projects/new-project");
+  f.actions.closeCreateDialog();
+  assert.equal(f.$("createDialog").hidden, true);
+  assert.equal(f.document.activeElement, f.opener);
+  assert.equal(f.requests.length, 0);
+});
+
+test("new project form keeps idempotent retry when registration succeeded but listing is delayed", async () => {
+  const f = await newProjectFormFixture();
+  f.actions.showNewProjectForm();
+  f.fill();
+  f.setResponder(async (request) => ({ status: "complete", project_path: "/demo/projects/new-project", request_id: request.request_id }));
+  await f.submit();
+  assert.equal(f.$("createProjectError").textContent, "projectListRefreshRequired");
+  const originalId = f.requests[0].request_id;
+  f.setServerProjects([{ kind: "project", name: "Example", path: "/demo/projects/new-project" }]);
+  await f.submit();
+  assert.equal(f.requests[1].request_id, originalId);
+  assert.equal(f.$("createModeStep").hidden, false);
+});
+
+test("new project form markup supports Enter, labeled fields, durable live errors and isolated busy state", async () => {
+  const [html, source] = await Promise.all([readFile(indexPath, "utf8"), readFile(mainScriptPath, "utf8")]);
+  assert.match(html, /<form[^>]*id="createNewProjectStep"/);
+  assert.match(html, /for="createProjectName"/);
+  assert.match(html, /for="createProjectDirectory"/);
+  assert.match(html, /id="createProjectSubmitBtn" type="submit"/);
+  assert.match(html, /id="createProjectError" role="alert" aria-live="polite"/);
+  assert.match(source, /\$\("createNewProjectStep"\)\.onsubmit = initializeProjectFromForm/);
+});
+
+test("compiled demo WASM initializes a registered Git project and creates its first worktree session", async () => {
+  const command = await demoClient();
+  assert.equal(result(command({ command: "status" })).protocol_version, 44);
+  const request = { command: "project_initialize", parent_path: "/demo/projects", directory_name: "new-project",
+    name: "New project", request_id: "web-demo-new-project" };
+  const initialized = result(command(request));
+  assert.equal(initialized.status, "complete");
+  assert.equal(initialized.project_path, "/demo/projects/new-project");
+  assert.equal(initialized.request_id, request.request_id);
+  assert.match(initialized.git_head, /^[a-f0-9]{40}$/);
+  assert.ok(initialized.project.id);
+  assert.equal(initialized.project.roots[0].path, initialized.project_path);
+  assert.deepEqual(result(command(request)), initialized);
+  assert.equal(command({ ...request, name: "Different" }).ok, false);
+  const project = result(command({ command: "projects" })).projects.find((item) => item.path === initialized.project_path);
+  assert.equal(project.name, request.name);
+  assert.equal(project.id, initialized.project.id);
+  assert.equal(project.thread_count, 0);
+  assert.equal(result(command({ command: "project_threads", project_path: project.path })).available, 0);
+  const started = result(command({ command: "thread_create_start", project_path: project.path }));
+  assert.equal(result(command({ command: "thread_create_status", job_id: started.job_id })).status, "running");
+  const created = result(command({ command: "thread_create_status", job_id: started.job_id }));
+  assert.equal(created.location, "worktree");
+  assert.equal(created.project_path, project.path);
+  assert.equal(created.thread.cwd, created.worktree_path);
+  assert.deepEqual(result(command({ command: "thread_create_status", job_id: started.job_id })), created);
+  const threads = result(command({ command: "project_threads", project_path: project.path }));
+  assert.equal(threads.available, 1);
+  assert.equal(threads.threads[0].id, created.thread.id);
+});
+
+test("compiled demo WASM rejects unsafe initialization and never replaces an existing project", async () => {
+  const command = await demoClient();
+  const request = { command: "project_initialize", parent_path: "/demo/projects", directory_name: "safe-project",
+    name: "Example", request_id: "web-demo-safe-request" };
+  for (const change of [{ parent_path: "relative" }, { parent_path: "/demo/../projects" },
+    { directory_name: "../escape" }, { directory_name: "/absolute" }, { name: " " }, { request_id: "" }]) {
+    assert.equal(command({ ...request, ...change }).ok, false);
+  }
+  result(command(request));
+  assert.equal(command({ ...request, request_id: "web-another-request-id" }).ok, false);
+  assert.equal(result(command({ command: "projects" })).projects.filter((project) => project.path === "/demo/projects/safe-project").length, 1);
+});
+
 test("new session starts above pinned sessions and chooses from project history", async () => {
   const command = await demoClient();
   const projects = result(command({ command: "projects", include_archived: false })).projects;

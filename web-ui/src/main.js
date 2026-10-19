@@ -1831,6 +1831,126 @@ function renderProjects() {
   for (const { project, children } of sidebarProjectGroups(projects))
     root.appendChild(projectNode(project, children));
 }
+const PROJECT_INITIALIZATION_STORAGE_KEY = "codex-bridge.project-initialization.v1";
+let projectInitializationBusy = false;
+let projectInitializationDisabled = [];
+let createDialogOpener = null;
+let pendingProjectInitialization = null;
+
+function splitProjectDirectory(value) {
+  const fullPath = value.trim().replace(/\/+$/, "");
+  if (
+    !fullPath.startsWith("/") || fullPath.startsWith("//") ||
+    /[\\\x00-\x1f\x7f]/.test(fullPath) ||
+    fullPath.split("/").some((part) => part === "." || part === "..")
+  ) throw new Error(tr("projectDirectoryInvalid"));
+  const separator = fullPath.lastIndexOf("/"),
+    directoryName = fullPath.slice(separator + 1),
+    parentPath = fullPath.slice(0, separator) || "/";
+  if (!directoryName || directoryName.startsWith(".") || directoryName.trim() !== directoryName ||
+      new TextEncoder().encode(directoryName).length > 96) throw new Error(tr("projectDirectoryInvalid"));
+  return { parentPath, directoryName, fullPath };
+}
+function storedProjectInitialization() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(PROJECT_INITIALIZATION_STORAGE_KEY) || "null");
+    const request = value?.request;
+    if (request?.command !== "project_initialize" ||
+        ![request.parent_path, request.directory_name, request.name, request.request_id].every(
+          (part) => typeof part === "string" && part.length > 0 && part.length <= 4096,
+        )) return null;
+    const directory = splitProjectDirectory(`${request.parent_path.replace(/\/$/, "")}/${request.directory_name}`);
+    if (directory.directoryName !== request.directory_name || directory.parentPath !== request.parent_path)
+      return null;
+    return { request, fullPath: directory.fullPath };
+  } catch {
+    return null;
+  }
+}
+function rememberProjectInitialization(value) {
+  pendingProjectInitialization = value;
+  try {
+    if (value) sessionStorage.setItem(PROJECT_INITIALIZATION_STORAGE_KEY, JSON.stringify(value));
+    else sessionStorage.removeItem(PROJECT_INITIALIZATION_STORAGE_KEY);
+  } catch {
+    // Session storage is optional; the in-memory request still makes retries idempotent.
+  }
+}
+function setProjectInitializationBusy(busy) {
+  projectInitializationBusy = busy;
+  $("createNewProjectStep").setAttribute("aria-busy", String(busy));
+  if (busy) {
+    projectInitializationDisabled = [
+      "createProjectName", "createProjectDirectory", "createProjectSubmitBtn",
+      "createNewProjectBackBtn", "createCancelBtn", "createCurrentBtn", "createWorktreeBtn",
+      "createProjectBackBtn", "createProjectSelect", "createProjectNextBtn", "createNewProjectBtn",
+    ].map((id) => [$(id), $(id).disabled]);
+    for (const [element] of projectInitializationDisabled) element.disabled = true;
+  } else {
+    for (const [element, disabled] of projectInitializationDisabled) element.disabled = disabled;
+    projectInitializationDisabled = [];
+  }
+  $("createProgress").textContent = busy ? tr("initializingProject") : "";
+}
+function showNewProjectForm() {
+  if (projectInitializationBusy) return;
+  pendingProjectInitialization ||= storedProjectInitialization();
+  if (pendingProjectInitialization) {
+    $("createProjectName").value = pendingProjectInitialization.request.name;
+    $("createProjectDirectory").value = pendingProjectInitialization.fullPath;
+  }
+  state.creatingProject = null;
+  $("createProjectStep").hidden = true;
+  $("createModeStep").hidden = true;
+  $("createNewProjectStep").hidden = false;
+  $("createProjectError").hidden = true;
+  $("createProjectName").focus();
+}
+async function initializeProjectFromForm(event) {
+  event?.preventDefault();
+  if (projectInitializationBusy || !$("createNewProjectStep").reportValidity()) return;
+  const errorElement = $("createProjectError");
+  errorElement.hidden = true;
+  try {
+    const name = $("createProjectName").value.trim();
+    if (!name) {
+      $("createProjectName").focus();
+      throw new Error(tr("projectNameRequired"));
+    }
+    if (new TextEncoder().encode(name).length > 256 || /[\x00-\x1f\x7f]/.test(name))
+      throw new Error(tr("projectNameInvalid"));
+    const directory = splitProjectDirectory($("createProjectDirectory").value),
+      payload = { command: "project_initialize", parent_path: directory.parentPath,
+        directory_name: directory.directoryName, name };
+    const pending = pendingProjectInitialization || storedProjectInitialization();
+    const sameRequest = pending && Object.entries(payload).every(([key, value]) => pending.request[key] === value);
+    const request = sameRequest ? pending.request : { ...payload, request_id: newSubmissionId() };
+    rememberProjectInitialization({ request, fullPath: directory.fullPath });
+    setProjectInitializationBusy(true);
+    const result = await command(request, false);
+    if (result.status !== "complete" || !result.project_path || result.request_id !== request.request_id)
+      throw new Error(tr("projectCreationUnconfirmed"));
+    await loadProjects({ restoreSession: false });
+    const project = state.projects.find((item) => item.kind === "project" && item.path === result.project_path);
+    if (!project) throw new Error(tr("projectListRefreshRequired"));
+    rememberProjectInitialization(null);
+    $("createProjectName").value = "";
+    $("createProjectDirectory").value = "";
+    $("createProjectSelect").value = project.path;
+    showCreateMode(project);
+    notify(tr("projectInitialized"));
+  } catch (error) {
+    errorElement.textContent = error.message;
+    errorElement.hidden = false;
+  } finally {
+    if (projectInitializationBusy) setProjectInitializationBusy(false);
+    if (!$("createModeStep").hidden) {
+      populateCreateProjectSelect();
+      $("createProjectSelect").value = state.creatingProject.path;
+      $("createWorktreeBtn").focus();
+    }
+  }
+}
 function populateCreateProjectSelect() {
   const select = $("createProjectSelect"),
     projects = state.projects.filter((project) => project.kind === "project"),
@@ -1865,14 +1985,18 @@ function populateCreateProjectSelect() {
   $("createProjectNextBtn").disabled = empty;
 }
 function showCreateDialog(project = null) {
+  if (projectInitializationBusy) return;
+  createDialogOpener = document.activeElement;
   state.creatingProject = null;
   populateCreateProjectSelect();
   $("createProjectStep").hidden = false;
   $("createModeStep").hidden = true;
+  $("createNewProjectStep").hidden = true;
   $("createProgress").textContent = "";
   $("createDialog").hidden = false;
   if (project) return showCreateMode(project);
-  $("createProjectSelect").focus();
+  if ($("createProjectSelect").disabled) $("createNewProjectBtn").focus();
+  else $("createProjectSelect").focus();
 }
 function showCreateMode(project) {
   state.creatingProject = project;
@@ -1886,6 +2010,7 @@ function showCreateMode(project) {
     isChat ? "newChatHelp" : "currentDirectoryHelp",
   );
   $("createProjectStep").hidden = true;
+  $("createNewProjectStep").hidden = true;
   $("createModeStep").hidden = false;
   $("createCurrentBtn").focus();
 }
@@ -1895,16 +2020,19 @@ function chooseCreateProject() {
   showCreateMode(project);
 }
 function backToCreateProject() {
-  if ($("createCurrentBtn").disabled) return;
+  if (projectInitializationBusy || $("createCurrentBtn").disabled) return;
   state.creatingProject = null;
   $("createModeStep").hidden = true;
+  $("createNewProjectStep").hidden = true;
   $("createProjectStep").hidden = false;
-  $("createProjectSelect").focus();
+  if ($("createProjectSelect").disabled) $("createNewProjectBtn").focus();
+  else $("createProjectSelect").focus();
 }
 function closeCreateDialog() {
-  if ($("createCurrentBtn").disabled) return;
+  if (projectInitializationBusy || $("createCurrentBtn").disabled) return;
   $("createDialog").hidden = true;
   state.creatingProject = null;
+  createDialogOpener?.focus();
 }
 function openProjectlessDraft() {
   const previous = state.current,
@@ -7060,6 +7188,12 @@ $("relocateThreadBtn").onclick = () =>
   });
 $("createSessionBtn").onclick = () => showCreateDialog();
 $("createProjectNextBtn").onclick = () => run(chooseCreateProject);
+$("createNewProjectBtn").onclick = showNewProjectForm;
+$("createNewProjectBackBtn").onclick = backToCreateProject;
+$("createNewProjectStep").onsubmit = initializeProjectFromForm;
+for (const id of ["createProjectName", "createProjectDirectory"]) {
+  $(id).oninput = () => ($("createProjectError").hidden = true);
+}
 $("createProjectBackBtn").onclick = backToCreateProject;
 $("createCurrentBtn").onclick = () => run(() => createThread(false));
 $("createWorktreeBtn").onclick = () => run(() => createThread(true));
@@ -7085,6 +7219,21 @@ $("createCancelBtn").onclick = closeCreateDialog;
 $("createDialog").onclick = (event) => {
   if (event.target === $("createDialog")) closeCreateDialog();
 };
+$("createDialog").addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const focusable = [...$("createDialog").querySelectorAll("button, input, select")].filter(
+    (element) => !element.disabled && !element.closest("[hidden]"),
+  );
+  const first = focusable[0], last = focusable.at(-1);
+  if (!first) return;
+  if (event.shiftKey && (document.activeElement === first || !focusable.includes(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 $("goalHideBtn").onclick = () => setGoalPanelCollapsed(true);
 $("asyncQuestionHideBtn").onclick = () => {
   collapsedAsyncQuestionKey = questionPanelKey(state.current?.id, currentAsyncQuestion());
