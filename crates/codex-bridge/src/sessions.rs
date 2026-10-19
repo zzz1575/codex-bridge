@@ -1266,6 +1266,35 @@ impl SessionStore {
         Ok((model, effort))
     }
 
+    /// None means an older rollout has no tier record; Some(Null) explicitly clears Fast.
+    pub fn composer_service_tier(&self, thread_id: &str) -> Result<Option<Value>> {
+        let Some(thread) = self.find_thread(thread_id)? else {
+            return Ok(None);
+        };
+        if thread.rollout_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let file = File::open(&thread.rollout_path)
+            .with_context(|| format!("failed to open {}", thread.rollout_path.display()))?;
+        let mut tier = None;
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { continue };
+            let Ok(record) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(payload) = record.get("payload") else {
+                continue;
+            };
+            if let Some(value) = payload.get("service_tier") {
+                tier = Some(value.clone());
+            }
+            if let Some(value) = payload.pointer("/thread_settings/service_tier") {
+                tier = Some(value.clone());
+            }
+        }
+        Ok(tier)
+    }
+
     pub fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectSummary>> {
         self.list_projects_with_index(include_archived, None)
     }
@@ -4202,6 +4231,39 @@ mod tests {
     }
 
     #[test]
+    fn composer_service_tier_survives_reload_and_explicit_standard_clear() {
+        let fixture = Fixture::new();
+        fixture.write_rollout("rollout-tier.jsonl", &[
+            r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-tier","cwd":"/tmp/project"}}"#,
+            r#"{"type":"turn_context","payload":{"service_tier":"priority"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"service_tier":null}}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-test"}}"#,
+        ]);
+        assert_eq!(
+            SessionStore::new(fixture.path.clone())
+                .composer_service_tier("thread-tier")
+                .unwrap(),
+            Some(Value::Null)
+        );
+        fixture.write_rollout("rollout-priority.jsonl", &[
+            r#"{"timestamp":"2026-08-30T01:00:00Z","type":"session_meta","payload":{"id":"thread-priority","cwd":"/tmp/project"}}"#,
+            r#"{"type":"event_msg","payload":{"thread_settings":{"service_tier":"priority"}}}"#,
+        ]);
+        assert_eq!(
+            SessionStore::new(fixture.path.clone())
+                .composer_service_tier("thread-priority")
+                .unwrap(),
+            Some(json!("priority"))
+        );
+        assert_eq!(
+            SessionStore::new(fixture.path.clone())
+                .composer_service_tier("missing")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn groups_nested_session_directories_under_the_repository_root() {
         let fixture = Fixture::new();
         let workspace = fixture.path.join("workspace");
@@ -4454,7 +4516,10 @@ mod tests {
         let projects = SessionStore::new(fixture.path.clone())
             .list_projects_with_index(true, Some(&index))
             .unwrap();
-        let saved = projects.iter().find(|project| project.path == workspace).unwrap();
+        let saved = projects
+            .iter()
+            .find(|project| project.path == workspace)
+            .unwrap();
         assert_eq!(saved.kind, ProjectKind::Project);
         assert_eq!(saved.thread_count, 0);
     }

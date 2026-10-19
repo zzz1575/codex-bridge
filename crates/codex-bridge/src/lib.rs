@@ -124,12 +124,16 @@ pub enum Request {
         worktree: bool,
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
     },
     ThreadCreateStart {
         project_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
     },
     ThreadCreateStatus {
         job_id: String,
@@ -166,6 +170,8 @@ pub enum Request {
         thread_id: String,
         model: String,
         effort: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
     },
     ThreadCwdUpdate {
         thread_id: String,
@@ -461,6 +467,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_tier_is_optional_in_legacy_requests_and_round_trips_explicit_choices() {
+        for command in [
+            "thread_create",
+            "thread_create_start",
+            "thread_settings_update",
+        ] {
+            let mut value = serde_json::json!({"command":command,"project_path":"/tmp/project","worktree":false,"thread_id":"thread-1","model":"gpt-test","effort":"high"});
+            let legacy: Request = serde_json::from_value(value.clone()).unwrap();
+            assert!(serde_json::to_value(legacy)
+                .unwrap()
+                .get("service_tier")
+                .is_none());
+            for tier in ["standard", "priority"] {
+                value["service_tier"] = serde_json::json!(tier);
+                let request: Request = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(serde_json::to_value(request).unwrap()["service_tier"], tier);
+            }
+        }
+    }
+
+    #[test]
     fn request_uses_tagged_json_protocol() {
         let request = Request::Scroll {
             direction: Some(ScrollDirection::Down),
@@ -478,20 +505,30 @@ mod tests {
     fn project_initialization_is_a_separate_typed_operation() {
         let legacy = serde_json::from_value::<Request>(serde_json::json!({
             "command": "project_create", "path": "/workspace/existing"
-        })).unwrap();
-        assert_eq!(legacy, Request::ProjectCreate {
-            path: PathBuf::from("/workspace/existing"), name: None,
-        });
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy,
+            Request::ProjectCreate {
+                path: PathBuf::from("/workspace/existing"),
+                name: None,
+            }
+        );
         let initialize = serde_json::from_value::<Request>(serde_json::json!({
             "command": "project_initialize", "parent_path": "/workspace",
             "directory_name": "new-project", "name": "New project",
             "request_id": "fixture-request-00000001"
-        })).unwrap();
-        assert_eq!(serde_json::to_value(initialize).unwrap()["command"], "project_initialize");
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(initialize).unwrap()["command"],
+            "project_initialize"
+        );
         assert!(serde_json::from_value::<Request>(serde_json::json!({
             "command": "project_initialize", "parent_path": "/workspace",
             "directory_name": "new-project"
-        })).is_err());
+        }))
+        .is_err());
     }
 
     #[test]
@@ -659,6 +696,7 @@ mod tests {
             project_path: Some(PathBuf::from("/tmp/project")),
             worktree: true,
             model: Some("gpt-test".into()),
+            service_tier: None,
             prompt: None,
         })
         .unwrap();
@@ -671,6 +709,7 @@ mod tests {
             project_path: None,
             worktree: false,
             model: None,
+            service_tier: None,
             prompt: Some("Explain the release plan".into()),
         })
         .unwrap();
@@ -680,6 +719,7 @@ mod tests {
         let create_start = serde_json::to_value(Request::ThreadCreateStart {
             project_path: PathBuf::from("/tmp/project"),
             model: None,
+            service_tier: None,
         })
         .unwrap();
         assert_eq!(create_start["command"], "thread_create_start");
@@ -736,6 +776,7 @@ mod tests {
             thread_id: "thread-1".into(),
             model: "gpt-test".into(),
             effort: "high".into(),
+            service_tier: None,
         })
         .unwrap();
         assert_eq!(settings["command"], "thread_settings_update");

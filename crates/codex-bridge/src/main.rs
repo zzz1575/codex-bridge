@@ -26,11 +26,11 @@ use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, ClientPerformanceSample,
-    CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, Request, Response,
-    ProjectKind, ProjectSummary, RolloutOrdinalRepair, SessionStore, ThreadMessage,
-    ThreadProjectIndex, ThreadSummary,
-    ThreadToolCall, ThreadWriterState, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV,
-    CHATS_PROJECT_PATH, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
+    CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, ProjectKind,
+    ProjectSummary, Request, Response, RolloutOrdinalRepair, SessionStore, ThreadMessage,
+    ThreadProjectIndex, ThreadSummary, ThreadToolCall, ThreadWriterState,
+    APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV, CHATS_PROJECT_PATH, CODEX_BIN_ENV,
+    HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{Connection, OpenFlags};
@@ -3314,6 +3314,9 @@ async fn main() -> Result<()> {
         app_server_socket.clone(),
         args.app_server_thread_cache,
     ));
+    if let Err(error) = write_backend.configure_service_tier_store(session_store.home()) {
+        eprintln!("{}: {}", error.code, error.message);
+    }
     let (managed_shutdown_tx, managed_shutdown_rx) = watch::channel(false);
     let mut managed_tasks = Vec::new();
     let mut managed_app_server_status = None;
@@ -5576,6 +5579,13 @@ fn composer_model_options(response: &Value) -> Vec<Value> {
                     "description": model.get("description").and_then(Value::as_str),
                     "default_effort": model.get("defaultReasoningEffort").and_then(Value::as_str),
                     "efforts": efforts,
+                    "is_default": model.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
+                    "service_tiers": model.get("serviceTiers").and_then(Value::as_array)
+                        .into_iter().flatten().filter_map(|tier| {
+                            let id = tier.get("id")?.as_str().filter(|id| !id.is_empty())?;
+                            Some(json!({"id":id,"name":tier.get("name").and_then(Value::as_str).unwrap_or(id),
+                                "description":tier.get("description").and_then(Value::as_str)}))
+                        }).collect::<Vec<_>>(),
                 })
             })
         })
@@ -5594,6 +5604,86 @@ fn model_supports(options: &[Value], model: &str, effort: &str) -> bool {
                         .any(|item| item.get("id").and_then(Value::as_str) == Some(effort))
                 })
     })
+}
+
+/// Omission preserves native defaults/settings; explicit Standard must be a JSON null.
+fn native_service_tier(tier: Option<&str>) -> Result<Option<Value>, Response> {
+    match tier {
+        None => Ok(None),
+        Some("standard") => Ok(Some(Value::Null)),
+        Some("priority") => Ok(Some(json!("priority"))),
+        _ => Err(Response::error(
+            "invalid_service_tier",
+            "service_tier must be standard or priority",
+        )),
+    }
+}
+
+fn normalized_service_tier(tier: &Value) -> Option<&'static str> {
+    match tier {
+        Value::Null => Some("standard"),
+        Value::String(value) if value == "priority" => Some("priority"),
+        Value::String(value) if value == "standard" => Some("standard"),
+        _ => None,
+    }
+}
+
+fn model_supports_service_tier(options: &[Value], model: &str, tier: &Value) -> bool {
+    tier.is_null()
+        || options.iter().any(|option| {
+            option.get("id").and_then(Value::as_str) == Some(model)
+                && option
+                    .get("service_tiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tiers| tiers.iter().any(|option| option.get("id") == Some(tier)))
+        })
+}
+
+fn creation_service_tier_model(
+    model: Option<&str>,
+    config: &Value,
+    options: &[Value],
+) -> Option<String> {
+    if let Some(model) = model {
+        return Some(model.to_owned());
+    }
+    if let Some(model) = config
+        .get("config")
+        .unwrap_or(config)
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        return Some(model.to_owned());
+    }
+    let defaults = options
+        .iter()
+        .filter(|option| option.get("is_default").and_then(Value::as_bool) == Some(true))
+        .collect::<Vec<_>>();
+    if defaults.len() == 1 {
+        defaults[0]
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+fn current_service_tier(
+    write_backend: &CodexCliBackend,
+    session_store: &SessionStore,
+    thread_id: &str,
+) -> Result<Value, Response> {
+    if let Some(tier) = write_backend.thread_service_tier(thread_id).or_else(|| {
+        session_store
+            .composer_service_tier(thread_id)
+            .ok()
+            .flatten()
+    }) {
+        return Ok(tier);
+    }
+    Err(Response::error("service_tier_unavailable", "this session has no confirmed service tier; refresh its writer or explicitly select Standard or Fast"))
 }
 
 fn composer_config_settings(response: &Value) -> (Option<String>, Option<String>) {
@@ -6043,13 +6133,23 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
     })
 }
 
-
 fn registered_project_matches(project: &Value, canonical: &Path) -> bool {
-    project.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
-        && project.get("roots").and_then(Value::as_array).is_some_and(|roots| {
-            roots.iter().any(|root| root.get("path").and_then(Value::as_str)
-                .is_some_and(|path| fs::canonicalize(path).is_ok_and(|path| path == canonical)))
-        })
+    project
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        && project
+            .get("roots")
+            .and_then(Value::as_array)
+            .is_some_and(|roots| {
+                roots.iter().any(|root| {
+                    root.get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| {
+                            fs::canonicalize(path).is_ok_and(|path| path == canonical)
+                        })
+                })
+            })
 }
 
 fn register_project(
@@ -6059,10 +6159,14 @@ fn register_project(
     idempotency_key: Option<&str>,
 ) -> Result<(Value, &'static str), BackendFailure> {
     let projects = app_server_list_all(
-        write_backend, "project/list",
+        write_backend,
+        "project/list",
         json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
     )?;
-    if let Some(project) = projects.iter().find(|project| registered_project_matches(project, canonical)) {
+    if let Some(project) = projects
+        .iter()
+        .find(|project| registered_project_matches(project, canonical))
+    {
         return Ok((project.clone(), "existing"));
     }
     let key = if let Some(key) = idempotency_key {
@@ -6075,9 +6179,12 @@ fn register_project(
         })?;
         random.iter().map(|byte| format!("{byte:02x}")).collect()
     };
-    let result = write_backend.app_server_rpc("project/create", json!({
-        "idempotencyKey": key, "name": name, "roots": [{"path": canonical}],
-    }))?;
+    let result = write_backend.app_server_rpc(
+        "project/create",
+        json!({
+            "idempotencyKey": key, "name": name, "roots": [{"path": canonical}],
+        }),
+    )?;
     let project = result.get("project").filter(|project| registered_project_matches(project, canonical))
         .ok_or_else(|| BackendFailure {
             code: "app_server_protocol_error",
@@ -8184,14 +8291,25 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             match register_project(write_backend, &canonical, &name, None) {
                 Ok((project, status)) => {
                     clear_project_cache(app_server_projects);
-                    Response::success(json!({"action": "project_create", "status": status, "project": project}))
+                    Response::success(
+                        json!({"action": "project_create", "status": status, "project": project}),
+                    )
                 }
                 Err(error) => Response::error(error.code, error.message),
             }
         }
-        Request::ProjectInitialize { parent_path, directory_name, name, request_id } => {
+        Request::ProjectInitialize {
+            parent_path,
+            directory_name,
+            name,
+            request_id,
+        } => {
             match project_creation::initialize(
-                session_store.home(), &parent_path, &directory_name, name.as_deref(), &request_id,
+                session_store.home(),
+                &parent_path,
+                &directory_name,
+                name.as_deref(),
+                &request_id,
                 |canonical, name, key| {
                     let (project, _) = register_project(write_backend, canonical, name, Some(key))?;
                     clear_project_cache(app_server_projects);
@@ -8678,6 +8796,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 .unwrap_or_default();
             let resolved_model = app_model.or(rollout_model);
             let resolved_effort = app_effort.or(rollout_effort);
+            let stored_tier = write_backend.thread_service_tier(&thread_id).or_else(|| {
+                session_store
+                    .composer_service_tier(&thread_id)
+                    .ok()
+                    .flatten()
+            });
             let (config_model, config_effort) =
                 if resolved_model.is_none() || resolved_effort.is_none() {
                     write_backend
@@ -8688,6 +8812,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 } else {
                     (None, None)
                 };
+            let tier = stored_tier;
+            let normalized_tier = tier.as_ref().and_then(normalized_service_tier);
             let (weekly_usage, weekly_usage_error) =
                 match write_backend.app_server_rpc("account/rateLimits/read", json!({})) {
                     Ok(rate_limits) => match weekly_usage(&rate_limits) {
@@ -8712,6 +8838,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 "thread_id": thread_id,
                 "model": resolved_model.or(config_model),
                 "reasoning_effort": resolved_effort.or(config_effort),
+                "service_tier": normalized_tier,
+                "service_tier_error": if normalized_tier.is_none() { Some(json!({"code":"service_tier_unavailable", "message":"current service tier could not be confirmed"})) } else { None },
                 "weekly_usage": weekly_usage,
                 "weekly_usage_error": weekly_usage_error,
             }))
@@ -8859,7 +8987,11 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
         Request::ThreadCreateStart {
             project_path,
             model,
+            service_tier,
         } => {
+            if let Err(response) = native_service_tier(service_tier.as_deref()) {
+                return response;
+            }
             if !project_path.is_absolute() {
                 return Response::error("invalid_project_path", "project path must be absolute");
             }
@@ -8915,6 +9047,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                             project_path: Some(project_path),
                             worktree: true,
                             model,
+                            service_tier,
                             prompt: None,
                         },
                         &worker_state,
@@ -9052,8 +9185,44 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             project_path,
             worktree,
             model,
+            service_tier,
             prompt,
         } => {
+            let native_tier = match native_service_tier(service_tier.as_deref()) {
+                Ok(tier) => tier,
+                Err(response) => return response,
+            };
+            if native_tier.as_ref().is_some_and(|tier| !tier.is_null()) {
+                let available = match write_backend
+                    .app_server_rpc("model/list", json!({"limit":100,"includeHidden":false}))
+                {
+                    Ok(result) => composer_model_options(&result),
+                    Err(error) => return write_backend_error(error),
+                };
+                let config = if model.is_none() {
+                    match write_backend.app_server_rpc("config/read", json!({})) {
+                        Ok(config) => config,
+                        Err(error) => return write_backend_error(error),
+                    }
+                } else {
+                    json!({})
+                };
+                let Some(tier_model) =
+                    creation_service_tier_model(model.as_deref(), &config, &available)
+                else {
+                    return Response::error("service_tier_unavailable", "the default model could not be confirmed; choose a model before enabling Fast");
+                };
+                if !model_supports_service_tier(
+                    &available,
+                    &tier_model,
+                    native_tier.as_ref().expect("explicit tier"),
+                ) {
+                    return Response::error(
+                        "unsupported_service_tier",
+                        "Fast is not currently available for the selected model",
+                    );
+                }
+            }
             if model
                 .as_ref()
                 .is_some_and(|model| model.is_empty() || model.len() > 128)
@@ -9084,14 +9253,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             let project_id = if let Some(project) = canonical_project.as_ref() {
                 // Use the same native, desktop-local and historical projects as the list.
                 // Fetch freshly here: a stale display cache must not authorize a removed root.
-                let index = match fetch_app_server_project_index(
-                    write_backend,
-                    true,
-                    session_store.home(),
-                ) {
-                    Ok(index) => index,
-                    Err(error) => return Response::error(error.code, error.message),
-                };
+                let index =
+                    match fetch_app_server_project_index(write_backend, true, session_store.home())
+                    {
+                        Ok(index) => index,
+                        Err(error) => return Response::error(error.code, error.message),
+                    };
                 session_store.sync_thread_cwds(&index);
                 let projects = match session_store.list_projects_with_index(true, Some(&index)) {
                     Ok(projects) => projects,
@@ -9122,6 +9289,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             };
             let mut params = json!({});
             params["cwd"] = json!(prepared.cwd);
+            if let Some(tier) = native_tier {
+                params["serviceTier"] = tier;
+            }
             if let Some(model) = model {
                 params["model"] = Value::String(model);
             }
@@ -9445,7 +9615,12 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             thread_id,
             model,
             effort,
+            service_tier,
         } => {
+            let native_tier = match native_service_tier(service_tier.as_deref()) {
+                Ok(tier) => tier,
+                Err(response) => return response,
+            };
             if let Err(response) = require_owned_thread_writer(write_backend, &thread_id) {
                 return response;
             }
@@ -9467,16 +9642,41 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "the selected model and reasoning effort are not currently available",
                 );
             }
-            match write_backend.app_server_rpc(
-                "thread/settings/update",
-                json!({"threadId": thread_id, "model": model, "effort": effort}),
-            ) {
-                Ok(_) => Response::success(json!({
-                    "action": "thread_settings_update",
-                    "thread_id": thread_id,
-                    "model": model,
-                    "reasoning_effort": effort,
-                })),
+            let effective_tier = match native_tier.clone() {
+                Some(tier) => tier,
+                None => match current_service_tier(write_backend, session_store, &thread_id) {
+                    Ok(tier) => tier,
+                    Err(response) => return response,
+                },
+            };
+            let Some(normalized_tier) = normalized_service_tier(&effective_tier) else {
+                return Response::error(
+                    "service_tier_unavailable",
+                    "the current service tier is unknown; explicitly select Standard or Fast",
+                );
+            };
+            if !model_supports_service_tier(&available, &model, &effective_tier) {
+                return Response::error("unsupported_service_tier", "Fast is not currently available for the selected model; explicitly select Standard");
+            }
+            let mut params = json!({"threadId":thread_id,"model":model,"effort":effort});
+            if let Some(tier) = native_tier.as_ref() {
+                params["serviceTier"] = tier.clone();
+            }
+            match write_backend.app_server_rpc("thread/settings/update", params) {
+                Ok(_) => {
+                    if let Some(tier) = native_tier.as_ref() {
+                        if !write_backend.wait_for_service_tier(&thread_id, tier) {
+                            return Response::error("service_tier_unconfirmed", "settings were accepted but native service-tier confirmation is pending; refresh instead of resending");
+                        }
+                    }
+                    Response::success(json!({
+                        "action": "thread_settings_update",
+                        "thread_id": thread_id,
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "service_tier": normalized_tier,
+                    }))
+                }
                 Err(error) => write_backend_error(error),
             }
         }
@@ -12562,14 +12762,30 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         fs::create_dir_all(&home).unwrap();
         let initialized = project_creation::initialize(
-            &home, &parent, "new-project", Some("New project"), "worktree-fixture-request-0001",
+            &home,
+            &parent,
+            "new-project",
+            Some("New project"),
+            "worktree-fixture-request-0001",
             |path, _, _| Ok(json!({"id":"native-project", "roots":[{"path":path}]})),
-        ).unwrap();
+        )
+        .unwrap();
         let prepared = prepare_thread_cwd(&initialized.project_path, true, &home).unwrap();
         assert_ne!(prepared.cwd, initialized.project_path);
-        assert_eq!(git_output(&prepared.cwd, &["rev-parse", "HEAD"]).unwrap().trim(), initialized.git_head);
-        assert_eq!(git_output(&prepared.cwd, &["status", "--porcelain"]).unwrap(), "");
-        assert_eq!(remove_created_worktree(prepared.worktree.as_ref().unwrap()), None);
+        assert_eq!(
+            git_output(&prepared.cwd, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            initialized.git_head
+        );
+        assert_eq!(
+            git_output(&prepared.cwd, &["status", "--porcelain"]).unwrap(),
+            ""
+        );
+        assert_eq!(
+            remove_created_worktree(prepared.worktree.as_ref().unwrap()),
+            None
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -12578,10 +12794,22 @@ mod tests {
         let root = unique_test_dir("registered-project-contract");
         fs::create_dir_all(root.join("child")).unwrap();
         let canonical = fs::canonicalize(&root).unwrap();
-        assert!(registered_project_matches(&json!({"id":"native-project", "roots":[{"path":canonical}]}), &canonical));
-        assert!(!registered_project_matches(&json!({"id":"", "roots":[{"path":canonical}]}), &canonical));
-        assert!(!registered_project_matches(&json!({"id":"native-project", "roots":[{"path":root.join("child")}]}), &canonical));
-        assert!(!registered_project_matches(&json!({"id":"native-project", "roots":[]}), &canonical));
+        assert!(registered_project_matches(
+            &json!({"id":"native-project", "roots":[{"path":canonical}]}),
+            &canonical
+        ));
+        assert!(!registered_project_matches(
+            &json!({"id":"", "roots":[{"path":canonical}]}),
+            &canonical
+        ));
+        assert!(!registered_project_matches(
+            &json!({"id":"native-project", "roots":[{"path":root.join("child")}]}),
+            &canonical
+        ));
+        assert!(!registered_project_matches(
+            &json!({"id":"native-project", "roots":[]}),
+            &canonical
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -12592,15 +12820,35 @@ mod tests {
         let home = root.join("codex-home");
         fs::create_dir_all(&repository).unwrap();
         fs::create_dir_all(home.join("sessions")).unwrap();
-        assert!(Command::new("git").args(["init", "--quiet"])
-            .current_dir(&repository).status().unwrap().success());
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         fs::write(repository.join("README.md"), "committed fixture\n").unwrap();
-        assert!(Command::new("git").args(["add", "README.md"])
-            .current_dir(&repository).status().unwrap().success());
-        assert!(Command::new("git").args([
-            "-c", "user.name=Codex Bridge Test", "-c", "user.email=codex-bridge@example.invalid",
-            "commit", "--quiet", "--no-gpg-sign", "-m", "fixture",
-        ]).current_dir(&repository).status().unwrap().success());
+        assert!(Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Codex Bridge Test",
+                "-c",
+                "user.email=codex-bridge@example.invalid",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
         fs::write(repository.join("README.md"), "uncommitted original work\n").unwrap();
         let canonical = fs::canonicalize(&repository).unwrap();
         let store = SessionStore::new(home.clone());
@@ -12610,15 +12858,34 @@ mod tests {
             "saved-only": {"name": "Saved project", "rootPaths": [canonical]}
         }}));
         let projects = store.list_projects_with_index(true, Some(&index)).unwrap();
-        assert_eq!(projects.iter().find(|project| project.path == canonical).unwrap().thread_count, 0);
-        assert_eq!(creation_project_id(&projects, &index, &canonical).unwrap(), None);
+        assert_eq!(
+            projects
+                .iter()
+                .find(|project| project.path == canonical)
+                .unwrap()
+                .thread_count,
+            0
+        );
+        assert_eq!(
+            creation_project_id(&projects, &index, &canonical).unwrap(),
+            None
+        );
         let prepared = prepare_thread_cwd(&canonical, true, &home).unwrap();
         assert_ne!(prepared.cwd, canonical);
         assert!(prepared.cwd.starts_with(home.join("worktrees")));
         assert!(prepared.cwd.join(".git").is_file());
-        assert_eq!(fs::read_to_string(prepared.cwd.join("README.md")).unwrap(), "committed fixture\n");
-        assert_eq!(fs::read_to_string(repository.join("README.md")).unwrap(), "uncommitted original work\n");
-        assert_eq!(remove_created_worktree(prepared.worktree.as_ref().unwrap()), None);
+        assert_eq!(
+            fs::read_to_string(prepared.cwd.join("README.md")).unwrap(),
+            "committed fixture\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repository.join("README.md")).unwrap(),
+            "uncommitted original work\n"
+        );
+        assert_eq!(
+            remove_created_worktree(prepared.worktree.as_ref().unwrap()),
+            None
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -12634,17 +12901,36 @@ mod tests {
         }
         let canonical = fs::canonicalize(&repository).unwrap();
         let index = ThreadProjectIndex::from_app_server(
-            &json!({"data": [{"id": "native-project", "roots": [{"path": canonical}]}]}), &[]);
+            &json!({"data": [{"id": "native-project", "roots": [{"path": canonical}]}]}),
+            &[],
+        );
         let store = SessionStore::new(home);
         let projects = store.list_projects_with_index(true, Some(&index)).unwrap();
-        assert_eq!(creation_project_id(&projects, &index, &canonical).unwrap().as_deref(), Some("native-project"));
+        assert_eq!(
+            creation_project_id(&projects, &index, &canonical)
+                .unwrap()
+                .as_deref(),
+            Some("native-project")
+        );
         for path in [&child, &unknown] {
-            assert_eq!(creation_project_id(&projects, &index, &fs::canonicalize(path).unwrap())
-                .unwrap_err().code, "unknown_project");
+            assert_eq!(
+                creation_project_id(&projects, &index, &fs::canonicalize(path).unwrap())
+                    .unwrap_err()
+                    .code,
+                "unknown_project"
+            );
         }
-        let mut section = projects.into_iter().find(|project| project.path == canonical).unwrap();
+        let mut section = projects
+            .into_iter()
+            .find(|project| project.path == canonical)
+            .unwrap();
         section.kind = ProjectKind::Section;
-        assert_eq!(creation_project_id(&[section], &index, &canonical).unwrap_err().code, "unknown_project");
+        assert_eq!(
+            creation_project_id(&[section], &index, &canonical)
+                .unwrap_err()
+                .code,
+            "unknown_project"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -14305,6 +14591,92 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
         assert!(model_supports(&options, "gpt-test", "low"));
         assert!(!model_supports(&options, "gpt-test", "high"));
         assert!(!model_supports(&options, "gpt-missing", "low"));
+    }
+
+    #[test]
+    fn unconfirmed_existing_thread_tier_is_not_inferred_from_global_defaults() {
+        let home = std::env::temp_dir().join(format!("unknown-tier-{}", std::process::id()));
+        let store = SessionStore::new(home);
+        let backend = CodexCliBackend::new(PathBuf::from("codex"), None);
+        let response = current_service_tier(&backend, &store, "unknown-thread").unwrap_err();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "service_tier_unavailable");
+    }
+
+    #[test]
+    fn service_tier_requests_preserve_omission_and_clear_standard_with_null() {
+        assert_eq!(native_service_tier(None).unwrap(), None);
+        assert_eq!(
+            native_service_tier(Some("standard")).unwrap(),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            native_service_tier(Some("priority")).unwrap(),
+            Some(json!("priority"))
+        );
+        for invalid in ["", "fast", "auto", "Priority"] {
+            assert!(native_service_tier(Some(invalid)).is_err());
+        }
+        assert_eq!(normalized_service_tier(&Value::Null), Some("standard"));
+        assert_eq!(
+            normalized_service_tier(&json!("priority")),
+            Some("priority")
+        );
+        assert_eq!(normalized_service_tier(&json!("unknown")), None);
+    }
+
+    #[test]
+    fn catalog_service_tiers_are_preserved_and_fast_requires_explicit_support() {
+        let options = composer_model_options(&json!({"data":[
+            {"model":"gpt-fast","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"medium"}],"serviceTiers":[{"id":"priority","name":"Fast","description":"1.5x speed, increased usage"}]},
+            {"model":"gpt-standard","supportedReasoningEfforts":[{"reasoningEffort":"low"}],"serviceTiers":[]}
+        ]}));
+        assert_eq!(
+            options[0]["service_tiers"],
+            json!([{"id":"priority","name":"Fast","description":"1.5x speed, increased usage"}])
+        );
+        assert_eq!(options[0]["is_default"], true);
+        assert!(model_supports_service_tier(
+            &options,
+            "gpt-fast",
+            &json!("priority")
+        ));
+        assert!(!model_supports_service_tier(
+            &options,
+            "gpt-standard",
+            &json!("priority")
+        ));
+        assert!(!model_supports_service_tier(
+            &options,
+            "gpt-missing",
+            &json!("priority")
+        ));
+        assert!(model_supports_service_tier(
+            &options,
+            "gpt-standard",
+            &Value::Null
+        ));
+        assert_eq!(
+            creation_service_tier_model(None, &json!({}), &options),
+            Some("gpt-fast".into())
+        );
+        assert_eq!(
+            creation_service_tier_model(
+                None,
+                &json!({"config":{"model":"gpt-standard"}}),
+                &options
+            ),
+            Some("gpt-standard".into())
+        );
+        assert_eq!(
+            creation_service_tier_model(
+                Some("gpt-fast"),
+                &json!({"config":{"model":"gpt-standard"}}),
+                &options
+            ),
+            Some("gpt-fast".into())
+        );
+        assert_eq!(creation_service_tier_model(None, &json!({}), &[]), None);
     }
 
     #[test]

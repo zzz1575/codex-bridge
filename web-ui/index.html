@@ -255,13 +255,18 @@
           </div>
           <div class="model-picker" id="modelPicker" hidden>
             <div class="model-picker-head">
-              <span data-i18n="modelAndEffort">Model and reasoning effort</span
+              <span data-i18n="modelAndEffort">Model, reasoning and speed</span
               ><button id="modelPickerClose" type="button" data-i18n="close">Close</button>
             </div>
             <label for="modelSelect" data-i18n="model">Model</label
-            ><select id="modelSelect"></select
-            ><label for="effortSelect" data-i18n="reasoningEffort">Reasoning effort</label
-            ><select id="effortSelect"></select>
+            ><select id="modelSelect"></select>
+            <div class="model-picker-options">
+              <div><label for="effortSelect" data-i18n="reasoningEffort">Reasoning effort</label
+              ><select id="effortSelect"></select></div>
+              <div><label for="serviceTierSelect" data-i18n="responseSpeed">Response speed</label
+              ><select id="serviceTierSelect" aria-describedby="serviceTierHint"></select></div>
+            </div>
+            <div class="service-tier-hint" id="serviceTierHint" role="status"></div>
             <div class="model-description" id="modelDescription"></div>
             <div class="model-picker-actions">
               <button class="primary" id="modelApply" type="button" data-i18n="apply">Apply</button>

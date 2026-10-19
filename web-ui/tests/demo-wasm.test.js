@@ -32,6 +32,7 @@ import { goalToggleState } from "../src/goal-state.js";
 import { goalPanelKey, questionPanelKey, snapshotIsCurrent } from "../src/floating-panel-state.js";
 import { asyncQuestionReplyMode } from "../src/async-question-state.js";
 import { commandPickerTrigger } from "../src/command-picker.js";
+import { composerSelectionIsCurrent } from "../src/service-tier.js";
 import { appendLiveCommandText, commandOutputModel, isCommandTool } from "../src/command-output.js";
 import { LARGE_PASTE_CHARS, shouldAttachPastedText } from "../src/large-paste.js";
 import { orderedTurnChildren, turnUsageHost } from "../src/turn-stack.js";
@@ -858,14 +859,14 @@ test("new session starts above pinned sessions and chooses from project history"
   assert.match(source, /function chooseCreateProject/);
   assert.match(source, /function openProjectlessDraft\(\)/);
   assert.match(source, /projectless_draft: true/);
-  assert.match(source, /async function materializeProjectlessDraft\(prompt\)/);
+  assert.match(source, /async function materializeProjectlessDraft\(prompt,\s*draftThread = state\.current,\s*openToken = state\.openToken\)/);
   assert.match(
     source,
     /command: "thread_create",[\s\S]*project_path: null,[\s\S]*prompt: prompt \|\| null/,
   );
   assert.match(
     source,
-    /if \(state\.current\.projectless_draft\)[\s\S]*materializeProjectlessDraft/,
+    /if \(selectedThread\.projectless_draft \|\| selectedThread\.pending_draft_settings \|\| createdDraftSettings\.has\(selectedThread\.id\)\)[\s\S]*materializeProjectlessDraft/,
   );
   assert.match(source, /if \(p\.kind === "project"\)[\s\S]*create\.className = "project-add"/);
   assert.match(source, /create\.onclick = \(\) => showCreateDialog\(p\)/);
@@ -3235,6 +3236,7 @@ test("a lost Steer response reconciles server acceptance without trapping the co
   const message = { value: "Check the mounting slope" };
   const state = {
     current: { id: "manta" },
+    openToken: 1,
     activeTurnId: "active-turn",
     composerAttachments: [],
     composerReference: null,
@@ -3249,6 +3251,8 @@ test("a lost Steer response reconciles server acceptance without trapping the co
   const calls = [];
   const context = {
     state,
+    createdDraftSettings: new Map(),
+    composerSelectionIsCurrent,
     $: () => message,
     voiceRecorder: null,
     newSubmissionId: () => "steer-attempt",
@@ -3290,6 +3294,7 @@ test("a stale writer lock cannot silently turn an explicit Steer into Queue", as
   const message = { value: "Check the mounting slope" };
   const state = {
     current: { id: "manta" },
+    openToken: 1,
     composerAttachments: [],
     composerReference: null,
     pending: [],
@@ -3304,6 +3309,8 @@ test("a stale writer lock cannot silently turn an explicit Steer into Queue", as
   let finishHistoryRefresh;
   const context = {
     state,
+    createdDraftSettings: new Map(),
+    composerSelectionIsCurrent,
     $: () => message,
     voiceRecorder: null,
     newSubmissionId: () => "steer-with-stale-lock",

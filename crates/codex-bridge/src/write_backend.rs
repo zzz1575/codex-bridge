@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::io::ErrorKind;
-use std::os::unix::fs::FileTypeExt;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -85,6 +86,8 @@ struct AppServerEventBus {
     approvals: RwLock<Vec<Value>>,
     server_requests: RwLock<Vec<Value>>,
     approval_sequence: AtomicU64,
+    service_tiers: RwLock<HashMap<String, Value>>,
+    service_tier_store: RwLock<Option<PathBuf>>,
 }
 
 impl AppServerEventBus {
@@ -95,6 +98,8 @@ impl AppServerEventBus {
             sequence: AtomicU64::new(0),
             approvals: RwLock::new(Vec::new()),
             server_requests: RwLock::new(Vec::new()),
+            service_tiers: RwLock::new(HashMap::new()),
+            service_tier_store: RwLock::new(None),
             approval_sequence: AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -112,13 +117,174 @@ impl AppServerEventBus {
         self.sequence.load(Ordering::Acquire)
     }
 
+    fn observe_service_tier(&self, thread_id: &str, tier: &Value) {
+        if !thread_id.is_empty() {
+            if let Ok(mut tiers) = self.service_tiers.write() {
+                tiers.insert(thread_id.to_owned(), tier.clone());
+                if let Some(path) = self
+                    .service_tier_store
+                    .read()
+                    .ok()
+                    .and_then(|path| path.clone())
+                {
+                    if let Err(error) = persist_service_tiers(&path, &tiers) {
+                        eprintln!("service-tier projection could not be saved: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn configure_service_tier_store(&self, path: PathBuf) -> std::io::Result<()> {
+        let loaded = read_service_tiers(&path)?;
+        *self
+            .service_tiers
+            .write()
+            .map_err(|_| std::io::Error::other("tier cache lock poisoned"))? = loaded;
+        *self
+            .service_tier_store
+            .write()
+            .map_err(|_| std::io::Error::other("tier store lock poisoned"))? = Some(path);
+        Ok(())
+    }
+
+    fn observe_rpc_settings(&self, method: &str, result: &Value) {
+        if matches!(method, "thread/start" | "thread/resume") {
+            if let (Some(thread_id), Some(tier)) = (
+                result.pointer("/thread/id").and_then(Value::as_str),
+                result.get("serviceTier"),
+            ) {
+                self.observe_service_tier(thread_id, tier);
+            }
+        }
+    }
+
     fn publish(&self, mut event: Value) -> bool {
+        let message = event.get("message").unwrap_or(&event);
+        if message.get("method").and_then(Value::as_str) == Some("thread/settings/updated") {
+            if let (Some(thread_id), Some(tier)) = (
+                message.pointer("/params/threadId").and_then(Value::as_str),
+                message.pointer("/params/threadSettings/serviceTier"),
+            ) {
+                self.observe_service_tier(thread_id, tier);
+            }
+        }
         let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
         if let Some(object) = event.as_object_mut() {
             object.insert("bridge_sequence".to_owned(), sequence.into());
         }
         self.sender.send(event).is_ok()
     }
+}
+
+const MAX_SERVICE_TIER_STORE_BYTES: u64 = 1024 * 1024;
+static SERVICE_TIER_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn check_service_tier_file(metadata: &fs::Metadata) -> std::io::Result<()> {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "tier projection must be a private owned regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn read_service_tiers(path: &Path) -> std::io::Result<HashMap<String, Value>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    };
+    check_service_tier_file(&file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SERVICE_TIER_STORE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SERVICE_TIER_STORE_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "tier projection exceeds size limit",
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        std::io::Error::new(ErrorKind::InvalidData, "tier projection JSON is invalid")
+    })?;
+    if value.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "tier projection version is invalid",
+        ));
+    }
+    let tiers: HashMap<String, Value> = serde_json::from_value(
+        value.get("tiers").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "tier projection entries are invalid",
+        )
+    })?;
+    if tiers
+        .iter()
+        .any(|(id, tier)| id.is_empty() || id.len() > 256 || !(tier.is_null() || tier.is_string()))
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "tier projection entry is invalid",
+        ));
+    }
+    Ok(tiers)
+}
+
+fn persist_service_tiers(path: &Path, tiers: &HashMap<String, Value>) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => check_service_tier_file(&metadata)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let bytes = serde_json::to_vec(&json!({"version":1,"tiers":tiers}))?;
+    if bytes.len() as u64 > MAX_SERVICE_TIER_STORE_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "tier projection exceeds size limit",
+        ));
+    }
+    let temporary = path.with_file_name(format!(
+        ".codex-bridge-service-tiers-{}-{}.tmp",
+        std::process::id(),
+        SERVICE_TIER_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut temporary_created = false;
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        temporary_created = true;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            check_service_tier_file(&metadata)?;
+        }
+        fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() && temporary_created {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -360,6 +526,44 @@ impl CodexCliBackend {
             .as_ref()
             .ok_or_else(app_server_unavailable)?;
         app_server.forget_thread(thread_id)
+    }
+
+    pub fn configure_service_tier_store(&self, codex_home: &Path) -> Result<(), BackendFailure> {
+        if let Some(session) = &self.app_server {
+            session
+                .events
+                .configure_service_tier_store(codex_home.join("codex-bridge-service-tiers.json"))
+                .map_err(|error| BackendFailure {
+                    code: "service_tier_store_unavailable",
+                    message: format!("could not load confirmed service-tier projection: {error}"),
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn wait_for_service_tier(&self, thread_id: &str, expected: &Value) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if self.thread_service_tier(thread_id).as_ref() == Some(expected) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub fn thread_service_tier(&self, thread_id: &str) -> Option<Value> {
+        self.app_server.as_ref().and_then(|session| {
+            session
+                .events
+                .service_tiers
+                .read()
+                .ok()?
+                .get(thread_id)
+                .cloned()
+        })
     }
 
     pub fn pending_server_requests(&self) -> Vec<Value> {
@@ -1318,7 +1522,11 @@ fn session_rpc(
                     .get_mut()
                     .set_read_timeout(Some(APP_SERVER_IDLE_POLL))
                     .ok();
-                return rpc_result(response);
+                let result = rpc_result(response);
+                if let Ok(result) = &result {
+                    events.observe_rpc_settings(method, result);
+                }
+                return result;
             }
         }
     }
@@ -1745,6 +1953,104 @@ mod tests {
         std::fs::remove_file(socket).unwrap();
         std::fs::remove_dir(directory).unwrap();
         (result, requests)
+    }
+
+    #[test]
+    fn confirmed_empty_thread_tier_survives_bridge_restart_without_rollout_or_resume() {
+        let directory = std::env::temp_dir().join(format!(
+            "tier-projection-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("tiers.json");
+        let first = AppServerEventBus::new(4);
+        first.configure_service_tier_store(path.clone()).unwrap();
+        assert!(!path.exists());
+        // A request alone is never observed; the native start response is authoritative.
+        first.observe_rpc_settings(
+            "thread/start",
+            &json!({"thread":{"id":"empty-fast"},"serviceTier":"priority"}),
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let restarted = AppServerEventBus::new(4);
+        restarted
+            .configure_service_tier_store(path.clone())
+            .unwrap();
+        assert_eq!(
+            restarted.service_tiers.read().unwrap().get("empty-fast"),
+            Some(&json!("priority"))
+        );
+        restarted.publish(json!({"type":"app_server","message":{"method":"thread/settings/updated","params":{"threadId":"empty-fast","threadSettings":{"serviceTier":null}}}}));
+        let cleared = AppServerEventBus::new(4);
+        cleared.configure_service_tier_store(path).unwrap();
+        assert_eq!(
+            cleared.service_tiers.read().unwrap().get("empty-fast"),
+            Some(&Value::Null)
+        );
+        assert!(!cleared
+            .service_tiers
+            .read()
+            .unwrap()
+            .contains_key("unknown-thread"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tier_projection_rejects_symlinks_and_keeps_target_unchanged() {
+        let directory = std::env::temp_dir().join(format!(
+            "tier-symlink-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target");
+        fs::write(&target, b"preserve").unwrap();
+        let alias = directory.join("tiers.json");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(read_service_tiers(&alias).is_err());
+        assert!(persist_service_tiers(&alias, &HashMap::new()).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"preserve");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn service_tier_cache_uses_native_settings_and_preserves_explicit_null_per_thread() {
+        let events = AppServerEventBus::new(8);
+        events.observe_rpc_settings(
+            "thread/resume",
+            &json!({"thread":{"id":"a"},"serviceTier":"priority"}),
+        );
+        events.observe_rpc_settings(
+            "thread/start",
+            &json!({"thread":{"id":"b"},"serviceTier":null}),
+        );
+        assert_eq!(
+            events.service_tiers.read().unwrap().get("a"),
+            Some(&json!("priority"))
+        );
+        events.publish(json!({"method":"thread/settings/updated","params":{"threadId":"a","threadSettings":{"model":"gpt-test"}}}));
+        assert_eq!(
+            events.service_tiers.read().unwrap().get("a"),
+            Some(&json!("priority"))
+        );
+        events.publish(json!({"type":"app_server","message":{"method":"thread/settings/updated","params":{"threadId":"a","threadSettings":{"serviceTier":null}}}}));
+        assert_eq!(
+            events.service_tiers.read().unwrap().get("a"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            events.service_tiers.read().unwrap().get("b"),
+            Some(&Value::Null)
+        );
+        events.observe_rpc_settings(
+            "thread/read",
+            &json!({"thread":{"id":"a"},"serviceTier":"priority"}),
+        );
+        assert_eq!(
+            events.service_tiers.read().unwrap().get("a"),
+            Some(&Value::Null)
+        );
     }
 
     #[test]

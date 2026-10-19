@@ -68,6 +68,7 @@ export const state = {
   modelOptions: [],
   composerModel: null,
   composerEffort: null,
+  composerServiceTier: "standard",
   usageUnavailable: false,
   directAppServer: false,
   appServerMode: null,

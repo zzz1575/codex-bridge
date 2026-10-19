@@ -18,6 +18,18 @@ import { asyncQuestionReplyMode } from "./async-question-state.js";
 import { goalPanelKey, questionPanelKey, snapshotIsCurrent } from "./floating-panel-state.js";
 import { commandPickerTrigger } from "./command-picker.js";
 import {
+  defaultServiceTier,
+  fastServiceTier,
+  normalizeServiceTier,
+  rememberServiceTier,
+  supportedServiceTier,
+  serviceTierFromStatus,
+  confirmedServiceTier,
+  serviceTierLabelKey,
+  initialComposerModel,
+  composerSelectionIsCurrent,
+} from "./service-tier.js";
+import {
   imageFileFromSource,
   pastedFiles,
   readClipboardImage,
@@ -2049,6 +2061,8 @@ function openProjectlessDraft() {
       git_branch: null,
       projectless_draft: true,
       preferred_model: state.composerModel,
+      preferred_effort: state.composerEffort,
+      preferred_service_tier: defaultServiceTier(window.localStorage),
     };
   state.openToken += 1;
   closePanels();
@@ -2080,6 +2094,7 @@ function openProjectlessDraft() {
   renderProjects();
   showActivity();
   updateTurnNavigation();
+  void refreshComposerStatus();
   window.history.pushState(null, "", `${window.location.pathname}${window.location.search}`);
   $("messageText").focus();
 }
@@ -2100,7 +2115,12 @@ async function createThread(worktree) {
     let r;
     if (worktree) {
       const started = await command(
-          { command: "thread_create_start", project_path: project.path, model: null },
+          {
+            command: "thread_create_start",
+            project_path: project.path,
+            model: null,
+            service_tier: defaultServiceTier(window.localStorage),
+          },
           false,
         ),
         deadline = Date.now() + 10 * 60 * 1000;
@@ -2126,6 +2146,7 @@ async function createThread(worktree) {
           project_path: project.kind === "chats" ? null : project.path,
           worktree: false,
           model: null,
+          service_tier: defaultServiceTier(window.localStorage),
         },
         false,
       );
@@ -5641,8 +5662,19 @@ function setUsageUnavailable(error) {
   $("composerStatus").hidden = false;
   renderPending();
 }
+let composerStatusSequence = 0;
+let composerSettingsSequence = 0;
+const composerSettingsInFlight = new Set();
 async function refreshComposerStatus() {
   if (!state.current) return;
+  const thread = state.current, openToken = state.openToken, sequence = ++composerStatusSequence;
+  const stillCurrent = () => sequence === composerStatusSequence && composerSelectionIsCurrent(state, thread, openToken);
+  if (state.composerStatusThreadId !== thread.id) {
+    state.composerModel = null;
+    state.composerEffort = null;
+    state.composerServiceTier = "unknown";
+    state.composerStatusThreadId = thread.id;
+  }
   const usage = $("usageState"),
     health = $("usageHealth"),
     effort = $("effortState");
@@ -5651,9 +5683,17 @@ async function refreshComposerStatus() {
     usage.textContent = "";
     health.hidden = true;
     health.title = "";
-    effort.textContent = state.composerModel || "";
-    $("modelPickerBtn").disabled = true;
-    $("composerStatus").hidden = !state.composerModel;
+    state.composerModel = state.current.preferred_model || null;
+    state.composerEffort = state.current.preferred_effort || null;
+    state.composerServiceTier = normalizeServiceTier(state.current.preferred_service_tier);
+    effort.textContent = [
+      state.composerModel || tr("selectModel"),
+      state.composerEffort,
+      tr(serviceTierLabelKey(state.composerServiceTier)),
+    ].filter(Boolean).join(" · ");
+    $("modelPickerBtn").title = effort.textContent;
+    $("modelPickerBtn").disabled = false;
+    $("composerStatus").hidden = false;
     renderPending();
     return;
   }
@@ -5661,6 +5701,7 @@ async function refreshComposerStatus() {
     state.usageUnavailable = false;
     state.composerModel = null;
     state.composerEffort = null;
+    state.composerServiceTier = "standard";
     usage.textContent = "";
     health.hidden = true;
     health.title = "";
@@ -5676,13 +5717,19 @@ async function refreshComposerStatus() {
   try {
     r = await command({ command: "composer_status", thread_id: threadId }, false);
   } catch (error) {
-    if (state.current?.id === threadId) setUsageUnavailable(error);
+    if (stillCurrent()) {
+      state.composerServiceTier = "unknown";
+      effort.textContent = [state.composerModel, state.composerEffort, tr("speedUnconfirmed")].filter(Boolean).join(" · ");
+      $("modelPickerBtn").title = effort.textContent;
+      setUsageUnavailable(error);
+    }
     return;
   }
-  if (state.current?.id !== threadId) return;
+  if (!stillCurrent()) return;
   const weekly = r.weekly_usage;
   state.composerModel = r.model || null;
   state.composerEffort = r.reasoning_effort || null;
+  state.composerServiceTier = serviceTierFromStatus(r);
   state.usageUnavailable = !weekly;
   usage.textContent = weekly ? tr("weeklyRemaining", { percent: weekly.remaining_percent }) : "";
   usage.title = weekly?.resets_at
@@ -5695,7 +5742,9 @@ async function refreshComposerStatus() {
   health.hidden = Boolean(weekly);
   health.title = r.weekly_usage_error?.message || "";
   effort.textContent = state.composerModel
-    ? [state.composerModel, state.composerEffort].filter(Boolean).join(" · ")
+    ? [state.composerModel, state.composerEffort,
+      tr(serviceTierLabelKey(state.composerServiceTier))]
+      .filter(Boolean).join(" · ")
     : tr("selectModel");
   $("modelPickerBtn").title = state.composerModel ? effort.textContent : tr("selectModelHelp");
   $("modelPickerBtn").disabled = !currentThreadWritable();
@@ -5705,7 +5754,7 @@ async function refreshComposerStatus() {
 function selectedModelOption() {
   return state.modelOptions.find((model) => model.id === $("modelSelect").value);
 }
-function renderEffortOptions(preferred) {
+function renderEffortOptions(preferred, allowDefault = Boolean(state.current?.projectless_draft)) {
   const model = selectedModelOption(),
     select = $("effortSelect");
   select.textContent = "";
@@ -5716,11 +5765,14 @@ function renderEffortOptions(preferred) {
     select.appendChild(option);
   }
   const available = (model?.efforts || []).map((effort) => effort.id);
-  select.value = available.includes(preferred)
-    ? preferred
-    : available.includes(model?.default_effort)
-      ? model.default_effort
-      : available[0] || "";
+  const value = available.includes(preferred) ? preferred
+    : allowDefault && available.includes(model?.default_effort) ? model.default_effort : "";
+  if (!value) {
+    const placeholder = document.createElement("option");
+    placeholder.value = ""; placeholder.textContent = tr("effortUnconfirmed"); placeholder.disabled = true;
+    select.prepend(placeholder);
+  }
+  select.value = value;
   renderModelDescription();
 }
 function renderModelDescription() {
@@ -5729,18 +5781,57 @@ function renderModelDescription() {
     parts = [model?.description, effort?.description].filter(Boolean);
   $("modelDescription").textContent = parts.join(" · ");
 }
+function renderServiceTierHint() {
+  const fast = fastServiceTier(selectedModelOption());
+  $("serviceTierHint").textContent = $("serviceTierSelect").value === "unknown"
+    ? tr("speedConfirmHint") : $("serviceTierSelect").value === "priority"
+    ? [fast?.description, tr("speedFastUsage")].filter(Boolean).join(" · ")
+    : tr(fast ? "speedStandardHint" : "speedUnavailable");
+  updateModelApplyState();
+}
+function renderServiceTierOptions(preferred) {
+  const select = $("serviceTierSelect"), model = selectedModelOption();
+  select.replaceChildren();
+  const value = supportedServiceTier(preferred, model);
+  if (value === "unknown") {
+    const placeholder = document.createElement("option");
+    placeholder.value = "unknown"; placeholder.textContent = tr("speedUnconfirmed"); placeholder.disabled = true;
+    select.appendChild(placeholder);
+  }
+  for (const [value, label] of [["standard", "speedStandard"], ["priority", "speedFast"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = tr(label);
+    option.disabled = value === "priority" && !fastServiceTier(model);
+    select.appendChild(option);
+  }
+  select.value = value;
+  renderServiceTierHint();
+}
 function renderModelOptions() {
   const select = $("modelSelect");
   select.textContent = "";
+  const selected = initialComposerModel(state.modelOptions, state.composerModel, Boolean(state.current?.projectless_draft));
+  if (!selected) {
+    const placeholder = document.createElement("option");
+    placeholder.value = ""; placeholder.textContent = tr("modelUnconfirmed"); placeholder.disabled = true;
+    select.appendChild(placeholder);
+  }
   for (const model of state.modelOptions) {
     const option = document.createElement("option");
     option.value = model.id;
     option.textContent = model.name;
     select.appendChild(option);
   }
-  if (state.modelOptions.some((model) => model.id === state.composerModel))
-    select.value = state.composerModel;
+  select.value = selected;
   renderEffortOptions(state.composerEffort);
+  renderServiceTierOptions(state.composerServiceTier);
+}
+function updateModelApplyState() {
+  const model = selectedModelOption(), tier = $("serviceTierSelect").value;
+  $("modelApply").disabled = composerSettingsInFlight.has(state.current?.id) || !model
+    || !$("effortSelect").value || !["standard", "priority"].includes(tier)
+    || supportedServiceTier(tier, model) !== tier;
 }
 function renderWorkspaceDiff(summary) {
   const button = $("workspaceDiff");
@@ -5800,7 +5891,10 @@ async function toggleModelPicker() {
     return;
   }
   if (!state.current) throw new Error(tr("chooseSessionError"));
+  const threadId = state.current.id;
+  const thread = state.current, openToken = state.openToken;
   const r = await command({ command: "composer_options" }, false);
+  if (!composerSelectionIsCurrent(state, thread, openToken)) return;
   state.modelOptions = Array.isArray(r.models) ? r.models : [];
   if (!state.modelOptions.length) throw new Error(tr("noModels"));
   renderModelOptions();
@@ -5809,14 +5903,43 @@ async function toggleModelPicker() {
 async function applyThreadSettings() {
   if (!state.current) throw new Error(tr("chooseSessionError"));
   requireCurrentThreadWriter();
-  const threadId = state.current.id,
+  const thread = state.current,
+    threadId = thread.id,
+    openToken = state.openToken,
     model = $("modelSelect").value,
-    effort = $("effortSelect").value;
-  await command({ command: "thread_settings_update", thread_id: threadId, model, effort }, false);
-  if (state.current?.id !== threadId) return;
+    effort = $("effortSelect").value,
+    serviceTier = $("serviceTierSelect").value,
+    button = $("modelApply");
+  if (button.disabled) return;
+  if (!model || !effort || !["standard", "priority"].includes(serviceTier)
+    || supportedServiceTier(serviceTier, selectedModelOption()) !== serviceTier)
+    throw new Error(tr("settingsSelectionRequired"));
+  const sequence = ++composerSettingsSequence;
+  ++composerStatusSequence;
+  composerSettingsInFlight.add(threadId);
+  button.disabled = true;
+  try {
+    if (thread.projectless_draft) {
+      thread.preferred_model = model;
+      thread.preferred_effort = effort;
+      thread.preferred_service_tier = serviceTier;
+    } else {
+      const result = await command({ command: "thread_settings_update", thread_id: threadId,
+        model, effort, service_tier: serviceTier }, false);
+      if (!confirmedServiceTier(result, serviceTier)) throw new Error(tr("speedSettingsUnconfirmed"));
+      delete thread.pending_draft_settings;
+      createdDraftSettings.delete(threadId);
+    }
+    if (sequence === composerSettingsSequence) rememberServiceTier(window.localStorage, serviceTier);
+  } finally {
+    composerSettingsInFlight.delete(threadId);
+    updateModelApplyState();
+  }
+  if (!composerSelectionIsCurrent(state, thread, openToken)) return;
   $("modelPicker").hidden = true;
   await refreshComposerStatus();
-  notify(tr("switchedModel", { model, effort }));
+  notify(tr("settingsApplied", { model, effort,
+    speed: tr(serviceTier === "priority" ? "speedFast" : "speedStandard") }));
 }
 async function refreshActivity() {
   if (!state.current || state.current.projectless_draft) return null;
@@ -6888,35 +7011,60 @@ function newSubmissionId() {
       : `${Date.now()}-${Math.random().toString(36).slice(2)}`
   }`;
 }
-async function materializeProjectlessDraft(prompt) {
-  const draftThread = state.current;
-  if (!draftThread?.projectless_draft) return draftThread;
+const createdDraftSettings = new Map();
+async function materializeProjectlessDraft(prompt, draftThread = state.current, openToken = state.openToken) {
+  if (!draftThread?.projectless_draft) {
+    await applyCreatedDraftSettings(draftThread);
+    return draftThread;
+  }
   const response = await command(
       {
         command: "thread_create",
         project_path: null,
         worktree: false,
         model: draftThread.preferred_model || null,
+        service_tier: normalizeServiceTier(draftThread.preferred_service_tier),
         prompt: prompt || null,
       },
       false,
     ),
     thread = { ...response.thread, project_path: response.project_path };
+  if (draftThread.preferred_effort) {
+    thread.pending_draft_settings = {
+      model: draftThread.preferred_model,
+      effort: draftThread.preferred_effort,
+      service_tier: normalizeServiceTier(draftThread.preferred_service_tier),
+    };
+    createdDraftSettings.set(thread.id, thread.pending_draft_settings);
+  }
   const savedDraft = state.drafts.get(draftThread.id);
   state.drafts.delete(draftThread.id);
+  if (state.attachmentDrafts.has(draftThread.id)) state.attachmentDrafts.set(thread.id, state.attachmentDrafts.get(draftThread.id));
+  if (state.referenceDrafts.has(draftThread.id)) state.referenceDrafts.set(thread.id, state.referenceDrafts.get(draftThread.id));
   state.attachmentDrafts.delete(draftThread.id);
   state.referenceDrafts.delete(draftThread.id);
   if (savedDraft) state.drafts.set(thread.id, savedDraft);
   persistDrafts();
-  state.current = thread;
-  applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
-  $("threadTitle").textContent = thread.title || thread.id;
-  $("threadCompactMeta").textContent = thread.git_branch || tr("noBranch");
-  $("threadMeta").textContent =
-    `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
+  if (composerSelectionIsCurrent(state, draftThread, openToken)) {
+    state.current = thread;
+    applyThreadWriterLock({ state: "owned", read_only: false, reason: null });
+    $("threadTitle").textContent = thread.title || thread.id;
+    $("threadCompactMeta").textContent = thread.git_branch || tr("noBranch");
+    $("threadMeta").textContent = `${thread.cwd} · ${thread.git_branch || tr("noBranch")} · ${thread.id}`;
+  }
   renderProjects();
   void loadProjects().catch(() => {});
+  await applyCreatedDraftSettings(thread);
   return thread;
+}
+async function applyCreatedDraftSettings(thread) {
+  const settings = thread?.pending_draft_settings || createdDraftSettings.get(thread?.id);
+  if (!settings) return;
+  const result = await command({ command: "thread_settings_update", thread_id: thread.id,
+    ...settings }, false);
+  if (!confirmedServiceTier(result, settings.service_tier)) throw new Error(tr("speedSettingsUnconfirmed"));
+  createdDraftSettings.delete(thread.id);
+  delete thread.pending_draft_settings;
 }
 const serverRequestTray = createServerRequestTray({
   document,
@@ -6940,16 +7088,29 @@ async function write(name) {
   }
   if (voiceRecorder?.state === "recording") throw new Error(tr("stopRecording"));
   if (!state.current) throw new Error(tr("chooseSessionError"));
-  if (state.current.projectless_draft) {
+  const selectedThread = state.current, openToken = state.openToken;
+  let submissionThread = selectedThread;
+  if (selectedThread.projectless_draft || selectedThread.pending_draft_settings || createdDraftSettings.has(selectedThread.id)) {
+    saveDraft(selectedThread.id, draft, true);
+    state.attachmentDrafts.set(selectedThread.id, attachments);
+    if (reference) state.referenceDrafts.set(selectedThread.id, reference);
     setComposerSubmitting(true);
     try {
-      await materializeProjectlessDraft(text || tr("pastedTextName"));
+      submissionThread = await materializeProjectlessDraft(text || tr("pastedTextName"), selectedThread, openToken);
     } catch (error) {
       setComposerSubmitting(false);
       throw error;
     }
+    if (!composerSelectionIsCurrent(state, submissionThread, openToken)) {
+      saveDraft(submissionThread.id, draft, true);
+      state.attachmentDrafts.set(submissionThread.id, attachments);
+      if (reference) state.referenceDrafts.set(submissionThread.id, reference);
+      setComposerSubmitting(false);
+      notify(tr("draftSessionChanged"), true);
+      return;
+    }
   }
-  const threadId = state.current.id,
+  const threadId = submissionThread.id,
     submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
   const pendingText = pendingInputSummary(text, attachments);
@@ -7408,8 +7569,13 @@ $("workspaceDiff").onclick = () => refreshWorkspaceDiff(true);
 $("themeSelect").onchange = (event) => applyTheme(event.target.value);
 $("modelPickerBtn").onclick = () => run(toggleModelPicker);
 $("modelPickerClose").onclick = () => ($("modelPicker").hidden = true);
-$("modelSelect").onchange = () => renderEffortOptions(state.composerEffort);
-$("effortSelect").onchange = renderModelDescription;
+$("modelSelect").onchange = () => {
+  const serviceTier = $("serviceTierSelect").value;
+  renderEffortOptions(state.composerEffort, true);
+  renderServiceTierOptions(serviceTier);
+};
+$("effortSelect").onchange = () => { renderModelDescription(); updateModelApplyState(); };
+$("serviceTierSelect").onchange = renderServiceTierHint;
 $("modelApply").onclick = () => run(applyThreadSettings);
 let commandPickerMode = null;
 let commandPickerExplicit = false;

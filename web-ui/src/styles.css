@@ -3209,6 +3209,21 @@ html[lang="en"] .composer-status:not([hidden]) .model-picker-trigger {
 .model-picker select {
   margin-top: 4px;
 }
+.model-picker-options {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.model-picker-options select {
+  width: 100%;
+  min-width: 0;
+}
+.service-tier-hint {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
 .model-description {
   min-height: 32px;
   margin: 8px 1px 0;

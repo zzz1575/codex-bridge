@@ -10,8 +10,8 @@
     <link rel="icon" type="image/x-icon" href="/favicon.ico?v=f4d2cd6622e1" />
     <link rel="icon" type="image/png" sizes="512x512" href="/app-icon.png?v=6f9077d5595d" />
     <link rel="apple-touch-icon" href="/app-icon.png?v=6f9077d5595d" />
-    <script type="module" crossorigin src="/assets/app.js?v=e0014a7464e8"></script>
-    <link rel="stylesheet" crossorigin href="/assets/app.css?v=5cb7a3471407">
+    <script type="module" crossorigin src="/assets/app.js?v=c5cf1ed7c429"></script>
+    <link rel="stylesheet" crossorigin href="/assets/app.css?v=14a2c82c4d91">
   </head>
   <body>
     <div class="app">
@@ -257,13 +257,18 @@
           </div>
           <div class="model-picker" id="modelPicker" hidden>
             <div class="model-picker-head">
-              <span data-i18n="modelAndEffort">Model and reasoning effort</span
+              <span data-i18n="modelAndEffort">Model, reasoning and speed</span
               ><button id="modelPickerClose" type="button" data-i18n="close">Close</button>
             </div>
             <label for="modelSelect" data-i18n="model">Model</label
-            ><select id="modelSelect"></select
-            ><label for="effortSelect" data-i18n="reasoningEffort">Reasoning effort</label
-            ><select id="effortSelect"></select>
+            ><select id="modelSelect"></select>
+            <div class="model-picker-options">
+              <div><label for="effortSelect" data-i18n="reasoningEffort">Reasoning effort</label
+              ><select id="effortSelect"></select></div>
+              <div><label for="serviceTierSelect" data-i18n="responseSpeed">Response speed</label
+              ><select id="serviceTierSelect" aria-describedby="serviceTierHint"></select></div>
+            </div>
+            <div class="service-tier-hint" id="serviceTierHint" role="status"></div>
             <div class="model-description" id="modelDescription"></div>
             <div class="model-picker-actions">
               <button class="primary" id="modelApply" type="button" data-i18n="apply">Apply</button>

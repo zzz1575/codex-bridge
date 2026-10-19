@@ -26,6 +26,7 @@ struct PendingMessage {
 
 struct DemoWorktreeJob {
     project_path: String,
+    service_tier: String,
     polled: bool,
     result: Option<Value>,
 }
@@ -46,6 +47,7 @@ struct DemoState {
     file_len: u64,
     model: String,
     effort: String,
+    service_tiers: HashMap<String, String>,
     pinned_thread: Option<String>,
     renamed_threads: HashMap<String, String>,
     initialized_projects: Vec<Value>,
@@ -75,6 +77,7 @@ impl DemoState {
             file_len: 48_320,
             model: "gpt-5.6-sol".to_owned(),
             effort: "medium".to_owned(),
+            service_tiers: HashMap::new(),
             pinned_thread: Some(PRIMARY_THREAD.to_owned()),
             renamed_threads: HashMap::new(),
             initialized_projects: Vec::new(),
@@ -687,6 +690,8 @@ fn models() -> Value {
             "name": "GPT-5.6-Sol (demo)",
             "description": "A simulated model option for the Pages demo.",
             "default_effort": "medium",
+            "is_default": true,
+            "service_tiers": [{"id":"priority","name":"Fast","description":"1.5x speed, increased usage (simulated)"}],
             "efforts": [
                 {"id": "low", "description": "Fast responses with lighter reasoning"},
                 {"id": "medium", "description": "Balanced speed and reasoning depth"},
@@ -698,12 +703,57 @@ fn models() -> Value {
             "name": "GPT-5.4-Mini (demo)",
             "description": "A compact simulated model option.",
             "default_effort": "low",
+            "is_default": false,
+            "service_tiers": [],
             "efforts": [
                 {"id": "low", "description": "Fast demo responses"},
                 {"id": "medium", "description": "More simulated reasoning"}
             ]
         }
     ]})
+}
+
+fn demo_service_tier(request: &Value, current: &str, default_model: &str) -> Result<String, Value> {
+    let tier = match request.get("service_tier").filter(|tier| !tier.is_null()) {
+        None => current,
+        Some(value) => match value.as_str() {
+            Some("standard") => "standard",
+            Some("priority") => "priority",
+            _ => {
+                return Err(error(
+                    "invalid_service_tier",
+                    "service_tier must be standard or priority",
+                ))
+            }
+        },
+    };
+    let catalog = models();
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(default_model);
+    if tier == "priority"
+        && !catalog["models"].as_array().unwrap().iter().any(|option| {
+            option["id"] == model
+                && option["service_tiers"]
+                    .as_array()
+                    .is_some_and(|tiers| tiers.iter().any(|tier| tier["id"] == "priority"))
+        })
+    {
+        return Err(error(
+            "unsupported_service_tier",
+            "Fast is not available for this demo model; explicitly select Standard",
+        ));
+    }
+    Ok(tier.to_owned())
+}
+
+fn demo_created_tier(state: &mut DemoState, mut response: Value, tier: String) -> Value {
+    if let Some(id) = response.pointer("/thread/id").and_then(Value::as_str) {
+        state.service_tiers.insert(id.to_owned(), tier.clone());
+    }
+    response["service_tier"] = json!(tier);
+    response
 }
 
 fn seed_tool_content(message_index: usize, tool_index: usize) -> Option<Value> {
@@ -847,32 +897,62 @@ fn initialize_demo_project(request: &Value, state: &mut DemoState) -> Value {
     let directory = text("directory_name");
     let name = text("name").trim();
     let request_id = text("request_id");
-    if !parent.starts_with('/') || parent.starts_with("//") || parent.len() > 4096
-        || parent.contains('\\') || parent.chars().any(char::is_control)
+    if !parent.starts_with('/')
+        || parent.starts_with("//")
+        || parent.len() > 4096
+        || parent.contains('\\')
+        || parent.chars().any(char::is_control)
         || parent.split('/').any(|part| part == "." || part == "..")
-        || directory.is_empty() || directory.trim() != directory || directory.len() > 96
-        || directory.starts_with('.') || directory.contains(['/', '\\'])
+        || directory.is_empty()
+        || directory.trim() != directory
+        || directory.len() > 96
+        || directory.starts_with('.')
+        || directory.contains(['/', '\\'])
         || directory.chars().any(char::is_control)
-        || name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
-        || request_id.len() < 16 || request_id.len() > 128
-        || !request_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || name.is_empty()
+        || name.len() > 256
+        || name.chars().any(char::is_control)
+        || request_id.len() < 16
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return error("project_initialize_invalid", "Use an absolute parent path, a new directory name, a project name, and a request id");
+        return error(
+            "project_initialize_invalid",
+            "Use an absolute parent path, a new directory name, a project name, and a request id",
+        );
     }
-    let parent = format!("/{}", parent.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/"));
+    let parent = format!(
+        "/{}",
+        parent
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    );
     let payload = json!({"parent_path": parent, "directory_name": directory, "name": name});
     if let Some((previous, result)) = state.initialization_requests.get(request_id) {
         return if previous == &payload {
             success(result.clone())
         } else {
-            error("project_initialize_conflict", "This request id already belongs to another project request")
+            error(
+                "project_initialize_conflict",
+                "This request id already belongs to another project request",
+            )
         };
     }
     let project_path = format!("{}/{directory}", parent.trim_end_matches('/'));
     if [PROJECT_PATH, HISTORICAL_PROJECT_PATH].contains(&project_path.as_str())
-        || state.initialized_projects.iter().any(|project| project["path"] == project_path)
+        || state
+            .initialized_projects
+            .iter()
+            .any(|project| project["path"] == project_path)
     {
-        return error("project_directory_exists", "The requested project directory already exists");
+        return error(
+            "project_directory_exists",
+            "The requested project directory already exists",
+        );
     }
     let id = format!("demo-project-{}", state.initialized_projects.len() + 1);
     let project = json!({"id": id, "name": name, "roots": [{"path": project_path}]});
@@ -881,7 +961,9 @@ fn initialize_demo_project(request: &Value, state: &mut DemoState) -> Value {
         "project": project});
     state.initialized_projects.push(json!({"id": id, "name": name, "path": project_path,
         "kind": "project", "thread_count": 0, "archived_count": 0, "updated_at_ms": 1_788_854_400_000_u64}));
-    state.initialization_requests.insert(request_id.to_owned(), (payload, result.clone()));
+    state
+        .initialization_requests
+        .insert(request_id.to_owned(), (payload, result.clone()));
     success(result)
 }
 
@@ -938,10 +1020,20 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 json!({"name": "previous-project", "path": HISTORICAL_PROJECT_PATH, "kind": "project", "thread_count": 0, "archived_count": 0, "updated_at_ms": 1_788_760_000_000_u64}),
                 json!({"name": "Chats", "path": CHATS_PROJECT_PATH, "kind": "chats", "thread_count": 1, "archived_count": 0, "updated_at_ms": 1_788_767_500_000_u64}),
             ];
-            projects.extend(state.initialized_projects.iter().cloned().map(|mut project| {
-                project["thread_count"] = json!(state.created_threads.values().filter(|thread| thread["project_path"] == project["path"]).count());
-                project
-            }));
+            projects.extend(
+                state
+                    .initialized_projects
+                    .iter()
+                    .cloned()
+                    .map(|mut project| {
+                        project["thread_count"] = json!(state
+                            .created_threads
+                            .values()
+                            .filter(|thread| thread["project_path"] == project["path"])
+                            .count());
+                        project
+                    }),
+            );
             json!({
             "source": "demo_wasm",
             "include_archived": request.get("include_archived").and_then(Value::as_bool).unwrap_or(false),
@@ -957,8 +1049,17 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 vec![state.thread(SECONDARY_THREAD)]
             } else if project_path == HISTORICAL_PROJECT_PATH {
                 Vec::new()
-            } else if state.initialized_projects.iter().any(|project| project["path"] == project_path) {
-                state.created_threads.values().filter(|thread| thread["project_path"] == project_path).cloned().collect()
+            } else if state
+                .initialized_projects
+                .iter()
+                .any(|project| project["path"] == project_path)
+            {
+                state
+                    .created_threads
+                    .values()
+                    .filter(|thread| thread["project_path"] == project_path)
+                    .cloned()
+                    .collect()
             } else {
                 vec![state.thread(PRIMARY_THREAD)]
             };
@@ -1323,6 +1424,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "thread_id": thread_id,
             "model": state.model,
             "reasoning_effort": state.effort,
+            "service_tier": state.service_tiers.get(thread_id).map(String::as_str).unwrap_or("standard"),
             "weekly_usage": {"remaining_percent": 63, "resets_at": 1_790_000_000_u64}
         }),
         "composer_options" => models(),
@@ -1356,6 +1458,15 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             })
         }
         "thread_settings_update" => {
+            let current_tier = state
+                .service_tiers
+                .get(thread_id)
+                .map(String::as_str)
+                .unwrap_or("standard");
+            let tier = match demo_service_tier(&request, current_tier, &state.model) {
+                Ok(tier) => tier,
+                Err(error) => return error,
+            };
             state.model = request
                 .get("model")
                 .and_then(Value::as_str)
@@ -1366,7 +1477,10 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("medium")
                 .to_owned();
-            json!({"thread_id": thread_id, "model": state.model, "reasoning_effort": state.effort, "backend": "demo_wasm"})
+            state
+                .service_tiers
+                .insert(thread_id.to_owned(), tier.clone());
+            json!({"thread_id": thread_id, "model": state.model, "reasoning_effort": state.effort, "service_tier":tier, "backend": "demo_wasm"})
         }
         "temporary_thread_create" => {
             let source_thread_id = request
@@ -1413,18 +1527,34 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "backend": "demo_wasm",
         }),
         "thread_create_start" => {
+            let tier = match demo_service_tier(&request, "standard", "gpt-5.6-sol") {
+                Ok(tier) => tier,
+                Err(error) => return error,
+            };
             let job_id = format!("demo-worktree-job-{}", state.next_worktree_job);
             state.next_worktree_job += 1;
-            state.worktree_jobs.insert(job_id.clone(), DemoWorktreeJob {
-                project_path: request.get("project_path").and_then(Value::as_str).unwrap_or(PROJECT_PATH).to_owned(),
-                polled: false, result: None,
-            });
+            state.worktree_jobs.insert(
+                job_id.clone(),
+                DemoWorktreeJob {
+                    project_path: request
+                        .get("project_path")
+                        .and_then(Value::as_str)
+                        .unwrap_or(PROJECT_PATH)
+                        .to_owned(),
+                    service_tier: tier,
+                    polled: false,
+                    result: None,
+                },
+            );
             json!({"action":"thread_create_start", "status":"running", "job_id":job_id})
         }
         "thread_create_status" => {
             let job_id = request.get("job_id").and_then(Value::as_str).unwrap_or("");
             let Some(job) = state.worktree_jobs.get_mut(job_id) else {
-                return error("thread_create_job_not_found", "The demo worktree job was not found");
+                return error(
+                    "thread_create_job_not_found",
+                    "The demo worktree job was not found",
+                );
             };
             if let Some(result) = &job.result {
                 return success(result.clone());
@@ -1434,16 +1564,14 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 json!({"action":"thread_create_status", "status":"running", "job_id":job_id, "elapsed_ms":900})
             } else {
                 let project_path = job.project_path.clone();
-                let result = if state.initialized_projects.iter().any(|project| project["path"] == project_path) {
-                    state.create_project_thread(&project_path, true)
-                } else { json!({
-                    "action":"thread_create",
-                    "project_path":PROJECT_PATH,
-                    "location":"worktree",
-                    "worktree_path":"/demo/worktrees/new-session",
-                    "thread":state.thread(SECONDARY_THREAD)
-                }) };
-                state.worktree_jobs.get_mut(job_id).expect("existing worktree job").result = Some(result.clone());
+                let tier = job.service_tier.clone();
+                let created = state.create_project_thread(&project_path, true);
+                let result = demo_created_tier(state, created, tier);
+                state
+                    .worktree_jobs
+                    .get_mut(job_id)
+                    .expect("existing worktree job")
+                    .result = Some(result.clone());
                 result
             }
         }
@@ -1494,11 +1622,29 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             )
         }
         "thread_create" => {
-            let path = request.get("project_path").and_then(Value::as_str).unwrap_or("");
-            if !state.initialized_projects.iter().any(|project| project["path"] == path) {
+            let path = request
+                .get("project_path")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !state
+                .initialized_projects
+                .iter()
+                .any(|project| project["path"] == path)
+            {
                 return error("demo_limited", "Current-directory sessions are available only for projects created in this demo");
             }
-            state.create_project_thread(path, request.get("worktree").and_then(Value::as_bool).unwrap_or(false))
+            let tier = match demo_service_tier(&request, "standard", "gpt-5.6-sol") {
+                Ok(tier) => tier,
+                Err(error) => return error,
+            };
+            let created = state.create_project_thread(
+                path,
+                request
+                    .get("worktree")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            );
+            demo_created_tier(state, created, tier)
         }
         "thread_archive"
         | "thread_repair_ordinals"
@@ -1584,6 +1730,84 @@ mod tests {
                 state,
             ));
         }
+    }
+
+    #[test]
+    fn demo_fast_is_per_thread_preserves_omission_and_standard_clears_it() {
+        let mut state = DemoState::new();
+        let fast = result(dispatch(
+            json!({"command":"thread_settings_update","thread_id":PRIMARY_THREAD,"model":"gpt-5.6-sol","effort":"medium","service_tier":"priority"}),
+            &mut state,
+        ));
+        assert_eq!(fast["service_tier"], "priority");
+        assert_eq!(
+            result(dispatch(
+                json!({"command":"composer_status","thread_id":SECONDARY_THREAD}),
+                &mut state
+            ))["service_tier"],
+            "standard"
+        );
+        assert_eq!(
+            result(dispatch(
+                json!({"command":"thread_settings_update","thread_id":PRIMARY_THREAD,"model":"gpt-5.6-sol","effort":"high"}),
+                &mut state
+            ))["service_tier"],
+            "priority"
+        );
+        let rejected = dispatch(
+            json!({"command":"thread_settings_update","thread_id":PRIMARY_THREAD,"model":"gpt-5.4-mini","effort":"low"}),
+            &mut state,
+        );
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(state.model, "gpt-5.6-sol");
+        assert_eq!(
+            result(dispatch(
+                json!({"command":"thread_settings_update","thread_id":PRIMARY_THREAD,"model":"gpt-5.4-mini","effort":"low","service_tier":"standard"}),
+                &mut state
+            ))["service_tier"],
+            "standard"
+        );
+        assert_eq!(
+            dispatch(
+                json!({"command":"thread_settings_update","service_tier":"fast"}),
+                &mut state
+            )["ok"],
+            false
+        );
+    }
+
+    #[test]
+    fn demo_background_creation_remembers_requested_tier_without_changing_existing_thread() {
+        let mut state = DemoState::new();
+        let job = result(dispatch(
+            json!({"command":"thread_create_start","project_path":PROJECT_PATH,"service_tier":"priority"}),
+            &mut state,
+        ));
+        result(dispatch(
+            json!({"command":"thread_create_status","job_id":job["job_id"]}),
+            &mut state,
+        ));
+        let created = result(dispatch(
+            json!({"command":"thread_create_status","job_id":job["job_id"]}),
+            &mut state,
+        ));
+        assert_ne!(created["thread"]["id"], PRIMARY_THREAD);
+        assert_ne!(created["thread"]["id"], SECONDARY_THREAD);
+        assert_eq!(created["service_tier"], "priority");
+        assert_eq!(
+            result(dispatch(
+                json!({"command":"composer_status","thread_id":created["thread"]["id"]}),
+                &mut state
+            ))["service_tier"],
+            "priority"
+        );
+        assert_eq!(
+            result(dispatch(
+                json!({"command":"composer_status","thread_id":PRIMARY_THREAD}),
+                &mut state
+            ))["service_tier"],
+            "standard"
+        );
     }
 
     #[test]

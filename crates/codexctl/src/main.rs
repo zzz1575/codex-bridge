@@ -53,6 +53,20 @@ enum Command {
         worktree: bool,
         #[arg(long)]
         model: Option<String>,
+        /// Standard clears Fast; priority enables Fast when the model supports it.
+        #[arg(long, value_parser = ["standard", "priority"])]
+        service_tier: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the target session's model, reasoning effort, and optional service tier.
+    Settings {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        effort: String,
+        #[arg(long, value_parser = ["standard", "priority"])]
+        service_tier: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -271,6 +285,7 @@ impl Command {
                 chat,
                 worktree,
                 model,
+                service_tier,
                 json,
             } => {
                 reject_target(&target_thread, "new")?;
@@ -287,12 +302,28 @@ impl Command {
                         project_path,
                         worktree,
                         model,
+                        service_tier,
                         prompt: None,
                     },
                     json,
                     OutputKind::NewThread,
                 ))
             }
+            Self::Settings {
+                model,
+                effort,
+                service_tier,
+                json,
+            } => Ok((
+                Request::ThreadSettingsUpdate {
+                    thread_id: target_thread.context("settings requires --thread THREAD_ID")?,
+                    model,
+                    effort,
+                    service_tier,
+                },
+                json,
+                OutputKind::Generic,
+            )),
             Self::Ls {
                 limit,
                 include_archived,
@@ -781,6 +812,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_tier_cli_requires_explicit_valid_choice_and_preserves_legacy_omission() {
+        for tier in ["standard", "priority"] {
+            let cli =
+                Cli::try_parse_from(["codexctl", "new", "--chat", "--service-tier", tier]).unwrap();
+            let (request, _, _) = cli.command.into_request(cli.thread).unwrap();
+            assert!(
+                matches!(request, Request::ThreadCreate {service_tier:Some(value),..} if value == tier)
+            );
+            let cli = Cli::try_parse_from([
+                "codexctl",
+                "--thread",
+                "thread-1",
+                "settings",
+                "--model",
+                "gpt-test",
+                "--effort",
+                "high",
+                "--service-tier",
+                tier,
+            ])
+            .unwrap();
+            let (request, _, _) = cli.command.into_request(cli.thread).unwrap();
+            assert!(
+                matches!(request, Request::ThreadSettingsUpdate {service_tier:Some(value),..} if value == tier)
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["codexctl", "new", "--chat", "--service-tier", "fast"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "codexctl", "settings", "--model", "gpt-test", "--effort", "high",
+        ])
+        .unwrap();
+        assert!(cli.command.into_request(cli.thread).is_err());
+    }
+
+    #[test]
     fn project_and_session_commands_map_to_bridge_requests() {
         let cli = Cli::try_parse_from(["codexctl", "projects", "--json"]).unwrap();
         let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
@@ -812,6 +880,7 @@ mod tests {
                 project_path: None,
                 worktree: false,
                 model: None,
+                service_tier: None,
                 prompt: None,
             }
         );

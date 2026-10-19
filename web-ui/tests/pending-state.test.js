@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
+import { composerSelectionIsCurrent } from "../src/service-tier.js";
 import {
   isWithdrawableQueued,
   mergePendingSnapshot,
@@ -358,6 +359,7 @@ function composerContext(reply) {
     notices = [];
   const state = {
     current: { id: "thread-a" },
+    openToken: 1,
     composerAttachments: [],
     composerReference: null,
     pending: [],
@@ -374,6 +376,8 @@ function composerContext(reply) {
     notices,
     context: {
       state,
+      createdDraftSettings: new Map(),
+      composerSelectionIsCurrent,
       $: () => text,
       voiceRecorder: null,
       newSubmissionId: () => "submission-a",
