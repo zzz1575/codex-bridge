@@ -376,6 +376,7 @@ const PINNED_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 #[derive(Debug, Clone, Default)]
 pub struct ThreadProjectIndex {
     projects: HashMap<String, IndexedProject>,
+    native_project_ids: HashMap<PathBuf, String>,
     thread_projects: HashMap<String, Option<String>>,
     thread_cwds: HashMap<String, PathBuf>,
     sections: Vec<(String, String)>,
@@ -400,6 +401,30 @@ impl ThreadProjectIndex {
         sections: &Value,
         threads: &[Value],
     ) -> Self {
+        // Only native project/list results may supply thread/start project IDs.
+        let native_project_ids = projects
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|project| {
+                Some((
+                    project.get("id")?.as_str()?,
+                    project.get("roots")?.as_array()?,
+                ))
+            })
+            .flat_map(|(id, roots)| {
+                roots.iter().filter_map(move |root| {
+                    let path = root.get("path")?.as_str()?;
+                    fs::canonicalize(path)
+                        .ok()
+                        .map(|path| (path, id.to_owned()))
+                })
+            })
+            .fold(HashMap::new(), |mut known, (root, id)| {
+                known.entry(root).or_insert(id);
+                known
+            });
         let projects = projects
             .get("data")
             .and_then(Value::as_array)
@@ -484,12 +509,18 @@ impl ThreadProjectIndex {
             .collect();
         Self {
             projects,
+            native_project_ids,
             thread_projects,
             thread_cwds,
             sections,
             thread_sections,
             section_projects: HashMap::new(),
         }
+    }
+
+    pub fn native_project_id_for_path(&self, project_path: &Path) -> Option<String> {
+        let canonical = fs::canonicalize(project_path).ok()?;
+        self.native_project_ids.get(&canonical).cloned()
     }
 
     pub fn apply_desktop_state(&mut self, state: &Value) {
@@ -4384,6 +4415,98 @@ mod tests {
         assert_eq!(historical.name, "Historical");
         assert_eq!(historical.thread_count, 0);
         assert_eq!(historical.updated_at_ms, 1_788_760_000_000);
+    }
+
+    #[test]
+    fn native_project_ids_survive_desktop_project_overlays() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut index = ThreadProjectIndex::from_app_server(
+            &json!({"data":[{"id":"native-project","roots":[{"path":workspace}]}]}),
+            &[],
+        );
+        index.apply_desktop_state(&json!({
+            "local-projects": {
+                "local-project": {"name":"Saved workspace","rootPaths":[workspace]}
+            }
+        }));
+
+        assert_eq!(
+            index.native_project_id_for_path(&workspace),
+            Some("native-project".to_owned())
+        );
+    }
+
+    #[test]
+    fn saved_local_project_without_history_never_supplies_a_native_id() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("saved-workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut index = ThreadProjectIndex::from_app_server(&json!({"data":[]}), &[]);
+        index.apply_desktop_state(&json!({
+            "local-projects": {
+                "local-project": {"name":"Saved workspace","rootPaths":[workspace]}
+            }
+        }));
+
+        assert_eq!(index.native_project_id_for_path(&workspace), None);
+        let projects = SessionStore::new(fixture.path.clone())
+            .list_projects_with_index(true, Some(&index))
+            .unwrap();
+        let saved = projects.iter().find(|project| project.path == workspace).unwrap();
+        assert_eq!(saved.kind, ProjectKind::Project);
+        assert_eq!(saved.thread_count, 0);
+    }
+
+    #[test]
+    fn native_project_ids_match_only_the_exact_canonical_root() {
+        let fixture = Fixture::new();
+        let workspace = fixture.path.join("workspace");
+        let child = workspace.join("child");
+        let other = fixture.path.join("other");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let alias = child.join("..");
+        let index = ThreadProjectIndex::from_app_server(
+            &json!({"data":[{"id":"native-project","roots":[{"path":alias}]}]}),
+            &[],
+        );
+
+        assert_eq!(
+            index.native_project_id_for_path(&workspace),
+            Some("native-project".to_owned())
+        );
+        assert_eq!(
+            index.native_project_id_for_path(&alias),
+            Some("native-project".to_owned())
+        );
+        assert_eq!(index.native_project_id_for_path(&child), None);
+        assert_eq!(index.native_project_id_for_path(&other), None);
+    }
+
+    #[test]
+    fn desktop_id_collision_cannot_substitute_a_native_project_root() {
+        let fixture = Fixture::new();
+        let native = fixture.path.join("native-workspace");
+        let local = fixture.path.join("local-workspace");
+        fs::create_dir_all(&native).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        let mut index = ThreadProjectIndex::from_app_server(
+            &json!({"data":[{"id":"shared-id","roots":[{"path":native}]}]}),
+            &[],
+        );
+        index.apply_desktop_state(&json!({
+            "local-projects": {
+                "shared-id": {"name":"Local overlay","rootPaths":[local]}
+            }
+        }));
+
+        assert_eq!(
+            index.native_project_id_for_path(&native),
+            Some("shared-id".to_owned())
+        );
+        assert_eq!(index.native_project_id_for_path(&local), None);
     }
 
     #[test]

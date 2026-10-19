@@ -27,7 +27,8 @@ use clap::{Parser, ValueEnum};
 use codex_bridge::{
     default_codex_home, default_socket_path, BackendFailure, ClientPerformanceSample,
     CodexCliBackend, ComposerAttachment, HostExecFailure, HostExecutor, Request, Response,
-    RolloutOrdinalRepair, SessionStore, ThreadMessage, ThreadProjectIndex, ThreadSummary,
+    ProjectKind, ProjectSummary, RolloutOrdinalRepair, SessionStore, ThreadMessage,
+    ThreadProjectIndex, ThreadSummary,
     ThreadToolCall, ThreadWriterState, APP_SERVER_SCHEMA_VERSION, APP_SERVER_SOCKET_ENV,
     CHATS_PROJECT_PATH, CODEX_BIN_ENV, HOST_EXEC_POLICY_ENV, PROTOCOL_VERSION, SOCKET_ENV,
 };
@@ -6041,6 +6042,27 @@ fn project_id_for_path(result: &Value, project_path: &Path) -> Option<String> {
     })
 }
 
+
+fn creation_project_id(
+    projects: &[ProjectSummary],
+    index: &ThreadProjectIndex,
+    canonical_project: &Path,
+) -> Result<Option<String>, ThreadCreateFailure> {
+    let known = projects.iter().any(|project| {
+        project.kind == ProjectKind::Project
+            && fs::canonicalize(&project.path).is_ok_and(|path| path == canonical_project)
+    });
+    if !known {
+        return Err(ThreadCreateFailure {
+            code: "unknown_project",
+            message: "project is not registered; run `codexctl project create DIRECTORY` first"
+                .to_owned(),
+        });
+    }
+    // A desktop-local ID is not an app-server projectId.
+    Ok(index.native_project_id_for_path(canonical_project))
+}
+
 // Only the old mobile client's pure directory patch is promoted to relocation. Mixed
 // settings requests must remain untouched, including explicitly null extra fields.
 fn legacy_thread_cwd_request(method: &str, params: &Value) -> Option<Request> {
@@ -9036,36 +9058,29 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 },
                 None => None,
             };
-            let app_server_project_list = app_server_list_all(
-                write_backend,
-                "project/list",
-                json!({"limit": 100, "sortKey": "recencyAt", "sortDirection": "desc"}),
-            )
-            .ok()
-            .map(|projects| json!({"data": projects}));
-            let project_id = app_server_project_list.as_ref().and_then(|projects| {
-                canonical_project
-                    .as_ref()
-                    .and_then(|path| project_id_for_path(projects, path))
-            });
-            let known_project = if canonical_project.is_none() || project_id.is_some() {
-                true
-            } else {
-                match session_store.list_projects(true) {
-                    Ok(projects) => projects.into_iter().any(|project| {
-                        canonical_project.as_ref().is_some_and(|canonical| {
-                            fs::canonicalize(project.path).is_ok_and(|path| &path == canonical)
-                        })
-                    }),
+            let project_id = if let Some(project) = canonical_project.as_ref() {
+                // Use the same native, desktop-local and historical projects as the list.
+                // Fetch freshly here: a stale display cache must not authorize a removed root.
+                let index = match fetch_app_server_project_index(
+                    write_backend,
+                    true,
+                    session_store.home(),
+                ) {
+                    Ok(index) => index,
+                    Err(error) => return Response::error(error.code, error.message),
+                };
+                session_store.sync_thread_cwds(&index);
+                let projects = match session_store.list_projects_with_index(true, Some(&index)) {
+                    Ok(projects) => projects,
                     Err(error) => return backend_error(error),
+                };
+                match creation_project_id(&projects, &index, project) {
+                    Ok(project_id) => project_id,
+                    Err(error) => return Response::error(error.code, error.message),
                 }
+            } else {
+                None
             };
-            if !known_project {
-                return Response::error(
-                    "unknown_project",
-                    "project is not registered; run `codexctl project create DIRECTORY` first",
-                );
-            }
 
             let prepared = match canonical_project.as_ref() {
                 Some(project) => {
@@ -12514,6 +12529,69 @@ mod tests {
             Some("project-1")
         );
         fs::remove_dir(&project).unwrap();
+    }
+
+    #[test]
+    fn saved_project_with_no_threads_can_create_its_first_isolated_worktree() {
+        let root = unique_test_dir("first-saved-project");
+        let repository = root.join("source");
+        let home = root.join("codex-home");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        assert!(Command::new("git").args(["init", "--quiet"])
+            .current_dir(&repository).status().unwrap().success());
+        fs::write(repository.join("README.md"), "committed fixture\n").unwrap();
+        assert!(Command::new("git").args(["add", "README.md"])
+            .current_dir(&repository).status().unwrap().success());
+        assert!(Command::new("git").args([
+            "-c", "user.name=Codex Bridge Test", "-c", "user.email=codex-bridge@example.invalid",
+            "commit", "--quiet", "--no-gpg-sign", "-m", "fixture",
+        ]).current_dir(&repository).status().unwrap().success());
+        fs::write(repository.join("README.md"), "uncommitted original work\n").unwrap();
+        let canonical = fs::canonicalize(&repository).unwrap();
+        let store = SessionStore::new(home.clone());
+        assert!(store.list_projects(true).unwrap().is_empty());
+        let mut index = ThreadProjectIndex::from_app_server(&json!({"data": []}), &[]);
+        index.apply_desktop_state(&json!({"local-projects": {
+            "saved-only": {"name": "Saved project", "rootPaths": [canonical]}
+        }}));
+        let projects = store.list_projects_with_index(true, Some(&index)).unwrap();
+        assert_eq!(projects.iter().find(|project| project.path == canonical).unwrap().thread_count, 0);
+        assert_eq!(creation_project_id(&projects, &index, &canonical).unwrap(), None);
+        let prepared = prepare_thread_cwd(&canonical, true, &home).unwrap();
+        assert_ne!(prepared.cwd, canonical);
+        assert!(prepared.cwd.starts_with(home.join("worktrees")));
+        assert!(prepared.cwd.join(".git").is_file());
+        assert_eq!(fs::read_to_string(prepared.cwd.join("README.md")).unwrap(), "committed fixture\n");
+        assert_eq!(fs::read_to_string(repository.join("README.md")).unwrap(), "uncommitted original work\n");
+        assert_eq!(remove_created_worktree(prepared.worktree.as_ref().unwrap()), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creation_uses_exact_project_roots_and_keeps_native_project_ids() {
+        let root = unique_test_dir("creation-project-roots");
+        let repository = root.join("source");
+        let child = repository.join("child");
+        let unknown = root.join("unknown");
+        let home = root.join("codex-home");
+        for path in [&child, &unknown, &home.join("sessions")] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let canonical = fs::canonicalize(&repository).unwrap();
+        let index = ThreadProjectIndex::from_app_server(
+            &json!({"data": [{"id": "native-project", "roots": [{"path": canonical}]}]}), &[]);
+        let store = SessionStore::new(home);
+        let projects = store.list_projects_with_index(true, Some(&index)).unwrap();
+        assert_eq!(creation_project_id(&projects, &index, &canonical).unwrap().as_deref(), Some("native-project"));
+        for path in [&child, &unknown] {
+            assert_eq!(creation_project_id(&projects, &index, &fs::canonicalize(path).unwrap())
+                .unwrap_err().code, "unknown_project");
+        }
+        let mut section = projects.into_iter().find(|project| project.path == canonical).unwrap();
+        section.kind = ProjectKind::Section;
+        assert_eq!(creation_project_id(&[section], &index, &canonical).unwrap_err().code, "unknown_project");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
