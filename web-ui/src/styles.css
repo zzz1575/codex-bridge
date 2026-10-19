@@ -4930,3 +4930,21 @@ html[data-theme="light"] .composer-shell.agent-active:not(.submitting) {
 .pending-sync-warning button {
   flex: 0 0 auto;
 }
+
+.question-replies {
+  min-width: 0;
+}
+.question-reply + .question-reply {
+  margin-top: 12px;
+}
+.question-reply-question,
+.question-reply-answer {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.question-reply-question {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-weight: 600;
+}

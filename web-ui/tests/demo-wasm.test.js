@@ -1,3 +1,4 @@
+import "./question-reply-presentation.test.js";
 import "./pending-state.test.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -2542,7 +2543,7 @@ test("long assistant output collapses by viewport with controls at the message b
   assert.match(stylesheet, /max-height:\s*15em/);
   assert.match(source, /body\.appendChild\(toggle\)/);
   assert.ok(
-    source.indexOf("body.appendChild(toggle)") < source.indexOf("const copyText = content"),
+    source.indexOf("body.appendChild(toggle)") < source.indexOf("const copyText ="),
     "the disclosure belongs directly below the response, before tool activity",
   );
   assert.match(source, /preserveMessageElementPosition\(anchor/);

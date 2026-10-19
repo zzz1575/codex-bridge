@@ -63,6 +63,7 @@ import {
 import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import { toolOutputImageUrls } from "./tool-image.js";
+import { questionReplyNode, questionReplyPresentation } from "./question-reply-presentation.js";
 import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
 import {
   rememberSessionId,
@@ -4677,13 +4678,20 @@ function messageNode(
     ),
     usageItems = content.filter((item) => item.kind === "turn_usage"),
     memoryItems = content.filter((item) => item.kind === "memory_citation");
+  const questionReplyLabels = {
+      question: tr("questionReplyQuestion"), answer: tr("questionReplyAnswer"),
+    },
+    questionReply = ordinaryItems.length === 1 && ordinaryItems[0].kind === "text"
+      ? questionReplyPresentation(ordinaryItems[0].text, m.role, questionReplyLabels)
+      : null;
   const collapsibleRole = m.role === "assistant" || m.role === "user",
     messageOutput = collapsibleRole ? document.createElement("div") : body;
   if (collapsibleRole) {
     messageOutput.className = `${m.role}-output collapse-candidate`;
     body.appendChild(messageOutput);
   }
-  for (const item of ordinaryItems) messageOutput.appendChild(contentNode(item, threadId));
+  if (questionReply) messageOutput.appendChild(questionReplyNode(questionReply, questionReplyLabels));
+  else for (const item of ordinaryItems) messageOutput.appendChild(contentNode(item, threadId));
   if (collapsibleRole && ordinaryItems.length) {
     const toggle = document.createElement("button"),
       expansionKey = `${threadId || ""}:${m.role === "user" ? messageIdentity(m) : m.message_index}`;
@@ -4702,7 +4710,7 @@ function messageNode(
     body.appendChild(toggle);
     box.dataset.longMessageKey = expansionKey;
   }
-  const copyText = content
+  const copyText = questionReply?.text ?? content
     .filter((item) => item.kind === "text" && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n\n");
