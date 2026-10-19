@@ -99,3 +99,16 @@ test("same UUID after navigation cannot reuse an obsolete composer generation", 
   assert.equal(composerSelectionIsCurrent({ current: first, openToken: 5 }, first, 3), false);
   assert.equal(composerSelectionIsCurrent({ current: { ...first }, openToken: 3 }, first, 3), false);
 });
+
+test("native camelcase default is standard without weakening Bridge confirmation", () => {
+  assert.equal(serviceTierFromStatus({ serviceTier: "default" }), "standard");
+  assert.equal(serviceTierFromStatus({ serviceTier: "priority" }), "priority");
+  assert.equal(serviceTierFromStatus({ serviceTier: "invalid" }), "unknown");
+  assert.equal(serviceTierFromStatus({ service_tier: null, serviceTier: "default" }), "unknown");
+  assert.equal(serviceTierFromStatus({ service_tier: "default" }), "unknown");
+  assert.equal(serviceTierFromStatus({ serviceTier: "default", service_tier_error: "unavailable" }), "unknown");
+  assert.equal(confirmedServiceTier({ serviceTier: "default" }, "standard"), null);
+  assert.equal(confirmedServiceTier({ service_tier: "default" }, "standard"), null);
+  assert.equal(confirmedServiceTier({ service_tier: null }, "standard"), null);
+  assert.equal(confirmedServiceTier({ service_tier: "standard" }, "standard"), "standard");
+});

@@ -3095,6 +3095,7 @@ body.image-viewer-open {
 }
 .composer-runtime {
   display: flex;
+  margin-left: auto;
   align-items: center;
   justify-content: flex-end;
   gap: 7px;

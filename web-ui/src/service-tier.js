@@ -20,7 +20,7 @@ export function serviceTierFromStatus(status) {
     return ["standard", "priority", "fast"].includes(status.service_tier)
       ? normalizeServiceTier(status.service_tier) : "unknown";
   if (Object.hasOwn(status || {}, "serviceTier"))
-    return status.serviceTier === null ? "standard"
+    return status.serviceTier === null || status.serviceTier === "default" ? "standard"
       : ["standard", "priority", "fast"].includes(status.serviceTier)
         ? normalizeServiceTier(status.serviceTier) : "unknown";
   return "unknown";

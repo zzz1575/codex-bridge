@@ -109,3 +109,55 @@ test("a transport success without tier confirmation cannot save the new-session 
   await assert.rejects(ctx.applyCreatedDraftSettingsForTest(thread), /speedSettingsUnconfirmed/);
   assert.equal(thread.pending_draft_settings.service_tier, "priority");
 });
+
+test("opening a new draft clears only the inherited queue-sync warning", () => {
+  const originalPending = [{ id: "queued-A", thread_id: "native-A", status: "queued" }];
+  const oldAttachments = [{ type: "image", url: "synthetic-A.png" }];
+  const oldReference = { thread_id: "native-A", text: "selected context" };
+  const preservedAttachments = [{ type: "image", url: "synthetic-B.png" }];
+  const state = {
+    current: { id: "native-A" }, openToken: 7,
+    composerModel: "fixture-model", composerEffort: "ultra",
+    composerAttachments: oldAttachments, composerReference: oldReference,
+    pending: originalPending, pendingQueueUnavailable: "native-A",
+    drafts: new Map([["native-B", "B draft"]]),
+    attachmentDrafts: new Map([["native-B", preservedAttachments]]),
+    referenceDrafts: new Map([["native-B", { text: "B reference" }]]),
+  };
+  const elements = new Map(), commands = [], renderedWarnings = [];
+  const $ = (id) => {
+    if (!elements.has(id)) elements.set(id, { value: "", textContent: "", hidden: false, replaceChildren() {}, focus() {} });
+    return elements.get(id);
+  };
+  $("messageText").value = "A draft";
+  const ctx = vm.createContext({
+    state, $, crypto: { randomUUID: () => "synthetic-new-draft" },
+    defaultServiceTier: () => "priority", tr: (key) => key,
+    window: { localStorage: {}, location: { pathname: "/qa", search: "" }, history: { pushState() {} } },
+    command: (...args) => commands.push(args),
+    closePanels() {}, setThreadHeaderExpanded() {},
+    saveDraft: (id, text) => state.drafts.set(id, text),
+    serverRequestTray: { render() {} }, renderApprovals() {}, resetThreadViewState() {},
+    applyThreadWriterLock() {}, setSendMode() {}, syncTemporaryForCurrent() {},
+    setMessageSyncPhase() {}, renderRepairHint() {}, renderThreadStatistics() {},
+    renderPending: () => renderedWarnings.push(state.pendingQueueUnavailable),
+    renderProjects() {}, showActivity() {}, updateTurnNavigation() {},
+    refreshComposerStatus: async () => {},
+  });
+  vm.runInContext(part("function openProjectlessDraft()", "async function createThread(worktree)"), ctx);
+  ctx.openProjectlessDraft();
+  assert.equal(state.current.id, "draft:synthetic-new-draft");
+  assert.equal(state.current.preferred_service_tier, "priority");
+  assert.equal(state.pendingQueueUnavailable, null, "A fresh draft must not inherit queue-sync failures");
+  assert.deepEqual(renderedWarnings, [null], "The draft is rendered without a stale queue warning");
+  assert.equal(state.pending.length, 0);
+  assert.equal(originalPending.length, 1, "Opening a draft never mutates the old queue records");
+  assert.equal(originalPending[0].status, "queued");
+  assert.equal(state.drafts.get("native-A"), "A draft");
+  assert.equal(state.drafts.get("native-B"), "B draft");
+  assert.equal(state.attachmentDrafts.get("native-A"), oldAttachments);
+  assert.equal(state.attachmentDrafts.get("native-B"), preservedAttachments);
+  assert.equal(state.referenceDrafts.get("native-A"), oldReference);
+  assert.equal(state.referenceDrafts.get("native-B").text, "B reference");
+  assert.equal(commands.length, 0, "Opening a local draft must not change a remote queue");
+});

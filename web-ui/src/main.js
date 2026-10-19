@@ -2082,6 +2082,7 @@ function openProjectlessDraft() {
   state.userScrolled = false;
   state.followMessageTail = true;
   state.pending = [];
+  state.pendingQueueUnavailable = null;
   setMessageSyncPhase(null);
   $("messages").replaceChildren();
   $("threadTitle").textContent = tr("newChat");

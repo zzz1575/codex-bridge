@@ -5623,13 +5623,15 @@ fn normalized_service_tier(tier: &Value) -> Option<&'static str> {
     match tier {
         Value::Null => Some("standard"),
         Value::String(value) if value == "priority" => Some("priority"),
-        Value::String(value) if value == "standard" => Some("standard"),
+        Value::String(value) if matches!(value.as_str(), "standard" | "default") => {
+            Some("standard")
+        }
         _ => None,
     }
 }
 
 fn model_supports_service_tier(options: &[Value], model: &str, tier: &Value) -> bool {
-    tier.is_null()
+    normalized_service_tier(tier) == Some("standard")
         || options.iter().any(|option| {
             option.get("id").and_then(Value::as_str) == Some(model)
                 && option
@@ -14622,6 +14624,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             normalized_service_tier(&json!("priority")),
             Some("priority")
         );
+        assert_eq!(normalized_service_tier(&json!("default")), Some("standard"));
         assert_eq!(normalized_service_tier(&json!("unknown")), None);
     }
 
@@ -14655,6 +14658,11 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             &options,
             "gpt-standard",
             &Value::Null
+        ));
+        assert!(model_supports_service_tier(
+            &options,
+            "gpt-standard",
+            &json!("default")
         ));
         assert_eq!(
             creation_service_tier_model(None, &json!({}), &options),

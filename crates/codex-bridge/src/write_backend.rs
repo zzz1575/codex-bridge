@@ -177,6 +177,16 @@ impl AppServerEventBus {
     }
 }
 
+fn service_tiers_equivalent(left: &Value, right: &Value) -> bool {
+    let standard = |value: &Value| {
+        value.is_null()
+            || value
+                .as_str()
+                .is_some_and(|value| matches!(value, "default" | "standard"))
+    };
+    left == right || (standard(left) && standard(right))
+}
+
 const MAX_SERVICE_TIER_STORE_BYTES: u64 = 1024 * 1024;
 static SERVICE_TIER_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -544,7 +554,11 @@ impl CodexCliBackend {
     pub fn wait_for_service_tier(&self, thread_id: &str, expected: &Value) -> bool {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if self.thread_service_tier(thread_id).as_ref() == Some(expected) {
+            if self
+                .thread_service_tier(thread_id)
+                .as_ref()
+                .is_some_and(|actual| service_tiers_equivalent(actual, expected))
+            {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -1953,6 +1967,23 @@ mod tests {
         std::fs::remove_file(socket).unwrap();
         std::fs::remove_dir(directory).unwrap();
         (result, requests)
+    }
+
+    #[test]
+    fn native_default_notification_confirms_explicit_standard_null_without_treating_unknown_as_standard(
+    ) {
+        assert!(service_tiers_equivalent(&json!("default"), &Value::Null));
+        assert!(service_tiers_equivalent(&Value::Null, &json!("default")));
+        assert!(service_tiers_equivalent(
+            &json!("standard"),
+            &json!("default")
+        ));
+        assert!(service_tiers_equivalent(
+            &json!("priority"),
+            &json!("priority")
+        ));
+        assert!(!service_tiers_equivalent(&json!("priority"), &Value::Null));
+        assert!(!service_tiers_equivalent(&json!("unknown"), &Value::Null));
     }
 
     #[test]
