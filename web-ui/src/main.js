@@ -34,9 +34,13 @@ import {
   toolFileList,
 } from "./message-presentation.js";
 import {
+  isWithdrawableQueued,
   mergePendingSnapshot,
   pendingInputSummary,
+  pendingPresentation,
+  pendingSnapshotIsCurrent,
   reconcilePendingMessages,
+  sendWithExplicitNewTurnFallback,
 } from "./pending-state.js";
 import {
   browserNotificationState,
@@ -4892,39 +4896,29 @@ function pendingNode(entry) {
   body.className = "message-body";
   body.appendChild(markdownNode(entry.text, markdownOptions(entry.thread_id || state.current?.id)));
   const meta = document.createElement("div"),
-    withdrawable =
-      entry.status === "failed" ||
-      (entry.status === "queued" && ["app_server_queue", "demo_wasm"].includes(entry.source));
+    presentation = pendingPresentation(entry),
+    withdrawable = presentation.withdrawable,
+    recoverable =
+      entry.status === "failed" &&
+      !entry.queue_unverified &&
+      state.pendingQueueUnavailable !== entry.thread_id,
+    mode = document.createElement("span"),
+    status = document.createElement("span"),
+    menu = document.createElement("details"),
+    summary = document.createElement("summary"),
+    popover = document.createElement("div");
   meta.className = "outbox-meta";
-  if (entry.handoff) {
-    const status = document.createElement("div");
-    status.className = "outbox-status";
-    status.textContent = tr(entry.status === "processing" ? "processingShort" : "acceptedShort");
-    status.title = tr(entry.status === "processing" ? "handoffProcessing" : "serverAccepted");
-    meta.appendChild(status);
-  } else {
-    const mode = document.createElement("span"),
-      menu = document.createElement("details"),
-      summary = document.createElement("summary"),
-      popover = document.createElement("div");
-    mode.className = "outbox-mode";
-    mode.textContent = tr(entry.action === "steer" ? "followUp" : "queue");
-    meta.appendChild(mode);
-    if (!withdrawable) {
-      const status = document.createElement("span");
-      status.className = "outbox-status";
-      status.textContent = tr(
-        entry.status === "accepted"
-          ? "sentCannotWithdraw"
-          : entry.status === "queued"
-            ? "queuedRecovering"
-            : "submittingToServer",
-      );
-      status.title = status.textContent;
-      meta.appendChild(status);
-      box.append(meta, body);
-      return box;
-    }
+  mode.className = "outbox-mode";
+  mode.textContent = tr(presentation.modeKey);
+  status.className = "outbox-status";
+  status.textContent = tr(presentation.statusKey);
+  status.title = status.textContent;
+  meta.append(mode, status);
+  if (!withdrawable && !recoverable) {
+    box.append(meta, body);
+    return box;
+  }
+  {
     menu.className = "outbox-menu";
     summary.textContent = "•••";
     summary.title = tr("pendingMenu");
@@ -4933,8 +4927,8 @@ function pendingNode(entry) {
     const remove = document.createElement("button");
     remove.className = "outbox-delete";
     remove.type = "button";
-    remove.textContent = tr("withdraw");
-    remove.title = tr("deleteRestore");
+    remove.textContent = tr(recoverable ? "restoreFailedDraft" : "withdraw");
+    remove.title = tr(recoverable ? "restoreFailedDraft" : "deleteRestore");
     remove.setAttribute("aria-label", remove.title);
     remove.onclick = (event) => {
       event.stopPropagation();
@@ -4952,13 +4946,12 @@ function pendingNode(entry) {
           "[File attachment]",
         ].includes(line.trim()),
       );
-    const nativeQueue = ["app_server_queue", "demo_wasm"].includes(entry.source);
+    const nativeQueue = isWithdrawableQueued(entry);
     const mergeableQueueCount = state.pending.filter(
       (pending) =>
         pending.thread_id === entry.thread_id &&
         pending.action === "queue" &&
-        pending.status === "queued" &&
-        ["app_server_queue", "demo_wasm"].includes(pending.source) &&
+        isWithdrawableQueued(pending) &&
         !pending.text
           .split("\n")
           .some((line) =>
@@ -5024,6 +5017,21 @@ function renderPending() {
         node.querySelector(".outbox-menu").open = true;
       return node;
     });
+  if (state.pendingQueueUnavailable === state.current?.id) {
+    const warning = existingById.get("queue-sync-warning") || document.createElement("article");
+    if (!warning.childElementCount) {
+      warning.className = "outbox-item pending-sync-warning";
+      warning.dataset.pendingId = "queue-sync-warning";
+      warning.setAttribute("role", "status");
+      warning.textContent = tr("pendingQueueSyncFailed");
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.textContent = tr("pendingQueueRetry");
+      retry.onclick = () => run(() => refreshPending());
+      warning.appendChild(retry);
+    }
+    nodes.push(warning);
+  }
   let cursor = tray.firstChild;
   for (const node of nodes) {
     if (node === cursor) cursor = cursor.nextSibling;
@@ -5047,24 +5055,68 @@ function mergePendingResponse(
   messages,
   preserveLocal = true,
   authoritativeMessages = visibleTimelineMessages(state.visibleMessages, state.leadingTurnUsers),
+  queueAuthoritative = true,
 ) {
-  const remote = Array.isArray(messages) ? messages : [];
-  if (!preserveLocal) return reconcilePendingMessages(remote, authoritativeMessages);
+  const remote = Array.isArray(messages) ? messages : [],
+    threadId = state.current?.id || null;
+  if (!preserveLocal)
+    return reconcilePendingMessages(
+      mergePendingSnapshot(remote, state.pending, new Set(), { threadId, queueAuthoritative }),
+      authoritativeMessages,
+      threadId,
+    );
   return reconcilePendingMessages(
-    mergePendingSnapshot(remote, state.pending, state.pendingInFlight),
+    mergePendingSnapshot(remote, state.pending, state.pendingInFlight, {
+      threadId,
+      queueAuthoritative,
+    }),
     authoritativeMessages,
+    threadId,
   );
 }
 let pendingSnapshotGeneration = 0;
 let pendingAppliedGeneration = 0;
-async function refreshPending({ preserveOptimistic = true } = {}) {
-  const threadId = state.current?.id || null,
-    generation = ++pendingSnapshotGeneration;
-  const r = await command({ command: "pending_messages", thread_id: threadId }, false);
-  if (generation < pendingAppliedGeneration || threadId !== (state.current?.id || null)) return;
-  pendingAppliedGeneration = generation;
-  state.pending = mergePendingResponse(r.messages, preserveOptimistic);
+function applyPendingSnapshot(response, snapshot, preserveLocal = true) {
+  if (
+    !pendingSnapshotIsCurrent(snapshot, {
+      threadId: state.current?.id || null,
+      openToken: state.openToken,
+      appliedGeneration: pendingAppliedGeneration,
+    }) ||
+    !Array.isArray(response.messages)
+  )
+    return false;
+  const queueAuthoritative =
+    response.queue_available !== false && response.queue_authoritative !== false;
+  pendingAppliedGeneration = snapshot.generation;
+  state.pendingQueueUnavailable = queueAuthoritative ? null : snapshot.threadId;
+  state.pending = mergePendingResponse(
+    response.messages,
+    preserveLocal,
+    undefined,
+    queueAuthoritative,
+  );
   renderPending();
+  return true;
+}
+async function refreshPending({ preserveOptimistic = true } = {}) {
+  if (!state.current || state.current.projectless_draft) return;
+  const snapshot = {
+    threadId: state.current?.id || null,
+    openToken: state.openToken,
+    generation: ++pendingSnapshotGeneration,
+  };
+  try {
+    const r = await command({ command: "pending_messages", thread_id: snapshot.threadId }, false);
+    applyPendingSnapshot(r, snapshot, preserveOptimistic);
+  } catch (error) {
+    applyPendingSnapshot(
+      { messages: [], queue_available: false, queue_authoritative: false },
+      snapshot,
+      preserveOptimistic,
+    );
+    throw error;
+  }
 }
 async function deletePending(entry, button) {
   if (state.current?.id !== entry.thread_id) throw new Error(tr("pendingWrongSession"));
@@ -6248,6 +6300,7 @@ function resetThreadViewState(thread) {
   state.turnUsageBaseline = null;
   state.modelContextWindow = null;
   state.lastMessageIndex = null;
+  state.pendingQueueUnavailable = null;
   state.visibleMessages = [];
   state.leadingTurnUsers = [];
   state.hydratedTurns.clear();
@@ -6350,13 +6403,22 @@ async function openThread(
     });
   void command({ command: "pending_messages", thread_id: thread.id }, false)
     .then((pending) => {
-      if (!sameThread() || pendingGeneration < pendingAppliedGeneration) return;
-      if (!Array.isArray(pending.messages)) return;
-      pendingAppliedGeneration = pendingGeneration;
-      state.pending = mergePendingResponse(pending.messages, true);
-      renderPending();
+      applyPendingSnapshot(pending, {
+        threadId: thread.id,
+        openToken: token,
+        generation: pendingGeneration,
+      });
     })
-    .catch(() => {});
+    .catch(() => {
+      applyPendingSnapshot(
+        { messages: [], queue_available: false, queue_authoritative: false },
+        {
+          threadId: thread.id,
+          openToken: token,
+          generation: pendingGeneration,
+        },
+      );
+    });
   const goalVersion = goalStateVersion;
   void command({ command: "thread_goal_get", thread_id: thread.id }, false)
     .then((goal) => {
@@ -6390,6 +6452,7 @@ async function openThread(
     state.pending,
     true,
     visibleTimelineMessages(r.messages, state.leadingTurnUsers),
+    state.pendingQueueUnavailable !== thread.id,
   );
   state.messageCache.set(thread.id, r);
   state.current = { ...thread, ...r.thread };
@@ -6668,8 +6731,7 @@ async function continuePendingQueue() {
       (pending) =>
         pending.thread_id === threadId &&
         pending.action === "queue" &&
-        pending.status === "queued" &&
-        ["app_server_queue", "demo_wasm"].includes(pending.source),
+        isWithdrawableQueued(pending),
     );
   if (!entry) throw new Error(tr("messageRequired"));
   setComposerSubmitting(true);
@@ -6755,7 +6817,8 @@ async function write(name) {
     submissionId = newSubmissionId();
   let action = name === "steer" ? "steer" : "queue";
   const pendingText = pendingInputSummary(text, attachments);
-  let acknowledged = false;
+  let acknowledged = false,
+    startingNewTurn = false;
   state.pending.push({
     id: submissionId,
     thread_id: threadId,
@@ -6769,42 +6832,49 @@ async function write(name) {
   renderPending();
   setComposerSubmitting(true);
   try {
-    const queueInsteadOfSteer = () => {
+    const startNewTurnInstead = () => {
+      startingNewTurn = true;
       name = "send";
-      action = "queue";
+      action = "queue"; // Keep the stable backend enum; this is a local new-turn intent.
       const optimistic = state.pending.find((entry) => entry.id === submissionId);
       if (optimistic) {
         optimistic.action = action;
-        optimistic.status = "queueing";
+        optimistic.intent = "new_turn";
+        optimistic.status = "sending";
         renderPending();
       }
-      notify(tr("noActiveTurnQueued"));
+      notify(tr("noActiveTurnStarting"));
     };
-    const submit = () =>
-      command({
+    $("messageText").value = "";
+    closeCommandPicker();
+    resizeComposerTextarea();
+    saveDraft(threadId, "", true);
+    const outcome = await sendWithExplicitNewTurnFallback(
+      {
         command: name,
         thread_id: threadId,
         text: requestText,
         attachments,
         submission_id: submissionId,
-      }).then(
-        (value) => ({ value }),
-        (error) => ({ error }),
-      );
-    $("messageText").value = "";
-    closeCommandPicker();
-    resizeComposerTextarea();
-    saveDraft(threadId, "", true);
-    let outcome = await submit();
-    if (name === "steer" && outcome.error?.message?.startsWith("no_active_turn:")) {
-      queueInsteadOfSteer();
-      outcome = await submit();
-    }
+      },
+      (request) => command(request, false),
+      startNewTurnInstead,
+    ).then(
+      (result) => ({ value: result.value }),
+      (error) => ({ error }),
+    );
     if (outcome.error) {
       state.pendingInFlight.delete(submissionId);
       const confirmed = await refreshPending({ preserveOptimistic: false })
         .then(() =>
-          state.pending.some((entry) => entry.id === submissionId && entry.thread_id === threadId),
+          state.pending.some(
+            (entry) =>
+              entry.id === submissionId &&
+              entry.thread_id === threadId &&
+              ["queued", "accepted", "processing", "dequeued", "steered", "applied"].includes(
+                entry.status,
+              ),
+          ),
         )
         .catch(() => false);
       if (!confirmed) throw outcome.error;
@@ -6812,12 +6882,37 @@ async function write(name) {
     setComposerSubmitting(false);
     acknowledged = true;
     state.pendingInFlight.delete(submissionId);
-    state.composerAttachments = [];
+    const receipt = state.pending.find(
+      (entry) => entry.id === submissionId && entry.thread_id === threadId,
+    );
+    if (receipt && outcome.value) {
+      receipt.status = outcome.value.status === "queued" ? "queued" : "accepted";
+      if (
+        outcome.value.queue_backend === "app_server_queue" ||
+        (outcome.value.status === "queued" && outcome.value.backend?.queued_submission_id)
+      )
+        receipt.source = "app_server_queue";
+      if (outcome.value.start_error) receipt.start_error = outcome.value.start_error;
+      renderPending();
+    }
     state.attachmentDrafts.delete(threadId);
-    renderComposerAttachments();
     state.referenceDrafts.delete(threadId);
-    if (state.current?.id === threadId) setComposerReference(null, false);
-    notify(name === "send" ? tr("messageQueued") : tr("guidanceSteered"));
+    if (state.current?.id === threadId) {
+      state.composerAttachments = [];
+      renderComposerAttachments();
+      setComposerReference(null, false);
+    }
+    if (outcome.value?.start_error) notify(tr("pendingStartFailed"), true);
+    else
+      notify(
+        name === "send"
+          ? tr(
+              !startingNewTurn && outcome.value?.status === "queued"
+                ? "messageQueued"
+                : "pendingSubmitted",
+            )
+          : tr("guidanceSteered"),
+      );
     try {
       if (state.current?.id === threadId) await openThread(state.current, { quiet: true });
       else await refreshPending();
@@ -8032,7 +8127,8 @@ setInterval(() => {
 setInterval(() => {
   if (
     state.eventStreamConnected &&
-    state.pending.some((entry) => entry.thread_id === state.current?.id)
+    (state.pending.some((entry) => entry.thread_id === state.current?.id) ||
+      state.pendingQueueUnavailable === state.current?.id)
   )
     refreshPending().catch(() => {});
 }, 5000);

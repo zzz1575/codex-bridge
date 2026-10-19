@@ -1,3 +1,4 @@
+import "./pending-state.test.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -194,9 +195,13 @@ import {
   toolFileList,
 } from "../src/message-presentation.js";
 import {
+  isWithdrawableQueued,
   mergePendingSnapshot,
   pendingInputSummary,
+  pendingPresentation,
+  pendingSnapshotIsCurrent,
   reconcilePendingMessages,
+  sendWithExplicitNewTurnFallback,
 } from "../src/pending-state.js";
 import { SessionMessageCache } from "../src/message-cache.js";
 import { runtimeArchitectureModel } from "../src/runtime-architecture.js";
@@ -2432,12 +2437,21 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.match(source, /className = "outbox-menu"/);
   assert.match(source, /existingById/);
   assert.match(source, /entry\.status !== "failed"/);
-  assert.match(source, /entry\.status === "failed" \|\|/);
-  assert.match(source, /\["app_server_queue", "demo_wasm"\]\.includes\(entry\.source\)/);
-  assert.match(source, /if \(!withdrawable\)/);
-  assert.match(source, /sentCannotWithdraw/);
+  assert.match(source, /presentation = pendingPresentation\(entry\)/);
+  assert.match(source, /isWithdrawableQueued\(entry\)/);
+  assert.match(source, /if \(!withdrawable && !recoverable\)/);
+  assert.equal(
+    pendingPresentation({ action: "queue", status: "accepted", source: "app_server_queue" })
+      .modeKey,
+    "pendingSubmitted",
+  );
+  assert.equal(
+    pendingPresentation({ action: "queue", status: "accepted", source: "app_server_queue" })
+      .withdrawable,
+    false,
+  );
   assert.match(stylesheet, /\.outbox-delete\s*\{[^}]*color:\s*var\(--text\)/s);
-  assert.match(translations, /sentCannotWithdraw:\s*"已交接 · 无法撤回"/);
+  assert.match(translations, /pendingSubmitted:\s*"已提交"/);
   const withdrawFlow = source.slice(
     source.indexOf("async function deletePending"),
     source.indexOf("async function convertPendingToSteer"),
@@ -2445,7 +2459,7 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.match(withdrawFlow, /refreshPending\(\{ preserveOptimistic: false \}\)/);
   assert.match(
     source,
-    /state\.eventStreamConnected &&\s*state\.pending\.some\(\(entry\) => entry\.thread_id === state\.current\?\.id\)/,
+    /state\.eventStreamConnected &&\s*\(?state\.pending\.some\(\(entry\) => entry\.thread_id === state\.current\?\.id\)/,
   );
   const convertFlow = source.slice(
     source.indexOf("async function convertPendingToSteer"),
@@ -2495,6 +2509,8 @@ test("a queued card renders its Convert to Steer control without aborting sessio
   const context = {
     document,
     state: { current: { id: "manta" }, pending: [entry] },
+    pendingPresentation,
+    isWithdrawableQueued,
     markdownNode: () => document.createElement("span"),
     markdownOptions: () => ({}),
     currentThreadWritable: () => false,
@@ -2973,6 +2989,7 @@ test("a lost Steer response reconciles server acceptance without trapping the co
     voiceRecorder: null,
     newSubmissionId: () => "steer-attempt",
     currentThreadWritable: () => true,
+    sendWithExplicitNewTurnFallback,
     pendingInputSummary: (text) => text,
     renderPending: () => {},
     setComposerSubmitting: (value) => submitting.push(value),
@@ -3027,6 +3044,7 @@ test("a stale writer lock cannot silently turn an explicit Steer into Queue", as
     voiceRecorder: null,
     newSubmissionId: () => "steer-with-stale-lock",
     currentThreadWritable: () => false,
+    sendWithExplicitNewTurnFallback,
     pendingInputSummary: (text) => text,
     renderPending: () => {},
     setComposerSubmitting: () => {},
@@ -3142,6 +3160,10 @@ test("a slow history page does not delay writer or queue state", async () => {
     source.indexOf("async function openThread("),
     source.indexOf("async function refreshThread() {"),
   );
+  const pendingApplicationSource = source.slice(
+    source.indexOf("function applyPendingSnapshot("),
+    source.indexOf("async function refreshPending("),
+  );
   const locks = [];
   const state = {
     openToken: 0,
@@ -3154,6 +3176,7 @@ test("a slow history page does not delay writer or queue state", async () => {
     state,
     goalStateVersion: 0,
     snapshotIsCurrent,
+    pendingSnapshotIsCurrent,
     $: (id) => ({ textContent: "", id }),
     renderAsyncQuestion: () => {},
     serverRequestTray: { render: () => {} },
@@ -3184,7 +3207,7 @@ test("a slow history page does not delay writer or queue state", async () => {
     renderGoalPanel: () => {},
   };
   runInNewContext(
-    `let pendingSnapshotGeneration = 0, pendingAppliedGeneration = 0;\n${openSource}\nopenThread({id: "manta", title: "Manta58", cwd: "/tmp"}, {quiet: true})`,
+    `let pendingSnapshotGeneration = 0, pendingAppliedGeneration = 0;\n${pendingApplicationSource}\n${openSource}\nopenThread({id: "manta", title: "Manta58", cwd: "/tmp"}, {quiet: true})`,
     context,
   );
   await new Promise((resolve) => setImmediate(resolve));
@@ -3214,9 +3237,10 @@ test("pending snapshots apply promptly and never overwrite a newer applied resul
     source.indexOf("async function deletePending(entry, button) {"),
   );
   const resolvers = [];
-  const state = { current: { id: "manta" }, pending: [] };
+  const state = { current: { id: "manta" }, openToken: 0, pending: [] };
   const context = {
     state,
+    pendingSnapshotIsCurrent,
     command: () => new Promise((resolve) => resolvers.push(resolve)),
     mergePendingResponse: (messages) => messages,
     renderPending: () => {},

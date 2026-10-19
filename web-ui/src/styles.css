@@ -4908,3 +4908,13 @@ html[data-theme="light"] .composer-shell.agent-active:not(.submitting) {
 .server-request-error {
   color: var(--danger, #c33);
 }
+
+.pending-sync-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.pending-sync-warning button {
+  flex: 0 0 auto;
+}

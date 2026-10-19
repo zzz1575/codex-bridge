@@ -40,6 +40,8 @@ pub struct NativeQueueReceipt {
     pub queued_submission_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_error: Option<BackendFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -145,7 +147,7 @@ pub struct BackendSuccess {
     pub stderr: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BackendFailure {
     pub code: &'static str,
     pub message: String,
@@ -230,37 +232,52 @@ impl CodexCliBackend {
                 code: "app_server_protocol_error",
                 message: "thread/queue/add response has no queuedSubmission.id".to_owned(),
             })?;
-        let started_turn_id = start_if_idle
-            .then(|| {
-                self.app_server_rpc(
-                    "thread/read",
-                    json!({"threadId": thread_id, "includeTurns": false}),
-                )
-                .ok()
-                .filter(|thread| !app_server_thread_is_active(thread))
-                .and_then(|_| {
-                    self.app_server_rpc(
+        // queue/add has already committed. Never retry it or hide a failed/unknown
+        // start behind an ordinary success receipt: the same submission remains
+        // available for authoritative queue/history reconciliation.
+        let start = if start_if_idle {
+            self.app_server_rpc(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+            )
+            .and_then(|thread| match app_server_thread_status(&thread) {
+                Some("active") => Ok(None),
+                Some("idle" | "notLoaded") => self
+                    .app_server_rpc(
                         "thread/queue/start",
                         json!({
                             "threadId": thread_id,
                             "queuedSubmissionId": queued_submission_id,
                         }),
                     )
-                    .ok()
-                })
-                .and_then(|result| {
-                    result
-                        .pointer("/turn/id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .map(str::to_owned)
-                })
+                    .and_then(|result| {
+                        result
+                            .pointer("/turn/id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(|id| Some(id.to_owned()))
+                            .ok_or_else(|| BackendFailure {
+                                code: "app_server_protocol_error",
+                                message: "queue/add succeeded, but queue/start returned no turn id; refresh before continuing".to_owned(),
+                            })
+                    }),
+                _ => Err(BackendFailure {
+                    code: "active_turn_unavailable",
+                    message: "queue/add succeeded, but the runtime state is unknown; refresh before continuing".to_owned(),
+                }),
             })
-            .flatten();
+        } else {
+            Ok(None)
+        };
+        let (started_turn_id, start_error) = match start {
+            Ok(turn_id) => (turn_id, None),
+            Err(error) => (None, Some(error)),
+        };
         Ok(NativeQueueReceipt {
             backend: "app_server_queue".to_owned(),
             queued_submission_id: queued_submission_id.to_owned(),
             started_turn_id,
+            start_error,
         })
     }
 
@@ -423,6 +440,31 @@ impl CodexCliBackend {
         self.run_app_server_rpc("turn/steer", params, "codex_app_server_steer")
     }
 
+    pub fn active_turn_for_steer(&self, thread_id: &str) -> Result<Option<String>, BackendFailure> {
+        let thread = self.app_server_rpc(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+        )?;
+        if thread.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+            return Err(active_turn_unavailable(
+                "runtime returned a different or missing thread id",
+            ));
+        }
+        match app_server_thread_status(&thread) {
+            Some("idle") => Ok(None),
+            Some("active" | "notLoaded") => {
+                let turns = self.app_server_rpc(
+                    "thread/turns/list",
+                    json!({"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}),
+                )?;
+                native_active_turn_for_steer(&thread, &turns)
+            }
+            _ => Err(active_turn_unavailable(
+                "runtime thread status is unknown or unavailable",
+            )),
+        }
+    }
+
     pub fn interrupt_turn(
         &self,
         thread_id: &str,
@@ -552,15 +594,70 @@ impl CodexCliBackend {
     }
 }
 
+#[cfg(test)]
 fn app_server_thread_is_active(result: &Value) -> bool {
+    app_server_thread_status(result) == Some("active")
+}
+
+fn app_server_thread_status(result: &Value) -> Option<&str> {
     let status = result
         .pointer("/thread/status")
         .or_else(|| result.get("status"));
-    status.and_then(Value::as_str) == Some("active")
-        || status
-            .and_then(|status| status.get("type"))
+    status
+        .and_then(Value::as_str)
+        .or_else(|| status?.get("type")?.as_str())
+}
+
+fn active_turn_unavailable(message: &str) -> BackendFailure {
+    BackendFailure {
+        code: "active_turn_unavailable",
+        message: message.to_owned(),
+    }
+}
+
+fn native_active_turn_for_steer(
+    thread: &Value,
+    turns: &Value,
+) -> Result<Option<String>, BackendFailure> {
+    let data = turns
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| active_turn_unavailable("runtime turn page is malformed"))?;
+    if data.len() > 1 {
+        return Err(active_turn_unavailable(
+            "runtime returned an ambiguous current turn",
+        ));
+    }
+    if data.first().is_some_and(|turn| {
+        turn.get("id")
             .and_then(Value::as_str)
-            == Some("active")
+            .is_none_or(str::is_empty)
+    }) {
+        return Err(active_turn_unavailable("runtime latest turn has no id"));
+    }
+    match (app_server_thread_status(thread), data.first()) {
+        (Some("active"), Some(turn))
+            if turn.get("status").and_then(Value::as_str) == Some("inProgress") =>
+        {
+            turn.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|id| Some(id.to_owned()))
+                .ok_or_else(|| active_turn_unavailable("active runtime turn has no id"))
+        }
+        (Some("notLoaded"), None) => Ok(None),
+        (Some("notLoaded"), Some(turn))
+            if matches!(
+                turn.get("status").and_then(Value::as_str),
+                Some("completed" | "interrupted" | "failed")
+            ) =>
+        {
+            Ok(None)
+        }
+        _ => Err(active_turn_unavailable(
+            "runtime status and latest turn disagree; refresh before sending",
+        )),
+    }
 }
 
 fn app_server_unavailable() -> BackendFailure {
@@ -1601,6 +1698,254 @@ mod tests {
     use super::*;
 
     static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn with_scripted_rpc<T>(
+        script: Vec<(&'static str, Value)>,
+        operation: impl FnOnce(&CodexCliBackend) -> T,
+    ) -> (T, Vec<Value>) {
+        let directory = std::env::temp_dir().join(format!(
+            "codex-queue-state-test-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("bridge.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let initialize = read_json(&mut websocket);
+            websocket
+                .send(Message::Text(
+                    json!({"id":initialize["id"],"result":{}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            let _initialized = read_json(&mut websocket);
+            let mut requests = Vec::new();
+            for (method, mut response) in script {
+                let request = read_json(&mut websocket);
+                assert_eq!(request["method"], method);
+                response["id"] = request["id"].clone();
+                websocket
+                    .send(Message::Text(response.to_string().into()))
+                    .unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let backend = CodexCliBackend::new(PathBuf::from("/unused/codex"), Some(socket.clone()));
+        let result = operation(&backend);
+        let requests = server.join().unwrap();
+        drop(backend);
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        (result, requests)
+    }
+
+    #[test]
+    fn queue_add_success_preserves_submission_and_reports_read_or_start_failure() {
+        let added = json!({"result":{"queuedSubmission":{"id":"native-once"}}});
+        let rejected = json!({"error":{"code":-32000,"message":"fixture unavailable"}});
+        for failure_at_start in [false, true] {
+            let mut script = vec![("thread/queue/add", added.clone())];
+            if failure_at_start {
+                script.push((
+                    "thread/read",
+                    json!({"result":{"thread":{"status":{"type":"idle"}}}}),
+                ));
+                script.push(("thread/queue/start", rejected.clone()));
+            } else {
+                script.push(("thread/read", rejected.clone()));
+            }
+            let (receipt, requests) = with_scripted_rpc(script, |backend| {
+                backend
+                    .queue_message(
+                        "thread-a",
+                        &[json!({"type":"text","text":"fixture"})],
+                        "web-once",
+                    )
+                    .unwrap()
+            });
+            assert_eq!(receipt.queued_submission_id, "native-once");
+            assert_eq!(receipt.started_turn_id, None);
+            assert_eq!(
+                receipt.start_error.as_ref().unwrap().code,
+                "app_server_rejected"
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "thread/queue/add")
+                    .count(),
+                1
+            );
+            assert_eq!(requests[0]["params"]["clientUserMessageId"], "web-once");
+            assert!(serde_json::to_value(&receipt).unwrap()["start_error"]["message"].is_string());
+        }
+    }
+
+    #[test]
+    fn queue_start_missing_turn_id_is_a_partial_receipt_not_silent_success() {
+        let (receipt, requests) = with_scripted_rpc(
+            vec![
+                (
+                    "thread/queue/add",
+                    json!({"result":{"queuedSubmission":{"id":"native-malformed"}}}),
+                ),
+                (
+                    "thread/read",
+                    json!({"result":{"thread":{"status":{"type":"idle"}}}}),
+                ),
+                ("thread/queue/start", json!({"result":{}})),
+            ],
+            |backend| {
+                backend
+                    .queue_message(
+                        "thread-a",
+                        &[json!({"type":"text","text":"fixture"})],
+                        "web-malformed",
+                    )
+                    .unwrap()
+            },
+        );
+        assert_eq!(receipt.queued_submission_id, "native-malformed");
+        assert_eq!(
+            receipt.start_error.unwrap().code,
+            "app_server_protocol_error"
+        );
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
+    fn queue_unknown_runtime_status_does_not_attempt_an_unverified_start() {
+        let (receipt, requests) = with_scripted_rpc(
+            vec![
+                (
+                    "thread/queue/add",
+                    json!({"result":{"queuedSubmission":{"id":"native-unknown"}}}),
+                ),
+                (
+                    "thread/read",
+                    json!({"result":{"thread":{"status":{"type":"systemError"}}}}),
+                ),
+            ],
+            |backend| {
+                backend
+                    .queue_message(
+                        "thread-a",
+                        &[json!({"type":"text","text":"fixture"})],
+                        "web-unknown",
+                    )
+                    .unwrap()
+            },
+        );
+        assert_eq!(receipt.start_error.unwrap().code, "active_turn_unavailable");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn steer_uses_native_current_turn_even_without_a_flushed_rollout() {
+        let (turn, requests) = with_scripted_rpc(
+            vec![
+                (
+                    "thread/read",
+                    json!({"result":{"thread":{"id":"thread-a","status":{"type":"active"},"turns":[]}}}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"result":{"data":[{"id":"native-live-turn","status":"inProgress","items":[]}],"nextCursor":null}}),
+                ),
+                ("turn/steer", json!({"result":{}})),
+            ],
+            |backend| {
+                let turn = backend.active_turn_for_steer("thread-a").unwrap().unwrap();
+                backend
+                    .steer_via_app_server(
+                        "thread-a",
+                        &turn,
+                        &[json!({"type":"text","text":"follow-up"})],
+                    )
+                    .unwrap();
+                turn
+            },
+        );
+        assert_eq!(turn, "native-live-turn");
+        assert_eq!(requests[0]["params"]["includeTurns"], false);
+        assert_eq!(requests[1]["params"]["limit"], 1);
+        assert_eq!(requests[1]["params"]["itemsView"], "notLoaded");
+        assert_eq!(requests[2]["params"]["expectedTurnId"], "native-live-turn");
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"] == "thread/queue/add"));
+    }
+
+    #[test]
+    fn steer_read_errors_are_not_no_active_turn_and_do_not_write() {
+        let (error, requests) = with_scripted_rpc(
+            vec![(
+                "thread/read",
+                json!({"error":{"code":-32000,"message":"fixture read failed"}}),
+            )],
+            |backend| backend.active_turn_for_steer("thread-a").unwrap_err(),
+        );
+        assert_eq!(error.code, "app_server_rejected");
+        assert_ne!(error.code, "no_active_turn");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn steer_not_loaded_requires_a_terminal_or_empty_native_turn_page() {
+        let thread = json!({"thread":{"id":"thread-a","status":{"type":"notLoaded"}}});
+        for terminal in ["completed", "interrupted", "failed"] {
+            assert_eq!(
+                native_active_turn_for_steer(
+                    &thread,
+                    &json!({"data":[{"id":"old-turn","status":terminal}]})
+                )
+                .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            native_active_turn_for_steer(&thread, &json!({"data":[]})).unwrap(),
+            None
+        );
+        for malformed in [
+            json!({}),
+            json!({"data":[{"id":"old-turn","status":"inProgress"}]}),
+            json!({"data":[{"id":"old-turn"}]}),
+            json!({"data":[{"status":"completed"}]}),
+            json!({"data":[{"id":"","status":"completed"}]}),
+        ] {
+            assert_eq!(
+                native_active_turn_for_steer(&thread, &malformed)
+                    .unwrap_err()
+                    .code,
+                "active_turn_unavailable"
+            );
+        }
+        let active = json!({"thread":{"status":{"type":"active"}}});
+        assert_eq!(
+            native_active_turn_for_steer(&active, &json!({"data":[]}))
+                .unwrap_err()
+                .code,
+            "active_turn_unavailable"
+        );
+        assert_eq!(
+            native_active_turn_for_steer(
+                &active,
+                &json!({"data":[{"id":"old-turn","status":"completed"}]})
+            )
+            .unwrap_err()
+            .code,
+            "active_turn_unavailable"
+        );
+    }
 
     fn args(invocation: &Invocation) -> Vec<String> {
         invocation

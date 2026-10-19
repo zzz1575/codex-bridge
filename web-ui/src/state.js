@@ -58,6 +58,7 @@ export const state = {
   followMessageTail: true,
   messageSyncPhase: null,
   pending: [],
+  pendingQueueUnavailable: null,
   pendingInFlight: new Set(),
   drafts: loadDrafts(),
   composerAttachments: [],

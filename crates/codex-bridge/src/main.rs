@@ -726,6 +726,8 @@ struct PendingMessage {
     after_message_index: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_error: Option<BackendFailure>,
 }
 
 #[derive(Debug, Default)]
@@ -795,6 +797,7 @@ impl PendingMessages {
                 turn_id: None,
                 after_message_index,
                 error: None,
+                start_error: None,
             });
         }
         Ok((id, true))
@@ -816,6 +819,7 @@ impl PendingMessages {
                 entry.source = "app_server_queue".to_owned();
                 entry.queued_submission_id = Some(queued_submission_id);
                 entry.error = None;
+                entry.start_error = None;
             }
         }
     }
@@ -826,6 +830,16 @@ impl PendingMessages {
                 entry.status = "accepted".to_owned();
                 entry.turn_id = turn_id.or_else(|| entry.turn_id.clone());
                 entry.error = None;
+                entry.start_error = None;
+            }
+        }
+    }
+
+    fn queue_start_failed(&self, id: &str, error: BackendFailure) {
+        if let Ok(mut entries) = self.entries.write() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.error = Some(error.message.clone());
+                entry.start_error = Some(error);
             }
         }
     }
@@ -852,6 +866,7 @@ impl PendingMessages {
         session_store: &SessionStore,
         queued: Vec<PendingMessage>,
         thread_id: Option<&str>,
+        queue_authoritative: bool,
     ) -> Vec<PendingMessage> {
         let Ok(mut entries) = self.entries.write() else {
             return Vec::new();
@@ -888,6 +903,8 @@ impl PendingMessages {
                 (landed_in_history || finished_turn).then(|| {
                     let mut completed = entry.clone();
                     completed.status = "applied".to_owned();
+                    completed.error = None;
+                    completed.start_error = None;
                     completed
                 })
             })
@@ -910,10 +927,11 @@ impl PendingMessages {
             }
         }
         let mut matched_queue_ids = HashSet::new();
-        for entry in entries
-            .iter_mut()
-            .filter(|entry| entry.action == "queue" && entry.status != "failed")
-        {
+        for entry in entries.iter_mut().filter(|entry| {
+            entry.action == "queue"
+                && entry.status != "failed"
+                && thread_id.is_none_or(|scope| entry.thread_id == scope)
+        }) {
             if let Some(queued_entry) = queued.iter().find(|queued_entry| {
                 !matched_queue_ids.contains(&queued_entry.id)
                     && queued_entry.thread_id == entry.thread_id
@@ -931,7 +949,8 @@ impl PendingMessages {
                 // here proves that it is still withdrawable.
                 entry.status = "queued".to_owned();
                 matched_queue_ids.insert(queued_entry.id.clone());
-            } else if entry.queued_submission_id.is_some()
+            } else if queue_authoritative
+                && entry.queued_submission_id.is_some()
                 && matches!(entry.source.as_str(), "app_server_queue" | "codex_queue")
             {
                 // Leaving the native queue is not proof that the input landed in
@@ -959,45 +978,54 @@ impl PendingMessages {
     }
 }
 
-fn read_codex_queue(codex_home: &Path) -> Vec<PendingMessage> {
+fn queue_read_error() -> BackendFailure {
+    BackendFailure {
+        code: "queue_read_unavailable",
+        message:
+            "Queue state could not be read; existing submissions have not been withdrawn or retried"
+                .to_owned(),
+    }
+}
+
+fn read_codex_queue(codex_home: &Path) -> Result<Vec<PendingMessage>, BackendFailure> {
     let path = codex_home.join("queue_1.sqlite");
-    let Ok(connection) = Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return Vec::new();
-    };
-    let Ok(mut statement) = connection.prepare(
-        "SELECT id, thread_id, payload_json FROM queued_items ORDER BY thread_id, queue_order",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(rows) = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }) else {
-        return Vec::new();
-    };
-    rows.filter_map(|row| row.ok())
-        .filter_map(|(id, thread_id, payload)| {
-            let text = queue_payload_text(&payload)?;
-            Some(PendingMessage {
-                queued_submission_id: Some(id.clone()),
-                id,
-                thread_id,
-                text,
-                action: "queue".to_owned(),
-                status: "queued".to_owned(),
-                source: "codex_queue".to_owned(),
-                after_message_index: -1,
-                turn_id: None,
-                error: None,
-            })
+    )
+    .map_err(|_| queue_read_error())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, thread_id, payload_json FROM queued_items ORDER BY thread_id, queue_order",
+        )
+        .map_err(|_| queue_read_error())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
-        .collect()
+        .map_err(|_| queue_read_error())?;
+    rows.map(|row| {
+        let (id, thread_id, payload) = row.map_err(|_| queue_read_error())?;
+        let text = queue_payload_text(&payload).ok_or_else(queue_read_error)?;
+        Ok(PendingMessage {
+            queued_submission_id: Some(id.clone()),
+            id,
+            thread_id,
+            text,
+            action: "queue".to_owned(),
+            status: "queued".to_owned(),
+            source: "codex_queue".to_owned(),
+            after_message_index: -1,
+            turn_id: None,
+            error: None,
+            start_error: None,
+        })
+    })
+    .collect()
 }
 
 fn read_native_queue(
@@ -1006,33 +1034,54 @@ fn read_native_queue(
 ) -> Result<Vec<PendingMessage>, BackendFailure> {
     let mut cursor = None;
     let mut queued = Vec::new();
+    let mut seen_cursors = HashSet::new();
     loop {
         let result = write_backend.app_server_rpc(
             "thread/queue/list",
             json!({"threadId": thread_id, "cursor": cursor, "limit": 100}),
         )?;
-        for submission in result
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(id) = submission.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(text) = submission
+        queued.extend(native_queue_page(&result, thread_id)?);
+        cursor = match result.get("nextCursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value))
+                if !value.is_empty() && seen_cursors.insert(value.clone()) =>
+            {
+                Some(value.clone())
+            }
+            _ => return Err(queue_read_error()),
+        };
+        if cursor.is_none() {
+            return Ok(queued);
+        }
+    }
+}
+
+fn native_queue_page(
+    result: &Value,
+    thread_id: &str,
+) -> Result<Vec<PendingMessage>, BackendFailure> {
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(queue_read_error)?;
+    data.iter()
+        .map(|submission| {
+            let id = submission
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(queue_read_error)?;
+            let text = submission
                 .get("input")
                 .and_then(queue_input_text)
                 .filter(|text| !text.is_empty())
-            else {
-                continue;
-            };
+                .ok_or_else(queue_read_error)?;
             let client_id = submission
                 .get("clientUserMessageId")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(id);
-            queued.push(PendingMessage {
+            Ok(PendingMessage {
                 id: client_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 text,
@@ -1043,16 +1092,10 @@ fn read_native_queue(
                 turn_id: None,
                 after_message_index: -1,
                 error: None,
-            });
-        }
-        cursor = result
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if cursor.is_none() {
-            return Ok(queued);
-        }
-    }
+                start_error: None,
+            })
+        })
+        .collect()
 }
 
 fn add_native_queue_without_start(
@@ -1278,34 +1321,76 @@ fn pending_input_summary(text: &str, attachments: &[ComposerAttachment]) -> Stri
     parts.join("\n")
 }
 
+struct QueueSnapshot {
+    messages: Vec<PendingMessage>,
+    backend: &'static str,
+    available: bool,
+    authoritative: bool,
+    error: Option<BackendFailure>,
+}
+
+impl QueueSnapshot {
+    fn require_readable(&self, thread_id: Option<&str>) -> Result<(), BackendFailure> {
+        // Existing clients ignore additive availability fields and would erase
+        // their last good pending projection on ok:true/messages:[]. Fail the
+        // request instead when a scoped native read is unknown, or when an empty
+        // compatibility-only global snapshot cannot establish an empty queue.
+        if self.authoritative
+            || (thread_id.is_none() && self.available && !self.messages.is_empty())
+        {
+            return Ok(());
+        }
+        Err(BackendFailure {
+            code: "queue_state_unavailable",
+            message: "Queue state is not authoritative; keep the last known submissions and refresh before continuing".to_owned(),
+        })
+    }
+}
+
 fn queued_messages_for_thread(
     session_store: &SessionStore,
     write_backend: &CodexCliBackend,
     thread_id: Option<&str>,
-) -> (Vec<PendingMessage>, &'static str) {
+) -> QueueSnapshot {
+    let mut native_error = None;
     if let Some(thread_id) = thread_id {
-        if let Ok(messages) = read_native_queue(write_backend, thread_id) {
-            return (messages, "app_server");
+        match read_native_queue(write_backend, thread_id) {
+            Ok(messages) => {
+                return QueueSnapshot {
+                    messages,
+                    backend: "app_server",
+                    available: true,
+                    authoritative: true,
+                    error: None,
+                }
+            }
+            Err(error) => native_error = Some(error),
         }
     }
-    (
-        read_codex_queue(session_store.home())
-            .into_iter()
-            .filter(|entry| thread_id.is_none_or(|thread_id| entry.thread_id == thread_id))
-            .collect(),
-        "compatibility",
-    )
+    match read_codex_queue(session_store.home()) {
+        Ok(messages) => QueueSnapshot {
+            messages: messages
+                .into_iter()
+                .filter(|entry| thread_id.is_none_or(|scope| entry.thread_id == scope))
+                .collect(),
+            backend: "compatibility",
+            available: true,
+            authoritative: false,
+            error: native_error,
+        },
+        Err(error) => QueueSnapshot {
+            messages: Vec::new(),
+            backend: "compatibility",
+            available: false,
+            authoritative: false,
+            error: Some(native_error.unwrap_or(error)),
+        },
+    }
 }
 
 fn queue_payload_text(payload: &str) -> Option<String> {
     let payload: Value = serde_json::from_str(payload).ok()?;
-    let content = payload.get("UserInput")?.get("content")?.as_array()?;
-    let text = content
-        .iter()
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.is_empty()).then_some(text)
+    queue_input_text(payload.get("UserInput")?.get("content")?)
 }
 
 fn pending_message_landed(
@@ -7662,18 +7747,26 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             }))
         }
         Request::PendingMessages { thread_id } => {
-            let (queued, queue_backend) =
+            let queue =
                 queued_messages_for_thread(session_store, write_backend, thread_id.as_deref());
+            if let Err(error) = queue.require_readable(thread_id.as_deref()) {
+                return write_backend_error(error);
+            }
             Response::success(json!({
-                "messages": pending_messages.reconcile(session_store, queued, thread_id.as_deref()),
-                "queue_backend": queue_backend,
+                "messages": pending_messages.reconcile(session_store, queue.messages, thread_id.as_deref(), queue.authoritative),
+                "queue_backend": queue.backend,
+                "queue_available": queue.available,
+                "queue_authoritative": queue.authoritative,
+                "queue_error": queue.error,
             }))
         }
         Request::PendingMessageDelete { id, thread_id } => {
-            let (queued, _) =
-                queued_messages_for_thread(session_store, write_backend, Some(&thread_id));
+            let queue = queued_messages_for_thread(session_store, write_backend, Some(&thread_id));
+            if !queue.authoritative {
+                return write_backend_error(queue.error.unwrap_or_else(queue_read_error));
+            }
             let entry = pending_messages
-                .reconcile(session_store, queued, Some(&thread_id))
+                .reconcile(session_store, queue.messages, Some(&thread_id), true)
                 .into_iter()
                 .find(|entry| entry.id == id && entry.thread_id == thread_id);
             let Some(entry) = entry else {
@@ -9768,6 +9861,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "thread_id": resolved.thread.id,
                     "target": resolved.method,
                     "replayed": true,
+                    "partial": entry.start_error.is_some(),
+                    "start_error": entry.start_error,
                 }));
             }
             let queue_result = if starts_if_idle {
@@ -9779,6 +9874,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(receipt) => {
                     pending_messages
                         .finish_queue(&pending_id, receipt.queued_submission_id.clone());
+                    if let Some(error) = receipt.start_error.clone() {
+                        pending_messages.queue_start_failed(&pending_id, error);
+                    }
                     let status = if receipt.started_turn_id.is_some() {
                         pending_messages.accept(&pending_id, receipt.started_turn_id.clone());
                         "accepted"
@@ -9791,6 +9889,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                         "pending_id": pending_id,
                         "thread_id": resolved.thread.id,
                         "target": resolved.method,
+                        "partial": receipt.start_error.is_some(),
+                        "start_error": receipt.start_error,
                         "backend": receipt,
                     }))
                 }
@@ -9850,32 +9950,32 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             if let Err(response) = require_owned_thread_writer(write_backend, &resolved.thread.id) {
                 return response;
             }
-            if resolved.thread.rollout_path.as_os_str().is_empty() {
-                return start_empty_thread_turn(
-                    session_store,
-                    write_backend,
-                    pending_messages,
-                    &resolved,
-                    &input,
-                    EmptyThreadSubmission {
-                        text: &pending_text,
-                        action: EmptyThreadAction::Steer,
-                        id: submission_id.as_deref(),
-                    },
-                );
-            }
-            let turn_id = match session_store.active_turn_id(&resolved.thread.id) {
+            let turn_id = match write_backend.active_turn_for_steer(&resolved.thread.id) {
                 Ok(Some(turn_id)) => turn_id,
+                Ok(None) if resolved.thread.rollout_path.as_os_str().is_empty() => {
+                    return start_empty_thread_turn(
+                        session_store,
+                        write_backend,
+                        pending_messages,
+                        &resolved,
+                        &input,
+                        EmptyThreadSubmission {
+                            text: &pending_text,
+                            action: EmptyThreadAction::Steer,
+                            id: submission_id.as_deref(),
+                        },
+                    );
+                }
                 Ok(None) => {
                     return Response::error(
                         "no_active_turn",
                         format!(
-                            "thread {} has no active turn; use send to queue a message instead",
+                                "thread {} has no active runtime turn; use send to queue a message instead",
                             resolved.thread.id
                         ),
                     );
                 }
-                Err(error) => return backend_error(error),
+                Err(error) => return write_backend_error(error),
             };
             let (pending_id, is_new) = match pending_messages.begin(
                 &resolved.thread.id,
@@ -13332,6 +13432,219 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
     }
 
     #[test]
+    fn scoped_queue_snapshot_does_not_relabel_another_thread() {
+        let pending = PendingMessages::default();
+        let (id, _) = pending
+            .begin(
+                "thread-b",
+                "still queued",
+                "queue",
+                -1,
+                Some("web-thread-b"),
+            )
+            .unwrap();
+        pending.finish_queue(&id, "native-thread-b".to_owned());
+        let store = fixture_store();
+
+        assert!(pending
+            .reconcile(&store, Vec::new(), Some("thread-a"), true)
+            .is_empty());
+        assert_eq!(pending.get(&id).unwrap().status, "queued");
+        assert_eq!(
+            pending.get(&id).unwrap().queued_submission_id.as_deref(),
+            Some("native-thread-b")
+        );
+    }
+
+    #[test]
+    fn unknown_or_compatibility_empty_queue_does_not_confirm_dequeue() {
+        let pending = PendingMessages::default();
+        let (id, _) = pending
+            .begin("thread-b", "still queued", "queue", -1, Some("web-unknown"))
+            .unwrap();
+        pending.finish_queue(&id, "native-unknown".to_owned());
+        let store = fixture_store();
+        for scope in [None, Some("thread-b")] {
+            let entries = pending.reconcile(&store, Vec::new(), scope, false);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].status, "queued");
+        }
+        assert_eq!(
+            pending.reconcile(&store, Vec::new(), Some("thread-b"), true)[0].status,
+            "accepted"
+        );
+    }
+
+    #[test]
+    fn unknown_queue_read_fails_for_old_clients_instead_of_returning_false_empty() {
+        for available in [false, true] {
+            let snapshot = QueueSnapshot {
+                messages: Vec::new(),
+                backend: "compatibility",
+                available,
+                authoritative: false,
+                error: Some(queue_read_error()),
+            };
+            for scope in [None, Some("thread-b")] {
+                assert_eq!(
+                    snapshot.require_readable(scope).unwrap_err().code,
+                    "queue_state_unavailable"
+                );
+            }
+        }
+        let authoritative = QueueSnapshot {
+            messages: Vec::new(),
+            backend: "app_server",
+            available: true,
+            authoritative: true,
+            error: None,
+        };
+        assert!(authoritative.require_readable(Some("thread-b")).is_ok());
+    }
+
+    #[test]
+    fn malformed_native_queue_pages_are_unknown_not_authoritative_empty() {
+        for result in [
+            json!({}),
+            json!({"data": null}),
+            json!({"data": [{}]}),
+            json!({"data": [{"id":"server-queue", "input":[]} ]}),
+        ] {
+            assert_eq!(
+                native_queue_page(&result, "thread-b").unwrap_err().code,
+                "queue_read_unavailable"
+            );
+        }
+        assert!(native_queue_page(&json!({"data": []}), "thread-b")
+            .unwrap()
+            .is_empty());
+        let page = native_queue_page(
+            &json!({"data": [{"id":"server-queue", "clientUserMessageId":"web-queue",
+            "input":[{"type":"image", "url":"data:image/png;base64,fixture"}]}]}),
+            "thread-b",
+        )
+        .unwrap();
+        assert_eq!(page[0].id, "web-queue");
+        assert_eq!(
+            page[0].queued_submission_id.as_deref(),
+            Some("server-queue")
+        );
+        assert_eq!(page[0].text, "[Image attachment]");
+    }
+
+    #[test]
+    fn compatibility_queue_missing_or_malformed_is_an_error() {
+        let home = env::temp_dir().join(format!(
+            "codex-queue-unavailable-{}-{}",
+            std::process::id(),
+            NEXT_WORKTREE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+        assert_eq!(
+            read_codex_queue(&home).unwrap_err().code,
+            "queue_read_unavailable"
+        );
+        let connection = Connection::open(home.join("queue_1.sqlite")).unwrap();
+        connection.execute_batch("CREATE TABLE queued_items (id TEXT, thread_id TEXT, payload_json TEXT, queue_order INTEGER);").unwrap();
+        assert!(read_codex_queue(&home).unwrap().is_empty());
+        connection
+            .execute(
+                "INSERT INTO queued_items VALUES ('queue-1','thread-b','invalid-json',0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            read_codex_queue(&home).unwrap_err().code,
+            "queue_read_unavailable"
+        );
+        drop(connection);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn partial_queue_start_receipt_remains_idempotent_and_does_not_become_failed() {
+        let pending = PendingMessages::default();
+        let (id, is_new) = pending
+            .begin("thread-b", "queued once", "queue", -1, Some("web-partial"))
+            .unwrap();
+        assert!(is_new);
+        pending.finish_queue(&id, "native-partial".to_owned());
+        let error = BackendFailure {
+            code: "app_server_rejected",
+            message: "start refused".to_owned(),
+        };
+        pending.queue_start_failed(&id, error.clone());
+        let (replayed, is_new) = pending
+            .begin("thread-b", "queued once", "queue", -1, Some("web-partial"))
+            .unwrap();
+        assert!(!is_new);
+        assert_eq!(replayed, id);
+        let receipt = pending.get(&id).unwrap();
+        assert_eq!(receipt.status, "queued");
+        assert_eq!(
+            receipt.queued_submission_id.as_deref(),
+            Some("native-partial")
+        );
+        assert_eq!(receipt.start_error, Some(error));
+        assert_eq!(pending.entries.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn applied_history_clears_partial_start_error_before_idempotent_replay() {
+        let store = fixture_store();
+        let (thread_id, text) = store
+            .list_threads(false)
+            .unwrap()
+            .into_iter()
+            .find_map(|thread| {
+                let (_, messages) = store.read_recent_messages(&thread.id, 128).ok().flatten()?;
+                messages
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .find_map(thread_message_input_summary)
+                    .map(|text| (thread.id, text))
+            })
+            .expect("synthetic history fixture has a user input");
+        let pending = PendingMessages::default();
+        let (id, _) = pending
+            .begin(
+                &thread_id,
+                &text,
+                "queue",
+                -1,
+                Some("web-confirmed-history"),
+            )
+            .unwrap();
+        pending.finish_queue(&id, "native-confirmed-history".to_owned());
+        pending.queue_start_failed(
+            &id,
+            BackendFailure {
+                code: "app_server_rejected",
+                message: "earlier start failure".to_owned(),
+            },
+        );
+        assert!(pending
+            .reconcile(&store, Vec::new(), Some(&thread_id), false)
+            .is_empty());
+        let applied = pending.get(&id).unwrap();
+        assert_eq!(applied.status, "applied");
+        assert_eq!(applied.error, None);
+        assert_eq!(applied.start_error, None);
+        assert!(
+            !pending
+                .begin(
+                    &thread_id,
+                    &text,
+                    "queue",
+                    -1,
+                    Some("web-confirmed-history")
+                )
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
     fn bridge_pending_state_tracks_status_and_new_message_position() {
         let pending = PendingMessages::default();
         let (id, _) = pending
@@ -13417,8 +13730,8 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             .unwrap();
         pending.finish(&first, "queued", None);
         pending.finish(&second, "queued", None);
-        let queued = read_codex_queue(&home);
-        let entries = pending.reconcile(&SessionStore::new(home.clone()), queued, None);
+        let queued = read_codex_queue(&home).unwrap();
+        let entries = pending.reconcile(&SessionStore::new(home.clone()), queued, None, false);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].queued_submission_id.as_deref(), Some("queue-1"));
         assert_eq!(entries[1].queued_submission_id.as_deref(), Some("queue-2"));
@@ -13545,16 +13858,17 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             turn_id: None,
             after_message_index: -1,
             error: None,
+            start_error: None,
         }];
         let store = fixture_store();
-        let entries = pending.reconcile(&store, queued, Some("thread-1"));
+        let entries = pending.reconcile(&store, queued, Some("thread-1"), true);
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].queued_submission_id.as_deref(),
             Some("server-queue-1")
         );
 
-        let dequeued = pending.reconcile(&store, Vec::new(), Some("thread-1"));
+        let dequeued = pending.reconcile(&store, Vec::new(), Some("thread-1"), true);
         assert_eq!(dequeued.len(), 1);
         assert_eq!(dequeued[0].status, "accepted");
         assert_eq!(pending.entries.read().unwrap().len(), 1);
@@ -13572,8 +13886,10 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 turn_id: None,
                 after_message_index: -1,
                 error: None,
+                start_error: None,
             }],
             Some("thread-1"),
+            true,
         );
         assert_eq!(reappeared.len(), 1);
         assert_eq!(reappeared[0].status, "queued");
@@ -13591,13 +13907,15 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 turn_id: None,
                 after_message_index: -1,
                 error: None,
+                start_error: None,
             }],
             Some("thread-1"),
+            false,
         );
         assert_eq!(fallback[0].source, "codex_queue");
         assert_eq!(
-            pending.reconcile(&store, Vec::new(), Some("thread-1"))[0].status,
-            "accepted"
+            pending.reconcile(&store, Vec::new(), Some("thread-1"), false)[0].status,
+            "queued"
         );
     }
 

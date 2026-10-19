@@ -34,6 +34,8 @@ function messageFingerprint(message) {
     attachments = [];
   for (const item of message?.content || []) {
     if (item.kind === "text" && typeof item.text === "string") textParts.push(item.text);
+    else if (item.kind === "image") attachments.push("image");
+    else if (item.kind === "audio") attachments.push("audio");
     else if (item.kind === "pasted_text") attachments.push("pasted_text");
     else if (item.kind === "uploaded_file") attachments.push("file");
     else if (item.kind === "context" && item.label === "Attached-file context")
@@ -62,22 +64,115 @@ export function pendingInputSummary(text, attachments) {
   return parts.join("\n");
 }
 
-export function mergePendingSnapshot(remote, local, inFlightIds) {
-  const entries = Array.isArray(remote) ? remote : [],
-    ids = new Set(entries.map((entry) => entry.id));
+export function isWithdrawableQueued(entry) {
+  return (
+    entry?.status === "queued" &&
+    ["app_server_queue", "demo_wasm"].includes(entry.source) &&
+    !entry.queue_unverified &&
+    !entry.handoff
+  );
+}
+
+export function pendingPresentation(entry) {
+  if (isWithdrawableQueued(entry))
+    return {
+      modeKey: "pendingQueued",
+      statusKey: entry.start_error ? "pendingStartFailed" : "pendingQueuedReady",
+      withdrawable: true,
+    };
+  const submitted = ["accepted", "processing", "dequeued", "steered", "applied"].includes(
+    entry?.status,
+  );
+  return {
+    modeKey:
+      entry?.action === "steer"
+        ? "followUp"
+        : submitted
+          ? "pendingSubmitted"
+          : entry?.status === "failed"
+            ? "pendingSending"
+            : entry?.status === "queued"
+              ? "pendingUnconfirmed"
+              : entry?.intent === "new_turn"
+                ? "pendingSending"
+                : "pendingQueueRequest",
+    statusKey: entry?.start_error
+      ? "pendingStartFailed"
+      : entry?.queue_unverified
+        ? "pendingQueueUnavailable"
+        : entry?.status === "queued"
+          ? "pendingQueueUnavailable"
+          : entry?.status === "failed"
+            ? "sendFailed"
+            : entry?.status === "processing"
+              ? "processingShort"
+              : submitted
+                ? "pendingRecordSync"
+                : "submittingToServer",
+    withdrawable: false,
+  };
+}
+
+export function pendingSnapshotIsCurrent(snapshot, current) {
+  return (
+    snapshot.threadId === current.threadId &&
+    snapshot.openToken === current.openToken &&
+    Number.isSafeInteger(snapshot.generation) &&
+    snapshot.generation >= current.appliedGeneration
+  );
+}
+
+export function mergePendingSnapshot(remote, local, inFlightIds, options = {}) {
+  const { threadId = null, queueAuthoritative = true } = options;
+  const scoped = (entry) => !threadId || entry.thread_id === threadId;
+  const previous = new Map(local.filter(scoped).map((entry) => [entry.id, entry]));
+  let entries = (Array.isArray(remote) ? remote : []).filter(scoped).map((entry) => {
+    const prior = previous.get(entry.id);
+    // A failed native queue read cannot turn a previously observed queued item
+    // into an accepted receipt. Keep that projection explicitly unverified.
+    const value = !queueAuthoritative && prior?.status === "queued" ? prior : entry;
+    return {
+      ...value,
+      ...(prior?.intent ? { intent: prior.intent } : {}),
+      ...(!queueAuthoritative && value.status === "queued" ? { queue_unverified: true } : {}),
+    };
+  });
+  const ids = new Set(entries.map((entry) => entry.id));
+  if (!queueAuthoritative) {
+    entries = [
+      ...entries,
+      ...local
+        .filter(
+          (entry) =>
+            scoped(entry) &&
+            !ids.has(entry.id) &&
+            (entry.source !== "web_optimistic" ||
+              inFlightIds.has(entry.id) ||
+              ["accepted", "queued", "processing"].includes(entry.status)),
+        )
+        .map((entry) => ({
+          ...entry,
+          ...(entry.status === "queued" ? { queue_unverified: true } : {}),
+        })),
+    ];
+  }
+  const retainedIds = new Set(entries.map((entry) => entry.id));
   return [
     ...entries,
     ...local.filter(
       (entry) =>
-        entry.source === "web_optimistic" && inFlightIds.has(entry.id) && !ids.has(entry.id),
+        entry.source === "web_optimistic" &&
+        inFlightIds.has(entry.id) &&
+        !retainedIds.has(entry.id),
     ),
   ];
 }
 
-export function reconcilePendingMessages(entries, authoritativeMessages) {
+export function reconcilePendingMessages(entries, authoritativeMessages, threadId = null) {
   const claimed = new Set(),
     messages = Array.isArray(authoritativeMessages) ? authoritativeMessages : [];
   return entries.filter((entry) => {
+    if (threadId && entry.thread_id !== threadId) return true;
     const fingerprint = pendingFingerprint(entry);
     const landedAt = messages.findIndex((message, index) => {
       if (claimed.has(index) || message.role !== "user") return false;
@@ -90,4 +185,22 @@ export function reconcilePendingMessages(entries, authoritativeMessages) {
     claimed.add(landedAt);
     return false;
   });
+}
+
+export async function sendWithExplicitNewTurnFallback(request, submit, onNewTurn = () => {}) {
+  try {
+    return { value: await submit(request), command: request.command };
+  } catch (error) {
+    // Only an explicit no-write/no-active-turn rejection allows one new-turn
+    // attempt. Timeouts, partial queue acceptance and all unknown failures do not.
+    if (
+      request.command !== "steer" ||
+      error?.partial ||
+      error?.start_error ||
+      !String(error?.message || "").startsWith("no_active_turn:")
+    )
+      throw error;
+    onNewTurn();
+    return { value: await submit({ ...request, command: "send" }), command: "send" };
+  }
 }
