@@ -418,25 +418,31 @@ impl CodexCliBackend {
             )
             .and_then(|thread| match app_server_thread_status(&thread) {
                 Some("active") => Ok(None),
-                Some("idle" | "notLoaded") => self
-                    .app_server_rpc(
+                Some("idle" | "notLoaded" | "systemError") => {
+                    if app_server_thread_status(&thread) == Some("systemError") {
+                        if thread.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+                            return Err(active_turn_unavailable("runtime returned a different or missing thread id"));
+                        }
+                        let turns = self.app_server_rpc(
+                            "thread/turns/list",
+                            json!({"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}),
+                        )?;
+                        // queue/add already committed. Only resume this exact saved submission
+                        // after native terminal evidence; never add the user's message twice.
+                        native_active_turn_for_steer(&thread, &turns)?;
+                    }
+                    self.app_server_rpc(
                         "thread/queue/start",
-                        json!({
-                            "threadId": thread_id,
-                            "queuedSubmissionId": queued_submission_id,
-                        }),
-                    )
-                    .and_then(|result| {
-                        result
-                            .pointer("/turn/id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .map(|id| Some(id.to_owned()))
+                        json!({"threadId": thread_id, "queuedSubmissionId": queued_submission_id}),
+                    ).and_then(|result| {
+                        result.pointer("/turn/id").and_then(Value::as_str)
+                            .filter(|id| !id.is_empty()).map(|id| Some(id.to_owned()))
                             .ok_or_else(|| BackendFailure {
                                 code: "app_server_protocol_error",
                                 message: "queue/add succeeded, but queue/start returned no turn id; refresh before continuing".to_owned(),
                             })
-                    }),
+                    })
+                }
                 _ => Err(BackendFailure {
                     code: "active_turn_unavailable",
                     message: "queue/add succeeded, but the runtime state is unknown; refresh before continuing".to_owned(),
@@ -670,7 +676,7 @@ impl CodexCliBackend {
         }
         match app_server_thread_status(&thread) {
             Some("idle") => Ok(None),
-            Some("active" | "notLoaded") => {
+            Some("active" | "notLoaded" | "systemError") => {
                 let turns = self.app_server_rpc(
                     "thread/turns/list",
                     json!({"threadId": thread_id, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}),
@@ -862,6 +868,16 @@ fn native_active_turn_for_steer(
                 .filter(|id| !id.is_empty())
                 .map(|id| Some(id.to_owned()))
                 .ok_or_else(|| active_turn_unavailable("active runtime turn has no id"))
+        }
+        // A failed runtime session has no live turn to steer. Preserve its history and
+        // let the normal idempotent send path append a new turn only after this native check.
+        (Some("systemError"), Some(turn))
+            if matches!(
+                turn.get("status").and_then(Value::as_str),
+                Some("failed" | "interrupted")
+            ) =>
+        {
+            Ok(None)
         }
         (Some("notLoaded"), None) => Ok(None),
         (Some("notLoaded"), Some(turn))
@@ -2172,6 +2188,84 @@ mod tests {
     }
 
     #[test]
+    fn queue_failed_runtime_starts_only_the_already_saved_submission() {
+        let (receipt, requests) = with_scripted_rpc(
+            vec![
+                (
+                    "thread/queue/add",
+                    json!({"result":{"queuedSubmission":{"id":"saved-submission"}}}),
+                ),
+                (
+                    "thread/read",
+                    json!({"result":{"thread":{"id":"thread-a","status":{"type":"systemError"}}}}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"result":{"data":[{"id":"failed-turn","status":"failed"}]}}),
+                ),
+                (
+                    "thread/queue/start",
+                    json!({"result":{"turn":{"id":"recovered-turn"}}}),
+                ),
+            ],
+            |backend| {
+                backend
+                    .queue_message(
+                        "thread-a",
+                        &[json!({"type":"text","text":"continue"})],
+                        "saved-user-id",
+                    )
+                    .unwrap()
+            },
+        );
+        assert_eq!(receipt.started_turn_id.as_deref(), Some("recovered-turn"));
+        assert_eq!(
+            requests[3]["params"]["queuedSubmissionId"],
+            "saved-submission"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "thread/queue/add")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn queue_failed_runtime_with_unproved_active_turn_keeps_submission_without_start() {
+        let (receipt, requests) = with_scripted_rpc(
+            vec![
+                (
+                    "thread/queue/add",
+                    json!({"result":{"queuedSubmission":{"id":"saved-submission"}}}),
+                ),
+                (
+                    "thread/read",
+                    json!({"result":{"thread":{"id":"thread-a","status":{"type":"systemError"}}}}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"result":{"data":[{"id":"live-turn","status":"inProgress"}]}}),
+                ),
+            ],
+            |backend| {
+                backend
+                    .queue_message(
+                        "thread-a",
+                        &[json!({"type":"text","text":"continue"})],
+                        "saved-user-id",
+                    )
+                    .unwrap()
+            },
+        );
+        assert_eq!(receipt.queued_submission_id, "saved-submission");
+        assert!(receipt.started_turn_id.is_none());
+        assert_eq!(receipt.start_error.unwrap().code, "active_turn_unavailable");
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
     fn queue_unknown_runtime_status_does_not_attempt_an_unverified_start() {
         let (receipt, requests) = with_scripted_rpc(
             vec![
@@ -2232,6 +2326,50 @@ mod tests {
         assert!(!requests
             .iter()
             .any(|request| request["method"] == "thread/queue/add"));
+    }
+
+    #[test]
+    fn steer_system_error_with_failed_turn_allows_a_new_turn_without_writing() {
+        let (active, requests) = with_scripted_rpc(
+            vec![
+                (
+                    "thread/read",
+                    json!({"result":{"thread":{"id":"thread-a","status":{"type":"systemError"}}}}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"result":{"data":[{"id":"failed-turn","status":"failed",
+                    "error":{"codexErrorInfo":"serverOverloaded","message":"Model is at capacity"}}]}}),
+                ),
+            ],
+            |backend| backend.active_turn_for_steer("thread-a").unwrap(),
+        );
+        assert_eq!(active, None);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["params"]["limit"], 1);
+        assert!(!requests.iter().any(|r| matches!(
+            r["method"].as_str(),
+            Some("turn/start" | "turn/steer" | "thread/queue/add")
+        )));
+    }
+
+    #[test]
+    fn steer_system_error_rejects_missing_active_or_ambiguous_turn_evidence() {
+        let thread = json!({"thread":{"id":"thread-a","status":{"type":"systemError"}}});
+        for page in [
+            json!({"data":[]}),
+            json!({"data":[{"id":"a","status":"inProgress"}]}),
+            json!({"data":[{"id":"a","status":"completed"}]}),
+            json!({"data":[{"status":"failed"}]}),
+            json!({"data":[{"id":"a","status":"failed"},{"id":"b","status":"failed"}]}),
+        ] {
+            assert_eq!(
+                native_active_turn_for_steer(&thread, &page)
+                    .unwrap_err()
+                    .code,
+                "active_turn_unavailable"
+            );
+        }
     }
 
     #[test]
