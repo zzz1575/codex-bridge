@@ -12,3 +12,6 @@
   installation. Signing credentials belong only in the ignored private configuration.
 - Test real server writes only against an explicitly isolated QA runtime. Public CI uses example
   configuration, unit tests, compilation and lint; it does not perform production acceptance.
+
+- Integrate completed task-branch work into the configured source branch before delivery. Record
+  the local commit and confirm the managed GitHub PR result when reporting publication.
