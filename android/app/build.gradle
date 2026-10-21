@@ -1,0 +1,103 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+    id 'org.jetbrains.kotlin.kapt'
+}
+def privateFile = rootProject.file('.private/access.json')
+// An example-only build is useful for unit tests and offline UI development.
+// Real server credentials stay in the ignored .private directory.
+def accessFile = privateFile.exists() ? privateFile : rootProject.file('config/access.example.json')
+def access = new JsonSlurper().parse(accessFile)
+def signing = new Properties()
+def signingFile = rootProject.file('.private/signing.properties')
+if (signingFile.exists()) signingFile.withInputStream { signing.load(it) }
+def hasReleaseSigning = signingFile.exists() && signing.getProperty('storeFile') &&
+    signing.getProperty('storePassword') && signing.getProperty('keyAlias') && signing.getProperty('keyPassword')
+android {
+    namespace 'com.y2yy.codex.mobile'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    defaultConfig {
+        applicationId 'com.y2yy.codex.mobile'
+        minSdk 28
+        targetSdk 35
+        versionCode 11
+        versionName '2.2.6'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        buildConfigField 'String', 'SERVER_URL', JsonOutput.toJson(access.url ?: '')
+        buildConfigField 'String', 'SERVER_USER', JsonOutput.toJson(access.user ?: '')
+        buildConfigField 'String', 'SERVER_PASSWORD', JsonOutput.toJson(access.password ?: '')
+    }
+    buildFeatures { buildConfig true; compose true }
+    signingConfigs {
+        personal {
+            storeFile rootProject.file(signing.getProperty('storeFile', '.private/release.jks'))
+            storePassword signing.getProperty('storePassword', '')
+            keyAlias signing.getProperty('keyAlias', 'release')
+            keyPassword signing.getProperty('keyPassword', '')
+        }
+    }
+    buildTypes {
+        debug { applicationIdSuffix '.debug'; versionNameSuffix '-debug' }
+        release {
+            if (hasReleaseSigning) signingConfig signingConfigs.personal
+            minifyEnabled false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+    packaging { resources.excludes += ['/META-INF/{AL2.0,LGPL2.1}'] }
+    lint { abortOnError true }
+}
+kapt { correctErrorTypes true }
+dependencies {
+    implementation platform('androidx.compose:compose-bom:2025.04.01')
+    implementation 'androidx.activity:activity-compose:1.10.1'
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.material:material-icons-extended'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.7'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'androidx.room:room-runtime:2.7.1'
+    implementation 'androidx.room:room-ktx:2.7.1'
+    kapt 'androidx.room:room-compiler:2.7.1'
+    implementation 'androidx.datastore:datastore-preferences:1.1.4'
+    implementation 'io.coil-kt:coil-compose:2.7.0'
+    implementation 'io.noties.markwon:core:4.6.2'
+    implementation 'io.noties.markwon:ext-tables:4.6.2'
+    implementation 'io.noties.markwon:ext-strikethrough:4.6.2'
+    implementation 'io.noties.markwon:linkify:4.6.2'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:rules:1.6.1'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation platform('androidx.compose:compose-bom:2025.04.01')
+    androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
+}
+tasks.named('preBuild') {
+    doFirst {
+        if (!access.url?.startsWith('https://')) {
+            throw new GradleException('An HTTPS server URL is required')
+        }
+    }
+}
+
+tasks.matching { it.name == 'preReleaseBuild' }.configureEach {
+    doFirst {
+        if (!privateFile.exists() || !access.user || !access.password) {
+            throw new GradleException('Copy config/access.example.json to .private/access.json and configure your own server before building a release')
+        }
+    }
+}

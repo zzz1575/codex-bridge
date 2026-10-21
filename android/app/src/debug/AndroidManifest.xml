@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Match MainActivity's launch-time IME mode for the Compose test host. -->
+        <activity android:name="androidx.activity.ComponentActivity"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+</manifest>

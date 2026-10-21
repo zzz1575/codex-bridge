@@ -1,3 +1,17 @@
+# Codex Bridge + Y2YY Native Android
+
+这是基于 [hitsmaxft/codex-bridge](https://github.com/hitsmaxft/codex-bridge) 的公开 Fork，
+保留上游历史与 MIT 许可证，并提供 Y2YY 的 Bridge 定制改动和原生 Android 客户端。
+
+- **Bridge 定制功能与兼容范围：**[Fork 说明](docs/y2yy-fork.md)
+- **原生 Android 源码、配置模板与构建：**[android/](android/README.md)
+- **原项目介绍与安装方式：**见下文；其中项目站点、演示与上游发布包仍属于原项目。
+
+本仓库只发布源码与占位配置。部署实例、登录信息、会话数据、个人签名密钥和含真实
+访问凭据的 APK 均不包含在内。
+
+---
+
 # Codex App Server WebUI for Homelab and NAS
 
 Access OpenAI Codex app-server from a responsive Web UI or CLI running on your homelab, NAS, Mac
