@@ -352,6 +352,43 @@ struct ComposerCache {
     thread_checks: Mutex<HashMap<String, Instant>>,
 }
 
+fn cached_composer_models(
+    cache: &ComposerCache,
+    load: impl FnOnce() -> Result<Vec<Value>, BackendFailure>,
+) -> Result<Vec<Value>, BackendFailure> {
+    if let Some(models) = cache
+        .models
+        .read()
+        .ok()
+        .and_then(|models| models.clone())
+        .filter(|models| !models.is_empty())
+    {
+        return Ok(models);
+    }
+    let models = load()?;
+    if models.is_empty() {
+        return Err(BackendFailure {
+            code: "composer_models_unavailable",
+            message:
+                "the app-server model catalogue is not ready; refresh before changing settings"
+                    .to_owned(),
+        });
+    }
+    if let Ok(mut cached) = cache.models.write() {
+        *cached = Some(models.clone());
+    }
+    Ok(models)
+}
+
+fn composer_models(state: &BridgeState) -> Result<Vec<Value>, BackendFailure> {
+    cached_composer_models(&state.composer_cache, || {
+        state
+            .write_backend
+            .app_server_rpc("model/list", json!({"limit": 100, "includeHidden": false}))
+            .map(|result| composer_model_options(&result))
+    })
+}
+
 fn refresh_thread_composer_settings(
     cache: &Arc<ComposerCache>,
     backend: &Arc<CodexCliBackend>,
@@ -9554,13 +9591,10 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             }
         }
         Request::ComposerOptions => {
-            let models = state
-                .composer_cache
-                .models
-                .read()
-                .ok()
-                .and_then(|models| models.clone())
-                .unwrap_or_default();
+            let models = match composer_models(state) {
+                Ok(models) => models,
+                Err(error) => return write_backend_error(error),
+            };
             Response::success(json!({"models": models}))
         }
         Request::SkillsList { thread_id } => {
@@ -10266,13 +10300,10 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     "model and effort must be non-empty and reasonably sized",
                 );
             }
-            let available = state
-                .composer_cache
-                .models
-                .read()
-                .ok()
-                .and_then(|models| models.clone())
-                .unwrap_or_default();
+            let available = match composer_models(state) {
+                Ok(models) => models,
+                Err(error) => return write_backend_error(error),
+            };
             if !model_supports(&available, &model, &effort) {
                 return Response::error(
                     "invalid_thread_settings",
@@ -17207,5 +17238,42 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
                 total_bytes: 0,
             }])
             .is_err());
+    }
+
+    #[test]
+    fn cold_model_cache_loads_real_capabilities_once_and_never_caches_empty_or_failed_catalogues() {
+        let cache = ComposerCache::default();
+        let expected = vec![json!({"id":"fixture-model","service_tiers":[{"id":"priority"}]})];
+        assert_eq!(
+            cached_composer_models(&cache, || Ok(expected.clone())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            cached_composer_models(&cache, || panic!("warm cache must avoid another RPC")).unwrap(),
+            expected
+        );
+
+        let retry = ComposerCache::default();
+        assert_eq!(
+            cached_composer_models(&retry, || Ok(Vec::new()))
+                .unwrap_err()
+                .code,
+            "composer_models_unavailable"
+        );
+        assert!(retry.models.read().unwrap().is_none());
+        assert_eq!(
+            cached_composer_models(&retry, || Err(BackendFailure {
+                code: "app_server_unavailable",
+                message: "fixture".to_owned()
+            }))
+            .unwrap_err()
+            .code,
+            "app_server_unavailable"
+        );
+        assert!(retry.models.read().unwrap().is_none());
+        assert_eq!(
+            cached_composer_models(&retry, || Ok(expected.clone())).unwrap(),
+            expected
+        );
     }
 }
