@@ -61,3 +61,5 @@ git merge upstream/main
 上游版权和 [MIT 许可证](../LICENSE) 保持原样。
 Y2YY 定制改动和原生 Android 源码同样按 MIT 发布；
 Android 版权声明见 [android/LICENSE](../android/LICENSE)。
+
+自动同步和上游合并规则见 [维护流程](../tools/maintenance/README.md)。

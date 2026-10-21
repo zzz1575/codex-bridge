@@ -3,3 +3,8 @@
 /_site/
 .DS_Store
 .env*
+
+# Source maintenance tooling
+__pycache__/
+*.pyc
+.maintenance-private/
