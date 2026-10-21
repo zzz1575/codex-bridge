@@ -1,7 +1,7 @@
 # Y2YY Codex Android
 
 原生 Kotlin / Jetpack Compose 客户端，通过 HTTPS 和 WebSocket 连接本仓库的
-Codex Bridge。当前源码版本 **2.2.7**，最低 Android 9 / API 28，目标 API 35。
+Codex Bridge。当前源码版本 **2.2.8**，最低 Android 9 / API 28，目标 API 35。
 
 ## 功能
 
@@ -10,6 +10,7 @@ Codex Bridge。当前源码版本 **2.2.7**，最低 Android 9 / API 28，目标
 - 默认跟进、显式排队、权威队列状态与单条撤回、停止执行。
 - 工具调用折叠、图片与工具图片查看、相册、相机、文件和剪贴板。
 - 原生审批、问题与 MCP 表单；会话重命名和项目移动。
+- 正确识别 `systemError` 异常状态，保留历史和未发送内容；继续原会话时沿用同一消息身份，避免重复提交。
 
 这是独立的原生客户端，不是 WebView。服务端协议扩展位于本 Fork；不能假定未包含
 这些扩展的上游 Bridge 与所有功能兼容。已验证的组合为本仓库 Bridge 0.3.13
@@ -64,9 +65,13 @@ cp config/signing.example.properties .private/signing.properties
 ## 验证范围
 
 JVM 测试不连接真实服务器，使用合成数据与 MockWebServer。
-本次公开源码已通过 166 项 JVM 测试（0 失败、0 跳过）、Debug 与设备测试包编译，
+本次公开源码已通过 174 项 JVM 测试（0 失败、0 跳过）、Debug 与设备测试包编译，
 以及 Debug lint（0 错误、9 项既有警告）。这些检查使用占位配置，未连接真实服务器。
 设备测试包编译成功不代表已在设备执行全部集成测试。
+
+2.2.8 的异常恢复回归在 Android 9 / API 28 和 Android 15 / API 35 模拟器上
+各通过 17 项界面、消息提交和本地存储测试。使用合成会话与回执，模拟器关闭网络，
+没有向实际业务会话发送消息；这不替代真实服务器或实体手机验收。
 
 大多数界面测试使用合成数据；`NativeNavigationTest` 会启动应用并读取其配置的服务。
 `LiveBridgeCompatibilityTest`、`ServiceTierIntegrationTest` 和 `LiveQuestionUiTest`
