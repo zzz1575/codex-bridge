@@ -244,7 +244,7 @@ test("submitted pasted text appears only as an attachment in demo history", asyn
 test("async clarification answers steer only into their originating turn", () => {
   assert.equal(asyncQuestionReplyMode("turn-a", "turn-a"), "steer");
   assert.equal(asyncQuestionReplyMode("turn-a", "turn-b"), "changed");
-  assert.equal(asyncQuestionReplyMode("turn-a", null), "new_turn");
+  assert.equal(asyncQuestionReplyMode("turn-a", null), "expired");
 });
 import { isLocalImagePath, localFilePath, localFileReference } from "../src/markdown.js";
 import { memoryCitationModel } from "../src/memory-citations.js";

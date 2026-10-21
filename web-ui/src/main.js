@@ -871,9 +871,20 @@ let asyncQuestionBusy = false;
 let renderedAsyncQuestionKey = null;
 
 function currentAsyncQuestion() {
-  return (asyncQuestionsByThread.get(state.current?.id) || []).find(
-    (entry) => !answeredAsyncQuestions.has(`${state.current.id}:${entry.item_id}`),
+  const threadId = state.current?.id;
+  if (!threadId || !state.activeTurnId || state.authoritativeThreadActive?.get(threadId) === false)
+    return null;
+  return (asyncQuestionsByThread.get(threadId) || []).find(
+    (entry) => entry.turn_id === state.activeTurnId &&
+      !answeredAsyncQuestions.has(`${threadId}:${entry.item_id}`),
   );
+}
+function finishAsyncQuestionTurn(threadId, turnId) {
+  if (!threadId || !turnId) return;
+  asyncQuestionStateVersion++;
+  const questions = asyncQuestionsByThread.get(threadId);
+  if (questions) asyncQuestionsByThread.set(threadId,
+    questions.filter((entry) => entry.turn_id !== turnId));
 }
 function renderAsyncQuestion() {
   const question = currentAsyncQuestion();
@@ -939,8 +950,8 @@ function renderAsyncQuestion() {
         ? tr("asyncQuestionChanged")
         : "";
   const submit = $("asyncQuestionSubmitBtn");
-  submit.textContent = tr(mode === "steer" ? "asyncQuestionSteer" : "asyncQuestionNewTurn");
-  submit.disabled = asyncQuestionBusy || !currentThreadWritable() || mode === "changed";
+  submit.textContent = tr("asyncQuestionSteer");
+  submit.disabled = asyncQuestionBusy || !currentThreadWritable() || mode !== "steer";
 }
 async function refreshAsyncQuestions(threadId) {
   const version = asyncQuestionStateVersion;
@@ -956,7 +967,7 @@ async function submitAsyncQuestion(event) {
   const threadId = state.current.id;
   requireCurrentThreadWriter();
   const mode = asyncQuestionReplyMode(question.turn_id, state.activeTurnId);
-  if (mode === "changed") return;
+  if (mode !== "steer") return;
   const fields = [...$("asyncQuestionFields").querySelectorAll("fieldset")];
   const answers = fields.map((field, index) => {
     const choice = field.querySelector(`input[name="async-question-${index}"]:checked`);
@@ -6567,6 +6578,7 @@ function handleBridgeEvent(event) {
     }
     renderProjects();
     renderTaskOverviews();
+    renderAsyncQuestion();
     return;
   }
   if (
@@ -6698,6 +6710,7 @@ function handleBridgeEvent(event) {
         threadId !== state.current?.id ||
         completionMatchesActiveTurn(state.activeTurnId, completedTurnId),
       runState = completedTurnRunState(params.turn);
+    finishAsyncQuestionTurn(threadId, completedTurnId);
     // An interrupted turn may complete after the queued input has already
     // started a successor turn. Never let that older completion clear the new
     // active turn or replace its green activity state with a terminal state.

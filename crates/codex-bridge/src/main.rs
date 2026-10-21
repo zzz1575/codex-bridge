@@ -7193,6 +7193,10 @@ fn list_async_questions(
     write_backend: &CodexCliBackend,
     thread_id: &str,
 ) -> Result<Vec<Value>, BackendFailure> {
+    let active_turn_id = write_backend.active_turn_for_steer(thread_id)?;
+    if active_turn_id.is_none() {
+        return Ok(Vec::new());
+    }
     let mut cursor = None::<String>;
     let mut seen_cursors = HashSet::new();
     let mut questions = Vec::new();
@@ -7240,7 +7244,25 @@ fn list_async_questions(
         }
         cursor = Some(next.to_owned());
     }
+    Ok(pending_async_questions(
+        questions,
+        &answered,
+        active_turn_id.as_deref(),
+    ))
+}
+
+fn pending_async_questions(
+    mut questions: Vec<Value>,
+    answered: &HashSet<String>,
+    active_turn_id: Option<&str>,
+) -> Vec<Value> {
+    let Some(active_turn_id) = active_turn_id else {
+        return Vec::new();
+    };
     questions.retain(|entry| {
+        if entry.get("turn_id").and_then(Value::as_str) != Some(active_turn_id) {
+            return false;
+        }
         let Some(item_id) = entry.get("item_id").and_then(Value::as_str) else {
             return false;
         };
@@ -7253,7 +7275,7 @@ fn list_async_questions(
             !answered.contains(&key)
         })
     });
-    Ok(questions)
+    questions
 }
 
 fn app_server_tools_for_messages(
@@ -11091,9 +11113,9 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Value::Array(replies)
             );
             let input = vec![json!({"type": "text", "text": reply_text})];
-            let active_turn = match session_store.active_turn_id(&thread_id) {
+            let active_turn = match write_backend.active_turn_for_steer(&thread_id) {
                 Ok(active) => active,
-                Err(error) => return backend_error(error),
+                Err(error) => return write_backend_error(error),
             };
             match mode.as_str() {
                 "steer" if active_turn.as_deref() == Some(turn_id.as_str()) => {
@@ -11106,22 +11128,16 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 }
                 "steer" => Response::error(
                     "question_turn_finished",
-                    "The question's turn is no longer active; choose a new turn explicitly",
+                    "The question's turn is no longer active; this prompt has expired",
                 ),
-                "new_turn" if active_turn.is_none() => {
-                    let client_id = format!("async-question-{item_id}");
-                    match write_backend.start_turn(&thread_id, &input, &client_id) {
-                        Ok(backend) => {
-                            Response::success(json!({"mode": "new_turn", "backend": backend}))
-                        }
-                        Err(error) => write_backend_error(error),
-                    }
-                }
                 "new_turn" => Response::error(
-                    "active_turn_changed",
-                    "Another turn is active; wait until it finishes",
+                    "question_turn_finished",
+                    "Expired questions cannot start a new turn; submit a new task explicitly",
                 ),
-                _ => Response::error("invalid_reply_mode", "Use steer or new_turn"),
+                _ => Response::error(
+                    "invalid_reply_mode",
+                    "Use steer for the originating active turn",
+                ),
             }
         }
         Request::AudioTranscribe { thread_id, audio } => {
@@ -17275,5 +17291,21 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             cached_composer_models(&retry, || Ok(expected.clone())).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn async_questions_expire_with_their_origin_and_never_replace_a_successor_prompt() {
+        let old =
+            json!({"item_id":"old-question","turn_id":"turn-a","questions":[{"title":"Old?"}]});
+        let current = json!({"item_id":"current-question","turn_id":"turn-b","questions":[{"title":"Current?"}]});
+        let answered = HashSet::new();
+        assert!(pending_async_questions(vec![old.clone()], &answered, None).is_empty());
+        assert_eq!(
+            pending_async_questions(vec![old, current.clone()], &answered, Some("turn-b")),
+            vec![current.clone()]
+        );
+        let answered =
+            HashSet::from([json!(["request_user_input_async", "current-question", 0]).to_string()]);
+        assert!(pending_async_questions(vec![current], &answered, Some("turn-b")).is_empty());
     }
 }
