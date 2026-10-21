@@ -78,6 +78,7 @@ import { renderRuntimeArchitecture } from "./runtime-architecture.js";
 import { taskOverview } from "./task-overview.js";
 import { toolOutputImageUrls } from "./tool-image.js";
 import { questionReplyNode, questionReplyPresentation } from "./question-reply-presentation.js";
+import { taskProgressNode, taskProgressPresentation } from "./task-progress.js";
 import { orderedTurnChildren, turnUsageHost } from "./turn-stack.js";
 import { trafficMonitor } from "./traffic-monitor.js";
 import { weeklyUsageBuckets } from "./weekly-usage-chart.js";
@@ -5055,6 +5056,31 @@ function messageNode(
     ),
     usageItems = content.filter((item) => item.kind === "turn_usage"),
     memoryItems = content.filter((item) => item.kind === "memory_citation");
+  const progress = ordinaryItems.length === 1 && ordinaryItems[0].kind === "text" && !m.tools?.length
+    ? taskProgressPresentation(ordinaryItems[0].text, m.role) : null;
+  if (progress) {
+    box.className = "message task-progress-message";
+    const card = taskProgressNode(progress),
+      key = `${threadId || ""}:task-progress:${messageIdentity(m)}`;
+    for (const [details, disclosureKey] of [[card, key], [card.querySelector(".task-progress-raw"), `${key}:raw`]]) {
+      details.open = state.expandedLongMessageIds.has(disclosureKey);
+      const summary = details.querySelector(":scope > summary");
+      summary.onclick = (event) => {
+        event.preventDefault();
+        preserveMessageElementPosition(summary, () => {
+          details.open = !details.open;
+          if (details.open) state.expandedLongMessageIds.add(disclosureKey);
+          else state.expandedLongMessageIds.delete(disclosureKey);
+        });
+      };
+    }
+    body.appendChild(card);
+    for (const item of usageItems) body.appendChild(contentNode(item, threadId));
+    if (memoryItems.length) body.appendChild(memoryCitationNode(memoryItems));
+    box.appendChild(body);
+    renderedMessageState.set(box, { signature: JSON.stringify(m), activeToolCallId });
+    return box;
+  }
   const questionReplyLabels = {
       question: tr("questionReplyQuestion"), answer: tr("questionReplyAnswer"),
     },
