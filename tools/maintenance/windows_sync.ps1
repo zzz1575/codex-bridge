@@ -17,7 +17,8 @@ try {
         $access = Get-Content -LiteralPath $accessPath -Raw | ConvertFrom-Json
         $privateValues = @($access.url, $access.password) | Where-Object { $_ -and $_.Length -ge 8 }
     }
-    $target = (& $settings.git -C $project rev-parse HEAD).Trim()
+    $sourceRef = if ($settings.source_ref) { $settings.source_ref } else { 'refs/heads/main' }
+    $target = (& $settings.git -C $project rev-parse "$($sourceRef)^{commit}").Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read source commit' }
     $files = @(& $settings.git -C $project ls-tree -r --name-only $target)
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read source commit' }

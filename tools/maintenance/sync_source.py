@@ -82,7 +82,7 @@ def sync(config, component):
     source_repo = Path(source["repo"])
     pending = entry.get("pending")
     if pending:
-        status = json.loads(gh(config, "pr", "view", str(pending["pr"]), "--repo", config["repository"], "--json", "state,mergedAt"))
+        status = json.loads(gh(config, "pr", "view", str(pending["pr"]), "--repo", config["repository"], "--json", "state,mergedAt,mergeStateStatus,autoMergeRequest"))
         if status["state"] == "MERGED":
             entry["synced_source"] = pending["source"]
             entry.pop("pending")
@@ -94,6 +94,8 @@ def sync(config, component):
     if target == entry["synced_source"]:
         return {"component": component, "status": "up-to-date"}
     if pending and pending["source"] == target:
+        if status.get("mergeStateStatus") == "BEHIND" and status.get("autoMergeRequest"):
+            gh(config, "pr", "update-branch", str(pending["pr"]), "--repo", config["repository"])
         return {"component": component, "status": "waiting-for-checks", "pr": pending["pr"]}
     delta = patch(source_repo, entry["synced_source"], target)
     repository = Path(config["publication_repo"])
@@ -165,6 +167,12 @@ def drain(config):
     root.mkdir(parents=True, exist_ok=True)
     with (root / "worker.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # A lightweight timer may invoke drain to reconcile already-open PRs. Do not
+        # repeatedly retry a blocked publication or scan/fetch idle components.
+        for component, entry in load(root / "state.json", {}).items():
+            status = load(root / (component + "-status.json"), {})
+            if entry.get("pending") and status.get("status") != "blocked":
+                request(config, component)
         for _ in range(10):
             requests = sorted((root / "requests").glob("*.request"))
             if not requests:
