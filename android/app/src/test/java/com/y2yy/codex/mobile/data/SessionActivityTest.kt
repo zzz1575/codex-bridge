@@ -181,6 +181,53 @@ class SessionActivityTest {
         }
     }
 
+    @Test fun nativeSystemErrorClearsStaleExecutionWithoutRemovingConversationOrAttachments() {
+        val original = StreamReducer.apply(fixture("worker"), ack())
+        for (status in listOf<Any>("systemError", JSONObject().put("type", "systemError"))) {
+            val event = JSONObject().put("type", "app_server").put("bridge_sequence", 20)
+                .put("message", JSONObject().put("method", "thread/status/changed")
+                    .put("params", JSONObject().put("threadId", "worker").put("status", status)))
+            val failed = StreamReducer.apply(original, event)
+            assertFalse(failed.running)
+            assertNull(failed.activeTurnId)
+            assertFalse("worker" in failed.activeSessionIds)
+            assertEquals("failed", failed.sessions.single { it.id == "worker" }.status)
+            assertEquals("执行失败", failed.activity)
+            assertSame(original.messages, failed.messages)
+            assertSame(original.attachments, failed.attachments)
+            assertEquals(original.selected, failed.selected)
+        }
+    }
+
+    @Test fun nativeSystemErrorReadAndReconnectSnapshotAgreeOnFailure() {
+        val original = StreamReducer.apply(fixture("worker"), ack())
+        val token = SessionActivity.capture(original, "worker", 25)
+        val read = SessionActivity.applyRead(original, token, SessionActivity.statusType(JSONObject().put("type", "systemError")))
+        val reconnect = StreamReducer.apply(original, JSONObject().put("type", "bridge_event_stream").put("status", "ready"))
+        val restored = StreamReducer.apply(reconnect, snapshot("systemError", 25))
+        for (failed in listOf(read, restored)) {
+            assertFalse(failed.running)
+            assertEquals("failed", failed.sessionRunStates["worker"]?.status)
+            assertEquals("执行失败", failed.activity)
+            assertSame(original.messages, failed.messages)
+        }
+    }
+
+    @Test fun recoveredTurnRemainsActiveWhenAnOldFailureOrCompletionArrives() {
+        val original = StreamReducer.apply(fixture("worker"), ack())
+        val failed = SessionActivity.applyRead(original, SessionActivity.capture(original, "worker", 20), "systemError")
+        val recovered = StreamReducer.apply(failed, ack("turn-recovered", 30))
+        val delayed = StreamReducer.apply(recovered, snapshot("systemError", 20))
+        assertEquals(recovered.sessionRunStates["worker"], delayed.sessionRunStates["worker"])
+        assertTrue(delayed.running)
+        assertEquals("turn-recovered", delayed.activeTurnId)
+        assertSame(original.messages, delayed.messages)
+        assertEquals(recovered, StreamReducer.apply(recovered, complete("turn-a", 35, "failed")))
+        assertTrue(recovered.running)
+        assertEquals("turn-recovered", recovered.activeTurnId)
+        assertSame(original.messages, recovered.messages)
+    }
+
     @Test fun malformedSnapshotsAndUnconfirmedReceiptsNeverFabricateExecution() {
         val original = fixture()
         assertEquals(original, StreamReducer.apply(original, JSONObject().put("type", "bridge_thread_activity_snapshot")))

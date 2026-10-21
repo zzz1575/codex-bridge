@@ -82,7 +82,7 @@ object SessionActivity {
         "active", "running", "inprogress", "in_progress", "started", "busy", "streaming" -> "active"
         "idle", "ready" -> "idle"
         "completed", "complete", "success", "succeeded", "done" -> "completed"
-        "failed", "failure", "error" -> "failed"
+        "failed", "failure", "error", "systemerror" -> "failed"
         "interrupted", "cancelled", "canceled", "stopped" -> "cancelled"
         else -> null
     }

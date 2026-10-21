@@ -37,7 +37,7 @@ class ComposerSubmissionTest {
     }
 
     @Test fun ownershipProtocolAndTimeoutErrorsDoNotReplayTheMutation() = runBlocking {
-        for (code in listOf("thread_writer_conflict", "thread_read_only", "app_server_timeout", "app_server_protocol_error", "request_failed")) {
+        for (code in listOf("thread_writer_conflict", "thread_read_only", "active_turn_unavailable", "app_server_timeout", "app_server_protocol_error", "request_failed")) {
             var calls = 0
             try {
                 ComposerSubmission.submit(submission(), "steer") { calls++; throw BridgeException(code, "rejected") }
@@ -45,6 +45,24 @@ class ComposerSubmissionTest {
             } catch (failure: BridgeException) { assertEquals(code, failure.code) }
             assertEquals(1, calls)
         }
+    }
+
+    @Test fun failedSessionRecoveryReusesTheSavedIdentityAndAcknowledgesOnlyTheExistingSubmission() = runBlocking {
+        val body = submission()
+        val seen = mutableListOf<JSONObject>()
+        val receipt = ComposerSubmission.submit(body) {
+            seen += it
+            if (seen.size == 1) throw BridgeException("no_active_turn", "native failed turn verified")
+            JSONObject().put("thread_id", "qa-thread").put("pending_id", "submission-a")
+                .put("status", "processing").put("turn_id", "recovered-turn")
+        }
+        assertEquals(listOf("steer", "send"), seen.map { it.getString("command") })
+        for (key in listOf("thread_id", "submission_id", "text", "attachments")) {
+            assertEquals(body.get(key).toString(), seen[0].get(key).toString())
+            assertEquals(body.get(key).toString(), seen[1].get(key).toString())
+        }
+        assertEquals("recovered-turn", receipt.getString("turn_id"))
+        assertFalse(body.has("command"))
     }
 
     @Test fun connectionLossDoesNotReplayAndFailedFallbackIsNotRetried() = runBlocking {
