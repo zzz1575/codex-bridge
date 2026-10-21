@@ -19,6 +19,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: python3 -m unittest discover -s tools/maintenance/tests -v
+      - run: pwsh -NoProfile -File tools/maintenance/tests/test_windows_source.ps1
       - run: python3 tools/maintenance/privacy.py --base origin/main
   bridge:
     name: Bridge
@@ -77,3 +78,24 @@ jobs:
             android/app/build/test-results/testDebugUnitTest/
             android/app/build/reports/lint-results-debug.*
           if-no-files-found: ignore
+  finalize:
+    name: Finalize Managed Sync
+    needs: [privacy, bridge, android]
+    if: >-
+      (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      contains(fromJSON('["sync/bridge","sync/android","automation/upstream"]'), github.head_ref || github.ref_name)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+      TESTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Merge only the tested managed PR, then refresh pending branches
+        run: python3 tools/maintenance/finalize_pr.py --repository "$GITHUB_REPOSITORY" --branch "$SOURCE_BRANCH" --tested-head "$TESTED_HEAD"

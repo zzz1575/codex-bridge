@@ -9,6 +9,7 @@ from unittest.mock import patch as mock_patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import privacy
 import sync_source
+import finalize_pr
 
 
 class MaintenanceTests(unittest.TestCase):
@@ -171,6 +172,59 @@ class MaintenanceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 sync_source.sync(config, 'bridge')
         self.assertEqual('older', sync_source.load(state / 'state.json', {})['bridge']['synced_source'])
+
+    def test_finalizer_rejects_unmanaged_branch(self):
+        with self.assertRaises(RuntimeError):
+            finalize_pr.finalize('example/fixture', 'feature/unrelated', 'tested')
+
+    def test_finalizer_cannot_merge_stale_checks(self):
+        replies = [b'[{"number":1}]', b'{"headRefOid":"newer","mergeStateStatus":"CLEAN","autoMergeRequest":{}}']
+        with mock_patch.object(finalize_pr, 'gh', side_effect=replies) as gh:
+            result = finalize_pr.finalize('example/fixture', 'sync/bridge', 'older')
+            self.assertEqual('stale-checks', result['status'])
+            self.assertEqual(2, gh.call_count)
+
+    def test_finalizer_honors_disabled_auto_merge(self):
+        replies = [b'[{"number":1}]', b'{"headRefOid":"tested","mergeStateStatus":"CLEAN","autoMergeRequest":null}']
+        with mock_patch.object(finalize_pr, 'gh', side_effect=replies) as gh:
+            self.assertEqual('auto-merge-not-requested', finalize_pr.finalize('example/fixture', 'sync/android', 'tested')['status'])
+            self.assertEqual(2, gh.call_count)
+
+    def test_finalizer_uses_exact_head_without_admin_bypass(self):
+        replies = [b'[{"number":1}]', b'{"headRefOid":"tested","mergeStateStatus":"CLEAN","autoMergeRequest":{"enabled":true}}', b'']
+        with mock_patch.object(finalize_pr, 'gh', side_effect=replies) as gh, mock_patch.object(finalize_pr, 'refresh_pending'):
+            self.assertEqual('merged', finalize_pr.finalize('example/fixture', 'sync/bridge', 'tested')['status'])
+            arguments = gh.call_args.args
+            self.assertIn('--match-head-commit', arguments)
+            self.assertNotIn('--admin', arguments)
+
+    def test_finalizer_refreshes_behind_branch_instead_of_merging(self):
+        replies = [b'[{"number":1}]', b'{"headRefOid":"tested","mergeStateStatus":"BEHIND","autoMergeRequest":{"enabled":true}}', b'', b'']
+        with mock_patch.object(finalize_pr, 'gh', side_effect=replies) as gh:
+            self.assertEqual('retesting-updated-branch', finalize_pr.finalize('example/fixture', 'sync/bridge', 'tested')['status'])
+            self.assertEqual('update-branch', gh.call_args_list[2].args[1])
+            self.assertEqual('workflow', gh.call_args_list[3].args[0])
+
+    def test_reconcile_polls_pending_pr_once(self):
+        repo = self.repo('scratch')
+        (repo / '.git/source-sync-owned').write_text('dedicated-publication-scratch')
+        state = self.root / 'state'
+        sync_source.atomic_json(state / 'state.json', {'bridge': {'synced_source': 'old', 'pending': {'source': 'new', 'pr': 7}}})
+        config = {'publication_repo': str(repo), 'state_dir': str(state), 'components': {'bridge': {'repo': str(self.root / 'source')}}}
+        with mock_patch.object(sync_source, 'sync', return_value={'component': 'bridge', 'status': 'waiting-for-checks'}) as sync:
+            sync_source.drain(config)
+            self.assertEqual(1, sync.call_count)
+
+    def test_reconcile_does_not_retry_blocked_publication(self):
+        repo = self.repo('scratch')
+        (repo / '.git/source-sync-owned').write_text('dedicated-publication-scratch')
+        state = self.root / 'state'
+        sync_source.atomic_json(state / 'state.json', {'bridge': {'synced_source': 'old', 'pending': {'source': 'new', 'pr': 7}}})
+        sync_source.atomic_json(state / 'bridge-status.json', {'status': 'blocked'})
+        config = {'publication_repo': str(repo), 'state_dir': str(state), 'components': {'bridge': {'repo': str(self.root / 'source')}}}
+        with mock_patch.object(sync_source, 'sync') as sync:
+            sync_source.drain(config)
+            sync.assert_not_called()
 
 
 if __name__ == '__main__':

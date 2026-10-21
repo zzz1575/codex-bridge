@@ -6,6 +6,7 @@
 ## 日常流程
 
 1. 在 Bridge 或 Android 的开发目录修改，完成相应验证后提交 Git。
+   工作树中的草稿分支需先按项目规则合入配置的源分支，再进入自动发布。
 2. 已安装的提交钩子异步通知独立同步服务。未提交的文件不会被上传。
 3. Bridge 从最后已合入的源码检查点计算增量；Windows 安卓端先固定提交快照，
    校验私人配置没有进入源码，再通过 SSH 传入服务器的私有源码库。
@@ -14,6 +15,8 @@
 5. 隐私检查通过后，更新 `sync/bridge` 或 `sync/android` 分支并创建 PR。
 6. `Privacy`、`Bridge`、`Android` 三项检查全部通过且分支与 `main` 同步后，自动合并。
    源码检查点只在确认 PR 已合并后推进。失败或冲突停留在 PR / 私有状态文件中。
+   受管理分支的 CI 收尾任务只合并已测试的精确提交，遵守主分支保护，不使用管理员绕过。
+   如果主分支在测试期间更新，则更新分支并重新测试，不能沿用旧结果。
 
 同步到仓库不代表已上线。部署仍需按独立发布流程处理。
 
@@ -46,8 +49,15 @@ GitHub Actions 页面使用 **Run workflow** 立即执行。GitHub 定时运行�
 - 用低优先级的 systemd oneshot 服务运行 `sync_source.py --config <private-config> drain`，
   用 path 单元监听 `state_dir/requests/*.request`。限制 CPU / 内存，把源目录设为只读。
   失败不会无限重试；修复后重新请求。
-- Bridge 提交钩子调用 `sync_source.py --config <private-config> request bridge`。
-  Windows 提交钩子通过隐藏的后台 PowerShell 进程执行 `windows_sync.ps1 -Config <private-config>`。
+- 显式设置服务用户、`HOME` 和 `GH_CONFIG_DIR`，让后台服务读取已授权的 GitHub 配置；
+  交互式 SSH 授权正常并不证明后台服务的认证环境相同。不要把 token 写入仓库或单元文件。
+- 可用低频 timer 每两分钟调用一次同一 `drain`，只跟踪已有待合入 PR、回收合入检查点。
+  空闲组件不执行 GitHub 请求或源码扫描；已阻塞的同步不会因 timer 无限重试。
+- Bridge 的 `post-commit` 和 `post-merge` 钩子调用
+  `sync_source.py --config <private-config> request bridge`，配置 `ref` 指向固定的源分支。
+  Windows 的两个同名钩子通过隐藏的后台 PowerShell 进程执行
+  `windows_sync.ps1 -Config <private-config>`；`source_ref` 默认为 `refs/heads/main`。
+  在草稿分支提交不会发布该草稿，合入源分支后会再次触发同步，包含 fast-forward 合并。
 - 保留已有提交钩子；不要覆盖已有钩子的逻辑。启用前先进行一次无改动同步验证。
 
 私有 `deny_values` / `private_json_files` 可以补充实际环境的秘密值检查。
@@ -68,6 +78,7 @@ GitHub Actions 页面使用 **Run workflow** 立即执行。GitHub 定时运行�
 
 ```sh
 python3 -m unittest discover -s tools/maintenance/tests -v
+pwsh -NoProfile -File tools/maintenance/tests/test_windows_source.ps1
 python3 tools/maintenance/privacy.py --base origin/main
 ```
 
