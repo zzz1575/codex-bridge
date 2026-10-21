@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
+import { taskProgressPresentation } from "../src/task-progress.js";
 import {
   questionReplyPresentation,
   questionReplyNode,
@@ -79,6 +80,7 @@ async function messageRenderer() {
     messageIdentity: (message) => message.id || `index-${message.message_index}`,
     tr: (key) => ({ questionReplyQuestion: "问题", questionReplyAnswer: "回答" })[key] || key,
     questionReplyPresentation,
+    taskProgressPresentation,
     questionReplyNode: (presentation, translated) =>
       questionReplyNode(presentation, translated, documentApi),
     contentNode: (item) => {
