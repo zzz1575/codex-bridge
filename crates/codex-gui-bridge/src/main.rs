@@ -193,9 +193,15 @@ fn app_server_urls(address: SocketAddr) -> (String, String) {
 /// Locate the `codex` binary bundled inside Codex Desktop, falling back to the
 /// PATH `codex` if the app bundle is not found.
 fn default_desktop_codex() -> Result<PathBuf> {
-    let bundled = PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex");
-    if bundled.exists() {
-        return Ok(bundled);
+    for path in [
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+    ] {
+        let bundled = PathBuf::from(path);
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
     }
     Ok(PathBuf::from("codex"))
 }

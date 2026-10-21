@@ -134,6 +134,10 @@ export function mergePendingSnapshot(remote, local, inFlightIds, options = {}) {
     return {
       ...value,
       ...(prior?.intent ? { intent: prior.intent } : {}),
+      ...(prior?.local_submission ? { local_submission: true } : {}),
+      ...(prior?.status === "accepted" && ["queueing", "steering"].includes(value.status)
+        ? { status: "accepted" }
+        : {}),
       ...(!queueAuthoritative && value.status === "queued" ? { queue_unverified: true } : {}),
     };
   });
@@ -161,9 +165,14 @@ export function mergePendingSnapshot(remote, local, inFlightIds, options = {}) {
     ...entries,
     ...local.filter(
       (entry) =>
-        entry.source === "web_optimistic" &&
-        inFlightIds.has(entry.id) &&
-        !retainedIds.has(entry.id),
+        scoped(entry) &&
+        !retainedIds.has(entry.id) &&
+        ((entry.source === "web_optimistic" && inFlightIds.has(entry.id)) ||
+          (entry.local_submission && entry.status !== "failed")),
+    ).map((entry) =>
+      queueAuthoritative && entry.local_submission && entry.status === "queued" && !inFlightIds.has(entry.id)
+        ? { ...entry, status: "accepted", queue_unverified: false }
+        : entry,
     ),
   ];
 }

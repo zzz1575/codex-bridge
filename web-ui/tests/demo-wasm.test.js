@@ -36,6 +36,64 @@ import { composerSelectionIsCurrent } from "../src/service-tier.js";
 import { appendLiveCommandText, commandOutputModel, isCommandTool } from "../src/command-output.js";
 import { LARGE_PASTE_CHARS, shouldAttachPastedText } from "../src/large-paste.js";
 import { orderedTurnChildren, turnUsageHost } from "../src/turn-stack.js";
+import { recentSidebarThreads } from "../src/project-state.js";
+import { createTrafficMonitor, monitoredJson } from "../src/traffic-monitor.js";
+
+test("Bridge traffic monitor is opt-in, bounded, and aggregates response bytes", async () => {
+  const values = new Map();
+  const monitor = createTrafficMonitor({
+    getItem: (key) => values.get(key),
+    setItem: (key, value) => values.set(key, value),
+  });
+  monitor.record("messages", 100);
+  assert.equal(monitor.snapshot().recent.length, 0);
+  monitor.setEnabled(true);
+  assert.deepEqual(await monitoredJson(new Response('{"name":"会话"}'), "json", monitor), {
+    name: "会话",
+  });
+  assert.equal(
+    monitor.snapshot().totals[0].bytes,
+    new TextEncoder().encode('{"name":"会话"}').byteLength,
+  );
+  monitor.record("messages", 100);
+  monitor.record("messages", 250);
+  monitor.record("events", 20);
+  assert.deepEqual(monitor.snapshot().totals[0], {
+    name: "messages",
+    count: 2,
+    bytes: 350,
+    maxBytes: 250,
+  });
+  for (let index = 0; index < 105; index++) monitor.record("events", index);
+  assert.equal(monitor.snapshot().recent.length, 100);
+  monitor.setEnabled(false);
+  monitor.record("messages", 1000);
+  assert.equal(monitor.snapshot().totals.find((item) => item.name === "messages").bytes, 350);
+  monitor.clear();
+  assert.deepEqual(monitor.snapshot().totals, []);
+});
+
+test("recent view keeps pinned sessions visible without duplicates or exceeding 50 rows", async () => {
+  const pinned = [{ id: "old-pin" }, { id: "recent-pin" }];
+  const recent = [
+    { id: "recent-pin" },
+    ...Array.from({ length: 60 }, (_, index) => ({ id: `r${index}` })),
+  ];
+  const view = recentSidebarThreads(recent, pinned);
+  assert.deepEqual(view.pinned, pinned);
+  assert.equal(view.pinned.length + view.recent.length, 50);
+  assert.equal(
+    view.recent.some((thread) => thread.id === "recent-pin"),
+    false,
+  );
+  const source = await readFile(mainScriptPath, "utf8");
+  const pinLoad = source.slice(
+    source.indexOf("async function loadPins()"),
+    source.indexOf("async function loadProjectThreads"),
+  );
+  assert.doesNotMatch(pinLoad, /if \(!state\.directAppServer\)/);
+  assert.match(source, /Promise\.all\(\[loadStatus\(\), loadInitialView\(\)\]\)/);
+});
 
 test("floating prompts stay scoped to their item and reject snapshots older than live events", () => {
   const goal = { createdAt: "2026-10-10T00:00:00Z", objective: "Current goal" };
@@ -295,6 +353,34 @@ const wasmPath = new URL(
 );
 const stylesheetPath = new URL("../src/styles.css", import.meta.url);
 const mainScriptPath = new URL("../src/main.js", import.meta.url);
+
+test("goal trigger messages render as a single-line disclosure outside user bubbles", async () => {
+  const [source, stylesheet] = await Promise.all([
+    readFile(mainScriptPath, "utf8"),
+    readFile(stylesheetPath, "utf8"),
+  ]);
+  const contentRenderer = source.slice(
+    source.indexOf("function contentNode"),
+    source.indexOf("const markdownImagePreviewCache"),
+  );
+  const messageRenderer = source.slice(
+    source.indexOf("function messageNode"),
+    source.indexOf("function settleHorizontalPosition"),
+  );
+  assert.match(contentRenderer, /item\.kind === "goal"/);
+  assert.match(contentRenderer, /goal-trigger-content/);
+  assert.match(contentRenderer, /goal-trigger-preview/);
+  assert.match(messageRenderer, /m\.goal_trigger/);
+  assert.match(
+    messageRenderer,
+    /!m\.goal_trigger && \(m\.role === "assistant" \|\| m\.role === "user"\)/,
+  );
+  assert.match(
+    stylesheet,
+    /\.goal-trigger-preview\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
+  );
+  assert.match(stylesheet, /\.message\.goal-trigger \.message-head\s*\{[^}]*display:\s*none;/s);
+});
 const apiScriptPath = new URL("../src/api.js", import.meta.url);
 const indexPath = new URL("../index.html", import.meta.url);
 
@@ -873,7 +959,26 @@ test("new session starts above pinned sessions and chooses from project history"
   assert.match(source, /if \(project\) return showCreateMode\(project\)/);
   assert.match(stylesheet, /\.project-head\s*\{[^}]*display:\s*flex;/s);
   assert.match(stylesheet, /\.project-add\s*\{[^}]*width:\s*30px;/s);
-  assert.match(stylesheet, /\.session-create-button\s*\{[^}]*width:\s*100%;/s);
+  assert.match(stylesheet, /\.session-create-button\s*\{[^}]*flex:\s*1;/s);
+});
+
+test("recent session view uses the newest 50 sessions and keeps project view separate", async () => {
+  const command = await demoClient();
+  const recent = result(command({ command: "ls", limit: 50, include_archived: false }));
+  assert.ok(recent.threads.length > 0);
+  assert.ok(recent.threads.length <= 50);
+  assert.deepEqual(
+    recent.threads.map((thread) => thread.updated_at_ms),
+    [...recent.threads.map((thread) => thread.updated_at_ms)].sort((a, b) => b - a),
+  );
+  const [html, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.match(html, /id="createSessionBtn"[\s\S]*id="sessionViewBtn"[\s\S]*id="projects"/);
+  assert.match(source, /command: "ls", limit: 50, include_archived: includeArchived/);
+  assert.match(source, /recentSidebarThreads\([\s\S]*state\.recentThreads\.filter/);
+  assert.match(source, /\$\("reloadBtn"\)\.onclick = \(\) => window\.location\.reload\(\)/);
 });
 
 test("compiled demo WASM supports refresh and active-run interruption", async () => {
@@ -882,6 +987,9 @@ test("compiled demo WASM supports refresh and active-run interruption", async ()
   assert.equal(status.demo, true);
   const windows = result(command({ command: "token_usage_windows" }));
   assert.ok(windows.thirty_days.total_tokens > windows.seven_days.total_tokens);
+  const weeklyHistory = result(command({ command: "weekly_usage_history" }));
+  assert.ok(weeklyHistory.samples.length >= 48);
+  assert.ok(weeklyHistory.samples.every((sample) => sample.remaining_percent >= 0));
   assert.equal(status.managed_services.codex_gui.stdio_app_server_count, 0);
   assert.equal(status.managed_services.app_server.status.running, true);
   assert.equal(status.managed_services.whisper.fallback, true);
@@ -1217,13 +1325,52 @@ test("task overview uses the demo server's latest input and final response", asy
   assert.match(index, /id="tasksBtn"/);
   assert.match(index, /id="tasksDialog"[\s\S]*?id="tasksList"/);
   assert.match(source, /limit: 20/);
-  assert.match(source, /setInterval\(\(\) => refreshTaskOverviews\(\)/);
+  assert.match(source, /scheduleTasksFallback\(\)/);
+  assert.match(source, /state\.eventStreamConnected \? 15_000 : 5000/);
+  assert.doesNotMatch(source, /setInterval\(\(\) => refreshTaskOverviews\(\)/);
   assert.match(source, /message \$\{className\} task-message/);
   assert.doesNotMatch(source, /task-message-label/);
   assert.match(source, /text\.length > 360 \|\| text\.split\("\\n"\)\.length > 8/);
   assert.match(stylesheet, /\.task-message\.collapsible:not\(\.expanded\) \.message-body/);
   const taskEntryStyle = stylesheet.match(/\.task-entry\s*\{[^}]*\}/s)?.[0] || "";
   assert.doesNotMatch(taskEntryStyle, /border|background/);
+});
+
+test("task overview fallback runs only while its panel is visible", async () => {
+  const source = await readFile(mainScriptPath, "utf8"),
+    fallbackSource = source.slice(
+      source.indexOf("function scheduleTasksFallback()"),
+      source.indexOf("async function refreshTaskOverviews("),
+    ),
+    timers = new Map(),
+    state = { tasksOpen: false, eventStreamConnected: true },
+    document = { hidden: false };
+  let nextTimer = 0;
+  const context = {
+    state,
+    document,
+    setTimeout: (callback, delay) => {
+      const id = ++nextTimer;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  runInNewContext(
+    `let tasksFallbackTimer = null;\n${fallbackSource}\nglobalThis.scheduleFallback = scheduleTasksFallback;`,
+    context,
+  );
+  context.scheduleFallback();
+  assert.equal(timers.size, 0);
+  state.tasksOpen = true;
+  context.scheduleFallback();
+  assert.equal([...timers.values()][0].delay, 15_000);
+  state.eventStreamConnected = false;
+  context.scheduleFallback();
+  assert.equal([...timers.values()][0].delay, 5000);
+  document.hidden = true;
+  context.scheduleFallback();
+  assert.equal(timers.size, 0);
 });
 
 test("mobile composer stays out of the message grid and catches its own pointer input", async () => {
@@ -1308,7 +1455,66 @@ test("browser performance samples use the bounded demo protocol", async () => {
   );
   assert.equal(response.recorded, true);
   const api = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
-  assert.match(api, /window\.setInterval\(\(\) => flushPerformance\(\), 15_000\)/);
+  assert.match(api, /performanceBuckets\.set\(metric, bucket\);\s*schedulePerformanceFlush\(\)/);
+  assert.doesNotMatch(api, /setInterval\(\(\) => flushPerformance\(\)/);
+});
+
+test("performance reporting sleeps when there are no samples or the tab is hidden", async () => {
+  const source = await readFile(new URL("../src/api.js", import.meta.url), "utf8"),
+    performanceSource = [
+      source.slice(
+        source.indexOf("const performanceBuckets = new Map();"),
+        source.indexOf("export async function uploadComposerFile("),
+      ),
+      source.slice(
+        source.indexOf("export function recordPerformance("),
+        source.indexOf("export async function command("),
+      ),
+    ]
+      .join("\n")
+      .replaceAll("export async function", "async function")
+      .replaceAll("export function", "function"),
+    timers = new Map(),
+    listeners = new Map(),
+    requests = [];
+  let timerId = 0;
+  const context = {
+    Map,
+    Number,
+    Math,
+    document: {
+      hidden: false,
+      addEventListener: (name, listener) => listeners.set(name, listener),
+    },
+    window: {
+      setTimeout: (callback) => {
+        const id = ++timerId;
+        timers.set(id, callback);
+        return id;
+      },
+      clearTimeout: (id) => timers.delete(id),
+    },
+    command: async (request) => requests.push(request),
+  };
+  runInNewContext(
+    `${performanceSource}\nglobalThis.recordPerformance = recordPerformance;`,
+    context,
+  );
+  assert.equal(timers.size, 0);
+  context.recordPerformance("messages_render", 4);
+  assert.equal(timers.size, 1);
+  const flush = [...timers.values()][0];
+  timers.clear();
+  flush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.equal(timers.size, 0);
+  context.document.hidden = true;
+  context.recordPerformance("messages_render", 3);
+  assert.equal(timers.size, 0);
+  context.document.hidden = false;
+  listeners.get("visibilitychange")();
+  assert.equal(timers.size, 1);
 });
 
 test("steer messages use a distinct bean-green outbox palette", async () => {
@@ -1674,7 +1880,7 @@ test("message refresh preserves stable nodes and viewport anchors", async () => 
   assert.match(restoreView, /setMessageScrollTop\(view\.top\)/);
   const reconcile = source.slice(
     source.indexOf("function reconcileMessageNodes"),
-    source.indexOf("function pendingNode"),
+    source.indexOf("function clearMessageTimeline"),
   );
   assert.doesNotMatch(reconcile, /replaceChildren/);
 });
@@ -1989,7 +2195,7 @@ test("mobile tail lock covers asynchronous layout changes", async () => {
   const source = await readFile(mainScriptPath, "utf8");
   assert.match(
     source,
-    /new MutationObserver\(\(\) => \{[\s\S]*?scheduleMessageTailLock\(\);[\s\S]*?updateTurnNavigation\(\);/,
+    /new MutationObserver\(\(\) => \{\s*scheduleMessageLayoutSync\(\);[\s\S]*?function scheduleMessageLayoutSync\(\) \{[\s\S]*?scheduleMessageTailLock\(\);[\s\S]*?scheduleTurnNavigationUpdate\(\);/,
   );
   assert.match(source, /event\.target instanceof HTMLImageElement/);
   assert.match(
@@ -1998,6 +2204,31 @@ test("mobile tail lock covers asynchronous layout changes", async () => {
   );
   assert.match(source, /view\.intentVersion !== messageScrollIntentVersion/);
   assert.match(source, /fullscreen: isHistoryFullscreen\(\)/);
+});
+
+test("message mutation bursts perform one layout pass per frame", async () => {
+  const source = await readFile(mainScriptPath, "utf8"),
+    scheduler = source.slice(
+      source.indexOf("let messageLayoutFrame = 0;"),
+      source.indexOf('messageLayoutMutationObserver.observe($("messages")'),
+    ),
+    frames = [],
+    calls = { messages: 0, tail: 0, navigation: 0 },
+    context = {
+      requestAnimationFrame: (callback) => frames.push(callback),
+      syncLongMessages: () => calls.messages++,
+      scheduleMessageTailLock: () => calls.tail++,
+      scheduleTurnNavigationUpdate: () => calls.navigation++,
+    };
+  runInNewContext(`${scheduler}\nglobalThis.scheduleLayout = scheduleMessageLayoutSync;`, context);
+  context.scheduleLayout();
+  context.scheduleLayout();
+  context.scheduleLayout();
+  assert.equal(frames.length, 1);
+  frames.shift()();
+  assert.deepEqual(calls, { messages: 1, tail: 1, navigation: 1 });
+  context.scheduleLayout();
+  assert.equal(frames.length, 1);
 });
 
 test("the hidden tools drawer cannot retain focus after it closes", async () => {
@@ -2191,6 +2422,55 @@ test("authoritative pending refresh removes consumed steer without losing an in-
   assert.deepEqual(mergePendingSnapshot([], local, new Set()), []);
   const confirmed = { id: inFlight.id, source: "bridge", status: "accepted" };
   assert.deepEqual(mergePendingSnapshot([confirmed], local, new Set([inFlight.id])), [confirmed]);
+});
+
+test("accepted local input stays visible until its matching history message arrives", async () => {
+  const local = {
+    id: "submit-1",
+    thread_id: "thread-1",
+    text: "Please check the model",
+    action: "steer",
+    status: "steering",
+    source: "web_optimistic",
+    local_submission: true,
+    after_message_index: 4,
+  };
+  const remote = { ...local, source: "bridge", status: "accepted" };
+  const accepted = mergePendingSnapshot([remote], [local], new Set());
+  assert.equal(accepted[0].local_submission, true);
+  assert.equal(accepted[0].status, "accepted");
+  assert.equal(
+    mergePendingSnapshot([{ ...remote, status: "steering" }], accepted, new Set())[0].status,
+    "accepted",
+  );
+  assert.deepEqual(mergePendingSnapshot([], accepted, new Set()), accepted);
+  assert.equal(
+    mergePendingSnapshot([], [{ ...accepted[0], status: "queued" }], new Set())[0].status,
+    "accepted",
+  );
+  assert.deepEqual(
+    reconcilePendingMessages(accepted, [
+      {
+        id: "submit-1",
+        message_index: 5,
+        role: "user",
+        content: [{ kind: "text", text: "Please check the model" }],
+      },
+    ]),
+    [],
+  );
+
+  const [html, source] = await Promise.all([
+    readFile(indexPath, "utf8"),
+    readFile(mainScriptPath, "utf8"),
+  ]);
+  assert.ok(html.indexOf('id="outboxTray"') < html.indexOf('class="composer"'));
+  const renderer = source.slice(
+    source.indexOf("function reconcileMessageNodes"),
+    source.indexOf("function clearMessageTimeline"),
+  );
+  assert.match(renderer, /nodes\.push\(\$\("outboxTray"\)\)/);
+  assert.match(source, /function clearMessageTimeline\(\)/);
 });
 
 test("completed turns collapse by server turn id and preserve the full expansion", async () => {
@@ -2724,7 +3004,7 @@ test("queued messages expose withdraw and convert-to-steer actions", async () =>
   assert.match(withdrawFlow, /refreshPending\(\{ preserveOptimistic: false \}\)/);
   assert.match(
     source,
-    /state\.eventStreamConnected &&\s*\(?state\.pending\.some\(\(entry\) => entry\.thread_id === state\.current\?\.id\)/,
+    /function schedulePendingFallback\(reset = false\)[\s\S]*?state\.eventStreamConnected[\s\S]*?state\.pending\.some\(\(entry\) => entry\.thread_id === state\.current\?\.id\)/,
   );
   const convertFlow = source.slice(
     source.indexOf("async function convertPendingToSteer"),
@@ -2973,6 +3253,19 @@ test("turn menu opens an identified full-screen temporary conversation", async (
   );
   assert.equal(turn.turn_id, "demo-temporary-turn");
   assert.match(turn.demo_reply, /in-memory temporary branch/);
+});
+
+test("tool group summary demo returns a concise answer", async () => {
+  const command = await demoClient();
+  const completed = result(
+    command({
+      command: "tool_group_summarize",
+      thread_id: "demo-thread-web-ui",
+      message_index: 2,
+    }),
+  );
+  assert.equal(completed.status, "completed");
+  assert.match(completed.text, /inspected the project/);
 });
 
 test("failed Temp creation leaves the main composer untouched", async () => {
@@ -3406,6 +3699,7 @@ test("a command timeout also covers a stalled response body", async () => {
   const context = {
     authenticate: async () => {},
     demoMode: false,
+    monitoredJson: (response) => response.json(),
     AbortController,
     window: {
       setTimeout: (callback) => setTimeout(callback, 0),
@@ -3451,9 +3745,11 @@ test("a slow history page does not delay writer or queue state", async () => {
     $: (id) => ({ textContent: "", id }),
     renderAsyncQuestion: () => {},
     serverRequestTray: { render: () => {} },
+    scheduleActivityFallback: () => {},
     applyThreadWriterLock: (lock) => locks.push(lock.state),
     syncTemporaryForCurrent: () => {},
     resetThreadViewState: () => {},
+    setTimeout: () => 0,
     refreshComposerStatus: async () => {},
     renderPending: () => {},
     renderProjects: () => {},

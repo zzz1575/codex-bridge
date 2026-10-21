@@ -3,6 +3,7 @@ export function sendFileUpload(
   encodedName,
   onProgress,
   createRequest = () => new XMLHttpRequest(),
+  onResponse = () => {},
 ) {
   return new Promise((resolve, reject) => {
     const request = createRequest();
@@ -17,6 +18,7 @@ export function sendFileUpload(
       }
     };
     request.onload = () => {
+      onResponse(new TextEncoder().encode(request.responseText || "").byteLength, request.status);
       if (request.status < 200 || request.status >= 300) {
         const error = new Error(request.responseText || `upload failed (${request.status})`);
         error.status = request.status;

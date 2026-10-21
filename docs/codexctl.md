@@ -48,7 +48,8 @@ focus.
 | `status`              | Show daemon, protocol, and rollout-store status        | Implemented          |
 | `show`                | Read user and assistant messages                       | Implemented          |
 | `relocate`            | Change an existing session's working directory         | Implemented          |
-| `send`                | Queue a new turn with `codex queue`                    | Implemented          |
+| `thread rename`       | Rename an existing session                              | Implemented          |
+| `send`                | Submit a turn and automatically start it when the session is idle | Implemented |
 | `steer`               | Add guidance to the active turn through app-server     | Implemented          |
 | `interrupt`           | Interrupt the active turn through app-server           | Implemented          |
 | `host-exec`           | Run an allowlisted host command in the task workspace  | Implemented          |
@@ -86,6 +87,7 @@ codexctl show
 codexctl show --last 20
 codexctl show <THREAD_ID> --json
 codexctl --thread <THREAD_ID> show --last 50
+codexctl --thread <THREAD_ID> thread rename "Keyboard design"
 ```
 
 `ls` and `show` read `$CODEX_HOME/sessions` and `session_index.jsonl` without resuming a task or
@@ -138,9 +140,8 @@ codexctl --thread <THREAD_ID> steer "Keep the public API backward compatible"
 codexctl --thread <THREAD_ID> interrupt --json
 ```
 
-`send` invokes `codex queue --thread ID --message TEXT`. The daemon uses the Codex executable from
-`--codex-bin`, then `CODEX_BRIDGE_CODEX_BIN`, then the CLI bundled in `ChatGPT.app` when present,
-and finally `codex` on `PATH`.
+`send` automatically continues delivery after the current run finishes. A `queued` receipt means
+the message is waiting; `accepted` means its turn started. Use `--json` for the submission status.
 
 `steer` and `interrupt` connect to the configured app-server WebSocket-over-Unix-socket endpoint.
 The daemon initializes that connection, obtains the active turn from the rollout, and sends the

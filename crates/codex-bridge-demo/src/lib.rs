@@ -982,6 +982,23 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "thirty_days": {"total_tokens": 534_900, "input_tokens": 401_000, "output_tokens": 133_900, "cached_input_tokens": 189_000},
             "updated_at": 0
         }),
+        "weekly_usage_history" => {
+            let now = request
+                .get("now_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(1_790_000_000);
+            let samples = (0..=56)
+                .map(|index| {
+                    json!({
+                        "observed_at": now.saturating_sub((56 - index) * 3 * 60 * 60),
+                        "remaining_percent": 82 - index / 3,
+                        "resets_at": now + 2 * 24 * 60 * 60,
+                        "error_code": null,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({"samples": samples})
+        }
         "status" => json!({
             "service": "codex-bridge-demo",
             "status": "ready",
@@ -1013,6 +1030,24 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "selected_thread_id": PRIMARY_THREAD,
             "write_backend": {"app_server_available": true, "app_server_mode": "demo_wasm", "standalone_fallback": false}
         }),
+        "ls" => {
+            let mut threads = vec![state.thread(PRIMARY_THREAD), state.thread(SECONDARY_THREAD)];
+            threads.extend(state.created_threads.values().cloned());
+            threads.sort_by(|left, right| {
+                right["updated_at_ms"]
+                    .as_u64()
+                    .cmp(&left["updated_at_ms"].as_u64())
+            });
+            let available = threads.len();
+            threads.truncate(
+                request
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(50)
+                    .min(50) as usize,
+            );
+            json!({"source": "demo_wasm", "returned": threads.len(), "available": available, "threads": threads})
+        }
         "project_initialize" => return initialize_demo_project(&request, state),
         "projects" => {
             let mut projects = vec![
@@ -1151,6 +1186,10 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                     "tool_calls": 3,
                     "total_duration_ms": 45000,
                     "total_tokens": 14472,
+                    "model_usage": {
+                        "gpt-6-sol": {"total_tokens": 12840, "input_tokens": 11200, "cached_input_tokens": 7000, "output_tokens": 1640},
+                        "gpt-6-luna": {"total_tokens": 1632, "input_tokens": 1248, "cached_input_tokens": 612, "output_tokens": 384}
+                    },
                     "input_tokens": 12448,
                     "cached_input_tokens": 7612,
                     "output_tokens": 2024
@@ -1525,6 +1564,10 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "thread_id": thread_id,
             "turn_id": request.get("turn_id"),
             "backend": "demo_wasm",
+        }),
+        "tool_group_summarize" => json!({
+            "status": "completed",
+            "text": "This group inspected the project and updated the requested files. Probe and git inspection steps were incidental.",
         }),
         "thread_create_start" => {
             let tier = match demo_service_tier(&request, "standard", "gpt-5.6-sol") {

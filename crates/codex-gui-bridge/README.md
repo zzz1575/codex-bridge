@@ -40,7 +40,7 @@ Desktop connection maps to one upstream Unix-socket connection. The Desktop
 still sends `initialize` and every later request itself.
 
 The upstream process is
-`/Applications/ChatGPT.app/Contents/Resources/codex app-server`; the standalone
+`/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server`; the standalone
 package under `~/.codex/packages/standalone` is not required. Both Desktop and
 `codex-bridge` use the same explicit bundled socket, preserving one
 thread/writer boundary.
@@ -93,7 +93,7 @@ application signature.
 Start the ChatGPT.app bundled app-server on the private bridge socket:
 
 ```sh
-/Applications/ChatGPT.app/Contents/Resources/codex app-server \
+/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server \
   --listen "unix://$HOME/.codex-bridge/bundled-app-server.sock"
 ```
 
@@ -145,7 +145,7 @@ The accepted machine uses three user LaunchAgents. launchd does not expand
 
 | Label                              | Role                                                       | Important settings                                                                                               |
 | ---------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `com.lunghaa.codex-app-server`     | Keeps the bundled app-server alive                         | Runs `/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen unix://.../bundled-app-server.sock` |
+| `com.lunghaa.codex-app-server`     | Keeps the bundled app-server alive                         | Runs the executable in `codex-cli/CodexCLI.app/Contents/MacOS` with `app-server --listen unix://.../bundled-app-server.sock` |
 | `com.lunghaa.ws-unix-bridge`       | Keeps the transparent adapter alive                        | Forwards `127.0.0.1:18790` to the bundled socket                                                                 |
 | `com.lunghaa.codex-app-server-env` | Injects the Desktop transport into the user launchd domain | Sets the WebSocket URL and unsets the local-daemon flag                                                          |
 
@@ -324,7 +324,7 @@ not use the managed standalone daemon and is not part of Solution B:
 
 ```sh
 codex-gui-bridge \
-  --codex-bin /Applications/ChatGPT.app/Contents/Resources/codex
+  --codex-bin /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex
 ```
 
 The daemon prints the capability-bearing `CODEX_APP_SERVER_WS_URL` and the

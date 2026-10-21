@@ -27,3 +27,4 @@ serde_json.workspace = true
 tokio.workspace = true
 tungstenite.workspace = true
 toml.workspace = true
+webauthn-rs.workspace = true

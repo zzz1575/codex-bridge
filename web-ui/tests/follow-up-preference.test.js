@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { sendWithExplicitNewTurnFallback } from "../src/pending-state.js";
 
 const source = fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
 function functionSource(start, end) {
@@ -33,6 +34,8 @@ function composer({ mode = "steer", active = false, writable = true, respond } =
     state,
     $: (id) => elements[id],
     voiceRecorder: null,
+    createdDraftSettings: new Map(),
+    sendWithExplicitNewTurnFallback,
     pendingInputSummary: (text) => text,
     newSubmissionId: () => "submission-fixture",
     currentThreadWritable: () => writable,
@@ -89,7 +92,8 @@ test("idle follow-up waits for authoritative no-active-turn before starting work
   assert.equal(c.requests[0].submission_id, c.requests[1].submission_id);
   assert.equal(c.elements.sendMode.value, "steer");
   assert.equal(c.state.pending[0].action, "queue");
-  assert.deepEqual(c.actions, ["steer", "queue"]);
+  assert.deepEqual(c.actions, ["steer", "queue", "queue"]);
+  assert.equal(c.state.pending[0].status, "accepted");
   assert.deepEqual(c.modeChanges, []);
 });
 

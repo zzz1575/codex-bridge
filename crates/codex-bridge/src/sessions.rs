@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -729,7 +729,7 @@ pub struct MessagePage {
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageReadProfile {
     pub cache: &'static str,
     pub rollout_bytes: u64,
@@ -737,7 +737,7 @@ pub struct MessageReadProfile {
     pub statistics: ThreadStatistics,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadStatistics {
     pub turns: u64,
     pub completed_turns: u64,
@@ -750,6 +750,10 @@ pub struct ThreadStatistics {
     pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
+    #[serde(default)]
+    pub model_usage: BTreeMap<String, TokenUsageBreakdown>,
+    #[serde(skip)]
+    active_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -783,6 +787,40 @@ impl TokenUsageBreakdown {
         self.reasoning_output_tokens = self
             .reasoning_output_tokens
             .saturating_add(other.reasoning_output_tokens);
+    }
+}
+
+impl ThreadStatistics {
+    fn record_token_usage(&mut self, current: TokenUsageBreakdown) {
+        let previous = TokenUsageBreakdown {
+            total_tokens: self.total_tokens,
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_output_tokens: self.reasoning_output_tokens,
+        };
+        let delta = if current.total_tokens < previous.total_tokens {
+            current
+        } else {
+            current.since(previous)
+        };
+        if delta.total_tokens > 0 {
+            self.model_usage
+                .entry(
+                    self.active_model
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                )
+                .or_default()
+                .add(delta);
+        }
+        self.total_tokens = current.total_tokens;
+        self.input_tokens = current.input_tokens;
+        self.cached_input_tokens = current.cached_input_tokens;
+        self.cache_write_input_tokens = current.cache_write_input_tokens;
+        self.output_tokens = current.output_tokens;
+        self.reasoning_output_tokens = current.reasoning_output_tokens;
     }
 }
 
@@ -1896,7 +1934,7 @@ impl SessionStore {
                             cache: "memory_hit",
                             rollout_bytes: file_len,
                             ordinal_repair_required: entry.ordinal_repair_required,
-                            statistics: entry.statistics,
+                            statistics: entry.statistics.clone(),
                         },
                     ));
                 }
@@ -1931,7 +1969,7 @@ impl SessionStore {
             entry.used_at = Instant::now();
             let messages = entry.messages.clone();
             let ordinal_repair_required = entry.ordinal_repair_required;
-            let statistics = entry.statistics;
+            let statistics = entry.statistics.clone();
             self.insert_message_cache(path, entry);
             return Ok((
                 messages,
@@ -1980,7 +2018,7 @@ impl SessionStore {
                 pending_turn,
                 expected_ordinal,
                 ordinal_repair_required,
-                statistics,
+                statistics: statistics.clone(),
             },
         );
         Ok((
@@ -2810,6 +2848,15 @@ fn read_rollout_messages_from(
             }
             *expected_ordinal = ordinal.checked_add(1);
         }
+        if envelope.record_type == "turn_context" {
+            if let Ok(record) = serde_json::from_slice::<Value>(&line) {
+                statistics.active_model = record
+                    .pointer("/payload/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            continue;
+        }
         if envelope.record_type == "event_msg" {
             if let Ok(record) = serde_json::from_slice::<Value>(&line) {
                 update_turn_metadata(&record, messages, pending_turn, statistics);
@@ -2891,12 +2938,7 @@ fn update_turn_metadata(
             if let Some(usage) = payload.pointer("/info/total_token_usage") {
                 pending.usage = Some(usage.clone());
                 let usage = TokenUsageBreakdown::from_rollout(usage);
-                statistics.total_tokens = usage.total_tokens;
-                statistics.input_tokens = usage.input_tokens;
-                statistics.cached_input_tokens = usage.cached_input_tokens;
-                statistics.cache_write_input_tokens = usage.cache_write_input_tokens;
-                statistics.output_tokens = usage.output_tokens;
-                statistics.reasoning_output_tokens = usage.reasoning_output_tokens;
+                statistics.record_token_usage(usage);
             }
         }
         Some("item_completed")
@@ -3857,6 +3899,51 @@ mod tests {
             assert_eq!(fs::read(&outside).unwrap(), b"{\"external\":true}");
             assert_no_temporary(&fixture);
         }
+    }
+
+    #[test]
+    fn session_statistics_attribute_token_deltas_to_each_model() {
+        let fixture = Fixture::new();
+        let path = fixture.write_rollout(
+            "rollout-model-usage.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"thread-model-usage","cwd":"/tmp/project"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100,"input_tokens":80,"output_tokens":20}}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100,"input_tokens":80,"output_tokens":20}}}}"#,
+                r#"{"type":"turn_context","payload":{"model":"model-b"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":160,"input_tokens":130,"output_tokens":30}}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":200,"input_tokens":165,"output_tokens":35}}}}"#,
+                r#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":230,"input_tokens":190,"output_tokens":40}}}}"#,
+            ],
+        );
+        let store = SessionStore::new(fixture.path.clone());
+        let (_, _, first) = store
+            .read_message_page_profiled("thread-model-usage", None, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.statistics.total_tokens, 230);
+        assert_eq!(first.statistics.model_usage["model-a"].total_tokens, 130);
+        assert_eq!(first.statistics.model_usage["model-b"].total_tokens, 100);
+        assert_eq!(first.statistics.model_usage["model-b"].input_tokens, 85);
+        let (_, _, cached) = store
+            .read_message_page_profiled("thread-model-usage", None, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.statistics.model_usage, first.statistics.model_usage);
+        writeln!(
+            OpenOptions::new().append(true).open(path).unwrap(),
+            "{}",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":250,"input_tokens":205,"output_tokens":45}}}}"#
+        )
+        .unwrap();
+        let (_, _, updated) = store
+            .read_message_page_profiled("thread-model-usage", None, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.statistics.model_usage["model-a"].total_tokens, 150);
+        assert_eq!(updated.statistics.model_usage["model-b"].total_tokens, 100);
     }
 
     #[test]

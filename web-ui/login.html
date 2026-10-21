@@ -77,6 +77,15 @@
         margin: 0 0 16px;
         color: #ffaea5;
       }
+      [hidden] {
+        display: none !important;
+      }
+      .passkey-button {
+        background: transparent;
+        color: #54c99e;
+        border: 1px solid #54c99e;
+        margin-top: 14px;
+      }
       @media (prefers-color-scheme: light) {
         body {
           background: #edf2ef;
@@ -129,6 +138,11 @@
         />
         <button type="submit">Sign in</button>
       </form>
+      <button class="passkey-button" id="passkeyLogin" type="button" hidden>
+        Sign in with a passkey
+      </button>
+      <p class="error" id="passkeyError" role="alert" hidden></p>
     </main>
+    <script src="/assets/passkey.js" defer></script>
   </body>
 </html>

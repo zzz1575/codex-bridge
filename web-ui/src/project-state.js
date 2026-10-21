@@ -1,5 +1,14 @@
 export const EXPANDED_PROJECTS_STORAGE_KEY = "codex-bridge.expanded-projects.v1";
 
+export function recentSidebarThreads(recentThreads, pinnedThreads, limit = 50) {
+  const pinned = pinnedThreads.slice(0, limit);
+  const pinnedIds = new Set(pinnedThreads.map((thread) => thread.id));
+  const recent = recentThreads
+    .filter((thread) => !pinnedIds.has(thread.id))
+    .slice(0, Math.max(0, limit - pinned.length));
+  return { pinned, recent };
+}
+
 export function sidebarProjectOrder(projects) {
   return [...projects].sort(
     (left, right) => Number(right.kind === "section") - Number(left.kind === "section"),

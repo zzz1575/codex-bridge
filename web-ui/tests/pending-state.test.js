@@ -645,3 +645,34 @@ test("a submission accepted after switching threads cannot clear the new thread 
   assert.equal(attachmentRenders, 0);
   assert.equal(referenceClears, 0);
 });
+
+
+test("upstream local receipts survive delayed echoes without downgrading accepted input", () => {
+  const receipt = queued({ status: "accepted", local_submission: true, intent: "new_turn" });
+  const stale = mergePendingSnapshot([queued({ status: "queueing" })], [receipt], new Set(), { threadId: "thread-a" });
+  assert.equal(stale[0].status, "accepted");
+  assert.equal(stale[0].local_submission, true);
+  assert.equal(stale[0].intent, "new_turn");
+  const missing = mergePendingSnapshot([], stale, new Set(), { threadId: "thread-a" });
+  assert.equal(missing[0].status, "accepted");
+  assert.equal(isWithdrawableQueued(missing[0]), false);
+  const echo = [{ role: "user", id: receipt.id, content: [{ kind: "text", text: receipt.text }] }];
+  assert.deepEqual(reconcilePendingMessages(missing, echo, "thread-a"), []);
+});
+
+test("native queue outages keep local submissions unverified until an authoritative read", () => {
+  const local = queued({ local_submission: true });
+  const unknown = mergePendingSnapshot([], [local], new Set(), { threadId: "thread-a", queueAuthoritative: false });
+  assert.equal(unknown[0].status, "queued");
+  assert.equal(unknown[0].queue_unverified, true);
+  assert.equal(isWithdrawableQueued(unknown[0]), false);
+  const delivered = mergePendingSnapshot([], unknown, new Set(), { threadId: "thread-a" });
+  assert.equal(delivered[0].status, "accepted");
+  assert.equal(delivered[0].queue_unverified, false);
+  assert.equal(isWithdrawableQueued(delivered[0]), false);
+});
+
+test("retained local acknowledgements remain scoped to the selected conversation", () => {
+  const other = queued({ thread_id: "thread-b", status: "accepted", local_submission: true });
+  assert.deepEqual(mergePendingSnapshot([], [other], new Set(), { threadId: "thread-a" }), []);
+});

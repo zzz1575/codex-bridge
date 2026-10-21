@@ -1,6 +1,7 @@
 import { createAuthenticationGate } from "./auth-gate.js";
 import { createEventSequenceTracker } from "./event-sequence.js";
 import { sendFileUpload } from "./file-upload.js";
+import { monitoredJson, monitoredText, trafficMonitor } from "./traffic-monitor.js";
 
 export const $ = (id) => document.getElementById(id);
 
@@ -14,12 +15,28 @@ const eventListeners = new Set();
 const eventSequence = createEventSequenceTracker();
 const performanceBuckets = new Map();
 let performanceFlush = null;
+let performanceFlushTimer = null;
+function schedulePerformanceFlush() {
+  if (
+    performanceFlushTimer !== null ||
+    !performanceBuckets.size ||
+    typeof document === "undefined" ||
+    document.hidden
+  )
+    return;
+  performanceFlushTimer = window.setTimeout(() => {
+    performanceFlushTimer = null;
+    void flushPerformance();
+  }, 15_000);
+}
 export async function uploadComposerFile(file, onProgress = () => {}) {
   if (demoMode) return { id: crypto.randomUUID(), name: file.name, size: file.size };
   await authenticate();
   const encodedName = btoa(String.fromCharCode(...new TextEncoder().encode(file.name)));
   try {
-    return await sendFileUpload(file, encodedName, onProgress);
+    return await sendFileUpload(file, encodedName, onProgress, undefined, (bytes, status) =>
+      trafficMonitor.record("attachment-upload", bytes, status),
+    );
   } catch (error) {
     if (error.status === 401) {
       const expired = new Error("authentication expired; reload the page to sign in again");
@@ -52,7 +69,11 @@ const authentication = createAuthenticationGate(async () => {
     },
     15_000,
   );
-  if (!response.ok) throw new Error(`authentication failed (${response.status})`);
+  if (!response.ok) {
+    if (trafficMonitor.enabled) await monitoredText(response, "auth");
+    throw new Error(`authentication failed (${response.status})`);
+  }
+  if (trafficMonitor.enabled) trafficMonitor.record("auth", 0, response.status);
 });
 
 export const authenticate = () => authentication.wait();
@@ -70,13 +91,16 @@ export async function createFileDownloadTicket(threadId, path) {
     30_000,
   );
   if (response.status === 401) {
+    if (trafficMonitor.enabled) await monitoredText(response, "file-ticket");
     const error = new Error("authentication expired; reload the page to sign in again");
     authentication.block(error);
     throw error;
   }
   if (!response.ok)
-    throw new Error((await response.text()) || `download failed (${response.status})`);
-  return response.json();
+    throw new Error(
+      (await monitoredText(response, "file-ticket")) || `download failed (${response.status})`,
+    );
+  return monitoredJson(response, "file-ticket");
 }
 
 export async function requestFilePreview(threadId, path, toolReference = null) {
@@ -92,13 +116,16 @@ export async function requestFilePreview(threadId, path, toolReference = null) {
     30_000,
   );
   if (response.status === 401) {
+    if (trafficMonitor.enabled) await monitoredText(response, "file-preview");
     const error = new Error("authentication expired; reload the page to sign in again");
     authentication.block(error);
     throw error;
   }
   if (!response.ok)
-    throw new Error((await response.text()) || `preview failed (${response.status})`);
-  return response.json();
+    throw new Error(
+      (await monitoredText(response, "file-preview")) || `preview failed (${response.status})`,
+    );
+  return monitoredJson(response, "file-preview");
 }
 
 async function sendCommand(request) {
@@ -123,11 +150,12 @@ async function sendCommand(request) {
       ...(controller ? { signal: controller.signal } : {}),
     });
     if (response.status === 401) {
+      if (trafficMonitor.enabled) await monitoredText(response, request.command || "command");
       const error = new Error("authentication expired; reload the page to sign in again");
       authentication.block(error);
       throw error;
     }
-    return await response.json();
+    return await monitoredJson(response, request.command || "command");
   } catch (error) {
     if (controller?.signal.aborted) throw new Error(`request timed out after ${timeoutMs} ms`);
     throw error;
@@ -152,9 +180,14 @@ export function recordPerformance(metric, durationMs, { count = 1, bytes = 0 } =
   bucket.max_ms = Math.max(bucket.max_ms, rounded);
   bucket.total_bytes += Number.isFinite(bytes) && bytes > 0 ? Math.ceil(bytes) : 0;
   performanceBuckets.set(metric, bucket);
+  schedulePerformanceFlush();
 }
 
 export async function flushPerformance() {
+  if (performanceFlushTimer !== null) {
+    window.clearTimeout(performanceFlushTimer);
+    performanceFlushTimer = null;
+  }
   if (performanceFlush || !performanceBuckets.size) return performanceFlush;
   const samples = [...performanceBuckets.values()];
   performanceBuckets.clear();
@@ -171,14 +204,17 @@ export async function flushPerformance() {
         }
       }
     })
-    .finally(() => (performanceFlush = null));
+    .finally(() => {
+      performanceFlush = null;
+      schedulePerformanceFlush();
+    });
   return performanceFlush;
 }
 
 if (typeof window !== "undefined") {
-  window.setInterval(() => flushPerformance(), 15_000);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushPerformance();
+    if (document.hidden) void flushPerformance();
+    else schedulePerformanceFlush();
   });
 }
 
@@ -251,6 +287,8 @@ async function connectEventStream() {
     eventStreamUnavailable = false;
   };
   eventSocket.onmessage = (message) => {
+    if (trafficMonitor.enabled && typeof message.data === "string")
+      trafficMonitor.record("events", new TextEncoder().encode(message.data).byteLength);
     try {
       const event = JSON.parse(message.data);
       const observation = eventSequence.observe(event);

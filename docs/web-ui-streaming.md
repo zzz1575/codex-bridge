@@ -30,6 +30,9 @@ reader's interaction state.
   rebuild an unchanged conversation subtree on each event or snapshot.
 - Snapshot and live-event representations of the same running turn are fused before rendering.
   A turn stays visually running until an authoritative completion or cancellation is observed.
+- Submitted input appears in the message timeline immediately. Its local card keeps the same
+  identity through acknowledgement and remains visible until the matching history message lands.
+  A late snapshot cannot move its status backward or leave a blank gap during handoff.
 - Keep each earlier tool group attached to its original message. Only the running turn's last tool
   group receives live activity styling and a not-yet-snapshotted tool placeholder; never flatten
   every tool call in the turn into one aggregate group.

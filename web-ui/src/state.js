@@ -25,6 +25,10 @@ function loadDrafts() {
 
 export const state = {
   projects: [],
+  sessionView: "projects",
+  recentThreads: [],
+  recentThreadsLoading: false,
+  recentLoadGeneration: 0,
   projectThreads: new Map(),
   projectThreadLoads: new Map(),
   projectLoadGeneration: 0,

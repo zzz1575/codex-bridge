@@ -35,7 +35,13 @@ config_path=$config_dir/config.toml
 runtime_dir=$HOME/.codex-bridge
 state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/codex-bridge
 launcher_dir=$HOME/Library/LaunchAgents
-desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
+desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex
+if [ ! -x "$desktop_codex" ]; then
+  desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
+fi
+if [ ! -x "$desktop_codex" ]; then
+  desktop_codex=/Applications/ChatGPT.app/Contents/Resources/codex
+fi
 desktop_main=/Applications/ChatGPT.app/Contents/MacOS/ChatGPT
 adapter_port=18790
 domain=gui/$(id -u)
@@ -153,6 +159,38 @@ if [ "$runtime_mode" = desktop ] && [ -f "$config_path" ]; then
     chmod 600 "$config_updated"
     mv "$config_updated" "$config_path"
     echo "Updated ws_bridge_bin to the Cargo-installed adapter (backup: $config_backup)"
+  fi
+fi
+
+# Migrate only paths supplied by earlier Desktop installations. Preserve any
+# custom Codex executable selected by the user.
+if [ "$runtime_mode" = desktop ] && [ -f "$config_path" ] &&
+  [ "$desktop_codex" = /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex ]; then
+  old_wrapper=/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
+  old_legacy=/Applications/ChatGPT.app/Contents/Resources/codex
+  if awk -v first="$old_wrapper" -v second="$old_legacy" '
+    /^[[:space:]]*codex_bin[[:space:]]*=/ {
+      value = $0; sub(/^[^=]*=[[:space:]]*/, "", value)
+      sub(/[[:space:]]*(#.*)?$/, "", value)
+      if (value == "\"" first "\"" || value == "\"" second "\"") found = 1
+    }
+    END { exit !found }
+  ' "$config_path"; then
+    config_backup=$(mktemp "$config_path.before-codex-path.XXXXXX")
+    cp -p "$config_path" "$config_backup"
+    config_updated=$(mktemp "$config_path.updated.XXXXXX")
+    awk -v first="$old_wrapper" -v second="$old_legacy" -v new="$desktop_codex" '
+      /^[[:space:]]*codex_bin[[:space:]]*=/ {
+        value = $0; sub(/^[^=]*=[[:space:]]*/, "", value)
+        sub(/[[:space:]]*(#.*)?$/, "", value)
+        if (value == "\"" first "\"" || value == "\"" second "\"")
+          sub(/"[^"]*"/, "\"" new "\"")
+      }
+      { print }
+    ' "$config_path" >"$config_updated"
+    chmod 600 "$config_updated"
+    mv "$config_updated" "$config_path"
+    echo "Updated Desktop codex_bin to the current bundle executable (backup: $config_backup)"
   fi
 fi
 

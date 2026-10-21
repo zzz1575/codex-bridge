@@ -139,7 +139,7 @@ test("opening a new draft clears only the inherited queue-sync warning", () => {
     saveDraft: (id, text) => state.drafts.set(id, text),
     serverRequestTray: { render() {} }, renderApprovals() {}, resetThreadViewState() {},
     applyThreadWriterLock() {}, setSendMode() {}, syncTemporaryForCurrent() {},
-    setMessageSyncPhase() {}, renderRepairHint() {}, renderThreadStatistics() {},
+    setMessageSyncPhase() {}, clearMessageTimeline() {}, renderRepairHint() {}, renderThreadStatistics() {},
     renderPending: () => renderedWarnings.push(state.pendingQueueUnavailable),
     renderProjects() {}, showActivity() {}, updateTurnNavigation() {},
     refreshComposerStatus: async () => {},

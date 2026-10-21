@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -18,7 +19,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
-    /// Target thread for show/send/steer/interrupt/host-exec/relocate, overriding daemon selection.
+    /// Target thread for show/send/steer/interrupt/host-exec/relocate/thread rename, overriding daemon selection.
     #[arg(long, global = true, value_name = "THREAD_ID")]
     thread: Option<String>,
 
@@ -130,9 +131,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage an existing Codex thread.
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
+    },
     /// Stream new items from the current thread.
     Tail,
-    /// Queue a new turn through `codex queue` without taking writer ownership.
+    /// Submit a new turn and continue delivery when the current run ends.
     Send {
         #[arg(required = true, value_name = "TEXT")]
         text: Vec<String>,
@@ -193,6 +199,17 @@ enum ProjectCommand {
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThreadCommand {
+    /// Rename the thread selected by --thread.
+    Rename {
+        #[arg(value_name = "NAME")]
+        name: String,
         #[arg(long)]
         json: bool,
     },
@@ -371,6 +388,17 @@ impl Command {
                 json,
                 OutputKind::Generic,
             )),
+            Self::Thread { command } => match command {
+                ThreadCommand::Rename { name, json } => Ok((
+                    Request::ThreadRename {
+                        thread_id: target_thread
+                            .context("thread rename requires --thread THREAD_ID")?,
+                        name,
+                    },
+                    json,
+                    OutputKind::Generic,
+                )),
+            },
             Self::Tail => {
                 reject_target(&target_thread, "tail")?;
                 Ok((Request::Tail, false, OutputKind::Generic))
@@ -380,6 +408,7 @@ impl Command {
                     thread_id: target_thread,
                     text: text.join(" "),
                     submission_id: None,
+                    ensure_delivery: true,
                     attachments: Vec::new(),
                 },
                 json,
@@ -471,7 +500,29 @@ async fn main() -> Result<()> {
         None => default_socket_path()?,
     };
     let (request, json_output, output_kind) = cli.command.into_request(cli.thread)?;
-    let response = send_request(&socket_path, &request).await?;
+    let request = match request {
+        Request::Send {
+            thread_id,
+            text,
+            attachments,
+            ensure_delivery,
+            ..
+        } => Request::Send {
+            thread_id,
+            text,
+            submission_id: Some(format!(
+                "ctl-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            )),
+            ensure_delivery,
+            attachments,
+        },
+        request => request,
+    };
+    let response = send_request_with_retry(&socket_path, &request).await?;
 
     if !response.ok {
         let error = response
@@ -520,6 +571,42 @@ async fn send_request(socket_path: &Path, request: &Request) -> Result<Response>
     }
 
     serde_json::from_str(&line).context("codex-bridge returned invalid JSON")
+}
+
+async fn send_request_with_retry(socket_path: &Path, request: &Request) -> Result<Response> {
+    let attempts = if matches!(
+        request,
+        Request::Send {
+            ensure_delivery: true,
+            ..
+        }
+    ) {
+        3
+    } else {
+        1
+    };
+    for attempt in 0..attempts {
+        match tokio::time::timeout(Duration::from_secs(45), send_request(socket_path, request))
+            .await
+        {
+            Ok(Ok(response))
+                if attempt + 1 < attempts
+                    && response
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.code == "submission_in_progress") =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(error)) if attempt + 1 == attempts => return Err(error),
+            Err(_) if attempt + 1 == attempts => {
+                bail!("bridge response timed out after {attempts} attempts")
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    unreachable!()
 }
 
 fn print_human(value: &serde_json::Value, output_kind: OutputKind) -> Result<()> {
@@ -677,6 +764,12 @@ fn print_write_result(value: &serde_json::Value) -> Result<()> {
     println!("{action}: {status}");
     println!("thread: {thread_id}");
     println!("backend: {backend}");
+    if value.get("delivery").and_then(serde_json::Value::as_str) == Some("automatic") {
+        println!("delivery: automatic");
+        if let Some(id) = string_value(value, "pending_id") {
+            println!("submission: {id}");
+        }
+    }
     if let Some(stdout) = value
         .get("backend")
         .and_then(|backend| backend.get("stdout"))
@@ -902,9 +995,59 @@ mod tests {
                 thread_id: Some("thread-1".into()),
                 text: "keep going".into(),
                 submission_id: None,
+                ensure_delivery: true,
                 attachments: Vec::new(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reliable_send_retries_a_lost_bridge_reply_with_the_same_id() {
+        let socket = std::path::Path::new("/tmp").join(format!(
+            "ctl-{}-{:x}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                    .await
+                    .unwrap();
+                requests.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                if attempt == 1 {
+                    tokio::io::AsyncWriteExt::write_all(
+                        reader.get_mut(),
+                        b"{\"ok\":true,\"result\":{\"status\":\"queued\"}}\n",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            requests
+        });
+        let request = codex_bridge::Request::Send {
+            thread_id: Some("thread-1".into()),
+            text: "hello".into(),
+            submission_id: Some("ctl-test-id".into()),
+            ensure_delivery: true,
+            attachments: Vec::new(),
+        };
+        let response = super::send_request_with_retry(&socket, &request)
+            .await
+            .unwrap();
+        assert!(response.ok);
+        let requests = server.await.unwrap();
+        assert_eq!(requests[0]["submission_id"], "ctl-test-id");
+        assert_eq!(requests[0], requests[1]);
+        std::fs::remove_file(socket).unwrap();
     }
 
     #[test]
@@ -951,6 +1094,31 @@ mod tests {
             }
         );
         let cli = Cli::try_parse_from(["codexctl", "relocate", "/tmp/new-project"]).unwrap();
+        assert!(cli.command.into_request(cli.thread).is_err());
+    }
+
+    #[test]
+    fn thread_rename_requires_explicit_thread() {
+        let cli = Cli::try_parse_from([
+            "codexctl",
+            "--thread",
+            "thread-1",
+            "thread",
+            "rename",
+            "Keyboard design",
+            "--json",
+        ])
+        .unwrap();
+        let (request, json, _) = cli.command.into_request(cli.thread).unwrap();
+        assert!(json);
+        assert_eq!(
+            request,
+            Request::ThreadRename {
+                thread_id: "thread-1".into(),
+                name: "Keyboard design".into(),
+            }
+        );
+        let cli = Cli::try_parse_from(["codexctl", "thread", "rename", "Keyboard design"]).unwrap();
         assert!(cli.command.into_request(cli.thread).is_err());
     }
 

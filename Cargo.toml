@@ -19,7 +19,7 @@ incremental = false
 debug = 0
 
 [workspace.package]
-version = "0.3.11"
+version = "0.3.13"
 edition = "2021"
 license = "MIT"
 
@@ -43,3 +43,4 @@ toml = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 zhhz = "0.8.2"
+webauthn-rs = "0.5.5"
