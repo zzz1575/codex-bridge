@@ -75,6 +75,7 @@ import com.y2yy.codex.mobile.data.decodeImageDataUrl
 import com.y2yy.codex.mobile.data.AttachmentInputs
 import com.y2yy.codex.mobile.data.ServerRequests
 import com.y2yy.codex.mobile.data.PendingMessages
+import com.y2yy.codex.mobile.data.TaskProgress
 import com.y2yy.codex.mobile.model.*
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -480,6 +481,11 @@ private fun HistoryTurnCard(turnId: String, toolCount: Int, fileCount: Int, load
 
 @Composable
 private fun MessageView(message: ChatMessage, onTool: (String) -> Unit, onRetryImage: (String) -> Unit) {
+    val progress = remember(message) { TaskProgress.presentation(message) }
+    if (progress != null) {
+        TaskProgressCard(message.id, progress)
+        return
+    }
     val user = message.role == "user"
     val clipboard = LocalClipboardManager.current
     Column(Modifier.fillMaxWidth().testTag("chat-message:${message.id}"), horizontalAlignment = if (user) Alignment.End else Alignment.Start) {
