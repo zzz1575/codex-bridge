@@ -93,7 +93,7 @@ data class AppUiState(
     val fromCache: Boolean = false,
     val darkTheme: Boolean = false,
     val serverLabel: String = "",
-    val version: String = "2.2.6",
+    val version: String = "2.2.7",
     val activeSessionIds: Set<String> = emptySet(),
     val sessionRunStates: Map<String, SessionRunState> = emptyMap(),
     val sessionActivityRevision: Long = 0,

@@ -1,7 +1,7 @@
 # Y2YY Codex Android
 
 原生 Kotlin / Jetpack Compose 客户端，通过 HTTPS 和 WebSocket 连接本仓库的
-Codex Bridge。当前源码版本 **2.2.6**，最低 Android 9 / API 28，目标 API 35。
+Codex Bridge。当前源码版本 **2.2.7**，最低 Android 9 / API 28，目标 API 35。
 
 ## 功能
 
