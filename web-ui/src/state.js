@@ -104,6 +104,8 @@ export const state = {
   pendingChanges: false,
   updatingThreads: new Set(),
   threadRunStates: new Map(),
+  threadRunTurnIds: new Map(),
+  threadRunEventSequences: new Map(),
   authoritativeThreadActive: new Map(),
   notifiedTurnIds: new Set(),
   taskTrackedIds: new Set(),

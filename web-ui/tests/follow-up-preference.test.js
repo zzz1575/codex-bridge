@@ -165,7 +165,7 @@ test("follow-up never queues through another writer even when cached ownership s
 test("idle status updates preserve both follow-up preference and a manually selected queue", () => {
   for (const mode of ["steer", "send"]) {
     const c = composer({ mode, active: true });
-    Object.assign(c.state, { threadRunStates: new Map([["thread-fixture", "active"]]) });
+    Object.assign(c.state, { threadRunStates: new Map([["thread-fixture", "active"]]), threadRunTurnIds: new Map() });
     Object.assign(c.context, {
       setThreadRunState: (id, status) => c.state.threadRunStates.set(id, status),
       completedActivityOverlay: () => ({}),

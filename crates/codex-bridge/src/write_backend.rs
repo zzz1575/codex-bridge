@@ -1539,6 +1539,19 @@ fn session_rpc(
                 let result = rpc_result(response);
                 if let Ok(result) = &result {
                     events.observe_rpc_settings(method, result);
+                    // Publish the native acknowledgement before returning to
+                    // control clients. Some native versions omit a start
+                    // notification for a resumed, already loaded thread.
+                    if method == "turn/start" {
+                        if let (Some(thread_id), Some(turn_id), Some("inProgress" | "active")) = (
+                            params.get("threadId").and_then(Value::as_str),
+                            result.pointer("/turn/id").and_then(Value::as_str),
+                            result.pointer("/turn/status").and_then(Value::as_str),
+                        ) {
+                            events.publish(json!({"type": "bridge_thread_run_state",
+                                "thread_id": thread_id, "turn_id": turn_id, "run_state": "active"}));
+                        }
+                    }
                 }
                 return result;
             }
@@ -2677,6 +2690,56 @@ mod tests {
 
         std::fs::remove_file(&sock_path).unwrap();
         std::fs::remove_dir(&sock_dir).unwrap();
+    }
+
+    #[test]
+    fn turn_start_ack_is_broadcast_even_when_native_omits_started_notification() {
+        let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("bridge-ack-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("app.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let mut ws = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+            let initialize = read_json(&mut ws);
+            ws.send(Message::Text(
+                json!({"id": initialize["id"], "result": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+            assert_eq!(read_json(&mut ws)["method"], "initialized");
+            let request = read_json(&mut ws);
+            assert_eq!(request["method"], "turn/start");
+            ws.send(Message::Text(
+                json!({"id": request["id"], "result": {"turn": {
+                    "id": "turn-worker", "status": "inProgress", "items": []
+                }}})
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        });
+        let backend = CodexCliBackend::new_with_thread_cache(
+            PathBuf::from("/unused/codex"),
+            Some(socket.clone()),
+            4,
+        );
+        let mut events = backend.subscribe_app_server_events().unwrap();
+        backend
+            .app_server_rpc("turn/start", json!({"threadId": "worker", "input": []}))
+            .unwrap();
+        let ack = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|event| event["type"] == "bridge_thread_run_state")
+            .unwrap();
+        assert_eq!(ack["thread_id"], "worker");
+        assert_eq!(ack["turn_id"], "turn-worker");
+        assert_eq!(ack["run_state"], "active");
+        assert!(ack["bridge_sequence"].as_u64().unwrap() > 0);
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

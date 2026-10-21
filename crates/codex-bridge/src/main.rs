@@ -768,10 +768,12 @@ impl SessionRunState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SessionRunStateEntry {
     state: SessionRunState,
     sequence: u64,
+    turn_id: Option<String>,
+    event_sequence: u64,
 }
 
 #[derive(Debug, Default)]
@@ -781,21 +783,47 @@ struct SessionRunStates {
 }
 
 impl SessionRunStates {
+    #[cfg(test)]
     fn set(&self, thread_id: &str, state: SessionRunState) -> bool {
+        self.set_turn(thread_id, state, None, 0)
+    }
+
+    fn set_turn(
+        &self,
+        thread_id: &str,
+        state: SessionRunState,
+        turn_id: Option<&str>,
+        event_sequence: u64,
+    ) -> bool {
         if thread_id.is_empty() {
             return false;
         }
         let Ok(mut entries) = self.entries.write() else {
             return false;
         };
-        let changed = entries
-            .get(thread_id)
-            .is_none_or(|entry| entry.state != state);
+        let previous = entries.get(thread_id);
+        if state != SessionRunState::Active
+            && turn_id.is_some()
+            && previous.is_some_and(|entry| {
+                entry
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|current| Some(current) != turn_id)
+            })
+        {
+            return false;
+        }
+        let turn_id = turn_id
+            .map(str::to_owned)
+            .or_else(|| previous.and_then(|entry| entry.turn_id.clone()));
+        let changed = previous.is_none_or(|entry| entry.state != state || entry.turn_id != turn_id);
         entries.insert(
             thread_id.to_owned(),
             SessionRunStateEntry {
                 state,
                 sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+                turn_id,
+                event_sequence,
             },
         );
         while entries.len() > MAX_SESSION_RUN_STATES {
@@ -814,6 +842,23 @@ impl SessionRunStates {
     }
 
     fn apply_event(&self, event: &Value) -> bool {
+        if event.get("type").and_then(Value::as_str) == Some("bridge_thread_run_state") {
+            return event
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .filter(|_| event.get("run_state").and_then(Value::as_str) == Some("active"))
+                .is_some_and(|id| {
+                    self.set_turn(
+                        id,
+                        SessionRunState::Active,
+                        event.get("turn_id").and_then(Value::as_str),
+                        event
+                            .get("bridge_sequence")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                });
+        }
         let Some(thread_id) = app_server_event_thread_id(event) else {
             return false;
         };
@@ -831,32 +876,71 @@ impl SessionRunStates {
             }
             _ => None,
         };
-        state.is_some_and(|state| self.set(&thread_id, state))
+        let turn_id = event
+            .pointer("/message/params/turn/id")
+            .or_else(|| event.pointer("/message/params/turnId"))
+            .and_then(Value::as_str);
+        state.is_some_and(|state| {
+            self.set_turn(
+                &thread_id,
+                state,
+                turn_id,
+                event
+                    .get("bridge_sequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
     }
 
+    fn revision(&self) -> u64 {
+        self.sequence.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     fn reconcile_active(&self, active_thread_ids: &[String]) {
+        self.reconcile_active_since(active_thread_ids, self.revision(), 0);
+    }
+
+    fn reconcile_active_since(
+        &self,
+        active_thread_ids: &[String],
+        observed_revision: u64,
+        event_sequence: u64,
+    ) {
+        // Native reads can span a turn transition. Only reconcile entries that
+        // have not received a newer event while those reads were in flight.
+        let Ok(mut entries) = self.entries.write() else {
+            return;
+        };
         let active = active_thread_ids.iter().collect::<HashSet<_>>();
-        let stale_active = self
-            .entries
-            .read()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|(thread_id, entry)| {
-                        entry.state == SessionRunState::Active && !active.contains(thread_id)
-                    })
-                    .map(|(thread_id, _)| thread_id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for thread_id in stale_active {
-            self.set(&thread_id, SessionRunState::Completed);
+        for (thread_id, entry) in entries.iter_mut() {
+            if entry.sequence >= observed_revision {
+                continue;
+            }
+            if entry.state == SessionRunState::Active && !active.contains(thread_id) {
+                entry.state = SessionRunState::Completed;
+                entry.event_sequence = event_sequence;
+                entry.sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+            } else if active.contains(thread_id) && entry.state != SessionRunState::Active {
+                entry.state = SessionRunState::Active;
+                entry.event_sequence = event_sequence;
+                entry.sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+            }
         }
         for thread_id in active_thread_ids {
-            self.set(thread_id, SessionRunState::Active);
+            entries
+                .entry(thread_id.clone())
+                .or_insert_with(|| SessionRunStateEntry {
+                    state: SessionRunState::Active,
+                    sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+                    turn_id: None,
+                    event_sequence,
+                });
         }
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> HashMap<String, &'static str> {
         self.entries
             .read()
@@ -890,7 +974,31 @@ fn turn_completed_run_state(event: &Value) -> SessionRunState {
 }
 
 fn thread_run_snapshot_event(run_states: &SessionRunStates) -> Value {
-    let thread_states = run_states.snapshot();
+    let (thread_states, thread_turn_ids, thread_sequences) = run_states
+        .entries
+        .read()
+        .map(|entries| {
+            (
+                entries
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.state.as_str()))
+                    .collect::<HashMap<_, _>>(),
+                entries
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        entry
+                            .turn_id
+                            .as_ref()
+                            .map(|turn| (id.clone(), turn.clone()))
+                    })
+                    .collect::<HashMap<_, _>>(),
+                entries
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.event_sequence))
+                    .collect::<HashMap<_, _>>(),
+            )
+        })
+        .unwrap_or_default();
     let active_thread_ids = thread_states
         .iter()
         .filter(|(_, state)| **state == "active")
@@ -900,6 +1008,8 @@ fn thread_run_snapshot_event(run_states: &SessionRunStates) -> Value {
         "type": "bridge_thread_activity_snapshot",
         "active_thread_ids": active_thread_ids,
         "thread_states": thread_states,
+        "thread_turn_ids": thread_turn_ids,
+        "thread_sequences": thread_sequences,
     })
 }
 
@@ -3897,82 +4007,102 @@ fn spawn_hot_session_cache(
     pinned_limit: usize,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut events = write_backend.subscribe_app_server_events()?;
+    let mut run_events = write_backend.subscribe_app_server_events()?;
     Some(tokio::spawn(async move {
-        let mut refresh = tokio::time::interval(Duration::from_secs(10));
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_warm = HashMap::<String, Instant>::new();
-        let mut refresh_count = 0_u64;
-        loop {
-            tokio::select! {
-                event = events.recv() => {
-                    let event = match event {
-                        Ok(event) => event,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    };
-                    if session_run_states.apply_event(&event) {
-                        write_backend.publish_bridge_event(thread_run_snapshot_event(&session_run_states));
+        // State propagation must never wait for rollout parsing or native RPC
+        // sweeps. Delegated turns often belong to a different visible session.
+        let observe = async {
+            loop {
+                match run_events.recv().await {
+                    Ok(event) => {
+                        if session_run_states.apply_event(&event) {
+                            write_backend.publish_bridge_event(thread_run_snapshot_event(
+                                &session_run_states,
+                            ));
+                        }
                     }
-                    invalidate_app_server_tool_cache_for_event(&app_server_tools, &event);
-                    let Some(thread_id) = app_server_event_thread_id(&event) else {
-                        continue;
-                    };
-                    let now = Instant::now();
-                    if last_warm.get(&thread_id).is_some_and(|last| now.duration_since(*last) < Duration::from_millis(200)) {
-                        continue;
-                    }
-                    last_warm.insert(thread_id.clone(), now);
-                    let store = Arc::clone(&session_store);
-                    let _ = tokio::task::spawn_blocking(move || store.warm_thread_messages(&thread_id)).await;
-                }
-                _ = refresh.tick() => {
-                    refresh_count = refresh_count.wrapping_add(1);
-                    let store = Arc::clone(&session_store);
-                    let backend = Arc::clone(&write_backend);
-                    let run_states = Arc::clone(&session_run_states);
-                    let refresh_pins = refresh_count == 1 || refresh_count.is_multiple_of(3);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let Ok(loaded_result) = backend.app_server_rpc("thread/loaded/list", json!({})) else {
-                            return;
-                        };
-                        let loaded = loaded_thread_ids(&loaded_result);
-                        let mut active_thread_ids = Vec::new();
-                        let mut complete_snapshot = true;
-                        for thread_id in loaded {
-                            let active = match backend.app_server_rpc(
-                                "thread/read",
-                                json!({"threadId": thread_id, "includeTurns": false}),
-                            ) {
-                                Ok(result) => thread_result_is_active(&result),
-                                Err(_) => {
-                                    complete_snapshot = false;
-                                    false
-                                }
-                            };
-                            if active {
-                                active_thread_ids.push(thread_id.clone());
-                                let _ = backend.watch_thread(&thread_id);
-                                let _ = store.warm_thread_messages(&thread_id);
-                            }
-                        }
-                        if complete_snapshot {
-                            run_states.reconcile_active(&active_thread_ids);
-                            backend.publish_bridge_event(thread_run_snapshot_event(&run_states));
-                        }
-                        if refresh_pins {
-                            for thread_id in pinned_thread_ids(&backend)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .take(pinned_limit)
-                            {
-                                let _ = store.warm_thread_messages(&thread_id);
-                            }
-                        }
-                    }).await;
-                    last_warm.retain(|_, last| last.elapsed() < Duration::from_secs(60));
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        }
+        };
+        let warm = async {
+            let mut refresh = tokio::time::interval(Duration::from_secs(3));
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_warm = HashMap::<String, Instant>::new();
+            let mut refresh_count = 0_u64;
+            loop {
+                tokio::select! {
+                    event = events.recv() => {
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
+                        invalidate_app_server_tool_cache_for_event(&app_server_tools, &event);
+                        let Some(thread_id) = app_server_event_thread_id(&event) else {
+                            continue;
+                        };
+                        let now = Instant::now();
+                        if last_warm.get(&thread_id).is_some_and(|last| now.duration_since(*last) < Duration::from_millis(200)) {
+                            continue;
+                        }
+                        last_warm.insert(thread_id.clone(), now);
+                        let store = Arc::clone(&session_store);
+                        let _ = tokio::task::spawn_blocking(move || store.warm_thread_messages(&thread_id)).await;
+                    }
+                    _ = refresh.tick() => {
+                        refresh_count = refresh_count.wrapping_add(1);
+                        let store = Arc::clone(&session_store);
+                        let backend = Arc::clone(&write_backend);
+                        let run_states = Arc::clone(&session_run_states);
+                        let refresh_pins = refresh_count == 1 || refresh_count.is_multiple_of(10);
+                        let observed_revision = run_states.revision();
+                        let observed_sequence = backend.app_server_event_sequence().unwrap_or(0);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let Ok(loaded_result) = backend.app_server_rpc("thread/loaded/list", json!({})) else {
+                                return;
+                            };
+                            let loaded = loaded_thread_ids(&loaded_result);
+                            let mut active_thread_ids = Vec::new();
+                            let mut complete_snapshot = true;
+                            for thread_id in loaded {
+                                let active = match backend.app_server_rpc(
+                                    "thread/read",
+                                    json!({"threadId": thread_id, "includeTurns": false}),
+                                ) {
+                                    Ok(result) => thread_result_is_active(&result),
+                                    Err(_) => {
+                                        complete_snapshot = false;
+                                        false
+                                    }
+                                };
+                                if active {
+                                    active_thread_ids.push(thread_id.clone());
+                                    let _ = backend.watch_thread(&thread_id);
+                                    let _ = store.warm_thread_messages(&thread_id);
+                                }
+                            }
+                            if complete_snapshot {
+                                run_states.reconcile_active_since(&active_thread_ids, observed_revision, observed_sequence);
+                                backend.publish_bridge_event(thread_run_snapshot_event(&run_states));
+                            }
+                            if refresh_pins {
+                                for thread_id in pinned_thread_ids(&backend)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .take(pinned_limit)
+                                {
+                                    let _ = store.warm_thread_messages(&thread_id);
+                                }
+                            }
+                        }).await;
+                        last_warm.retain(|_, last| last.elapsed() < Duration::from_secs(60));
+                    }
+                }
+            }
+        };
+        tokio::join!(observe, warm);
     }))
 }
 
@@ -5750,12 +5880,16 @@ async fn web_event_socket(socket: WebSocket, bridge: BridgeState) {
         return;
     }
     let snapshot_backend = Arc::clone(&backend);
+    let observed_revision = bridge.session_run_states.revision();
+    let observed_sequence = backend.app_server_event_sequence().unwrap_or(0);
     if let Ok(Ok(active_thread_ids)) =
         tokio::task::spawn_blocking(move || active_loaded_thread_ids(&snapshot_backend)).await
     {
-        bridge
-            .session_run_states
-            .reconcile_active(&active_thread_ids);
+        bridge.session_run_states.reconcile_active_since(
+            &active_thread_ids,
+            observed_revision,
+            observed_sequence,
+        );
         if sender
             .send(AxumWsMessage::Text(
                 thread_run_snapshot_event(&bridge.session_run_states)
@@ -11291,6 +11425,20 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             if let Some(relocation) = legacy_thread_cwd_request(&method, &params) {
                 return legacy_thread_cwd_response(dispatch(relocation, state));
             }
+            // A dispatcher uses the generic control API rather than opening a
+            // Web UI conversation. Subscribe before starting, just as the UI
+            // does, so lifecycle events and reconnect ownership are retained.
+            if method == "turn/start" {
+                if let Some(thread_id) = params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    if let Err(error) = write_backend.watch_thread(thread_id) {
+                        return write_backend_error(error);
+                    }
+                }
+            }
             match write_backend.app_server_rpc(&method, params) {
                 Ok(result) => Response::success(json!({
                     "action": "app_server_rpc",
@@ -15780,6 +15928,51 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
 
         assert_eq!(states.snapshot().get("thread-1"), Some(&"completed"));
         assert_eq!(states.snapshot().get("thread-2"), Some(&"active"));
+    }
+
+    #[test]
+    fn delegated_start_ack_updates_global_activity_without_native_notification() {
+        let states = SessionRunStates::default();
+        assert!(states.apply_event(
+            &json!({"type": "bridge_thread_run_state", "thread_id": "worker",
+            "turn_id": "turn-worker", "run_state": "active", "bridge_sequence": 7})
+        ));
+        let snapshot = thread_run_snapshot_event(&states);
+        assert_eq!(snapshot["thread_states"]["worker"], "active");
+        assert_eq!(snapshot["thread_turn_ids"]["worker"], "turn-worker");
+        assert_eq!(snapshot["thread_sequences"]["worker"], 7);
+    }
+
+    #[test]
+    fn delayed_native_sweep_cannot_clear_a_newly_dispatched_turn() {
+        let states = SessionRunStates::default();
+        states.set("worker", SessionRunState::Completed);
+        let observed = states.revision();
+        states.set_turn("worker", SessionRunState::Active, Some("turn-new"), 12);
+        states.reconcile_active_since(&[], observed, 10);
+        assert_eq!(states.snapshot().get("worker"), Some(&"active"));
+        states.reconcile_active_since(&[], states.revision(), 14);
+        assert_eq!(states.snapshot().get("worker"), Some(&"completed"));
+    }
+
+    #[test]
+    fn delayed_native_sweep_cannot_restore_a_finished_turn() {
+        let states = SessionRunStates::default();
+        states.set_turn("worker", SessionRunState::Active, Some("turn-worker"), 5);
+        let observed = states.revision();
+        states.set_turn("worker", SessionRunState::Completed, Some("turn-worker"), 9);
+        states.reconcile_active_since(&["worker".into()], observed, 6);
+        assert_eq!(states.snapshot().get("worker"), Some(&"completed"));
+    }
+
+    #[test]
+    fn old_turn_completion_does_not_finish_a_successor_in_global_activity() {
+        let states = SessionRunStates::default();
+        states.set_turn("worker", SessionRunState::Active, Some("turn-new"), 20);
+        assert!(!states.apply_event(&json!({"type": "app_server", "bridge_sequence": 21, "message": {
+            "method": "turn/completed", "params": {"threadId": "worker", "turn": {"id": "turn-old", "status": "completed"}}
+        }})));
+        assert_eq!(states.snapshot().get("worker"), Some(&"active"));
     }
 
     #[test]

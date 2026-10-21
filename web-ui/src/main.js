@@ -6528,6 +6528,10 @@ function handleBridgeEvent(event) {
     return;
   }
   if (event?.type === "bridge_event_gap") {
+    if (event.reason === "sequence_reset") {
+      state.threadRunEventSequences.clear();
+      state.threadRunTurnIds.clear();
+    }
     serverRequestTray.refresh();
     setMessageSyncPhase("reconnecting");
     state.lastMessageRefresh = 0;
@@ -6552,29 +6556,55 @@ function handleBridgeEvent(event) {
     syncVoiceCapability();
     return;
   }
+  if (event?.type === "bridge_thread_run_state") {
+    if (event.run_state === "active" && typeof event.thread_id === "string" && event.thread_id &&
+        typeof event.turn_id === "string" && event.turn_id) {
+      if (Number.isSafeInteger(event.bridge_sequence)) state.threadRunEventSequences.set(event.thread_id, event.bridge_sequence);
+      state.threadRunTurnIds.set(event.thread_id, event.turn_id);
+      state.authoritativeThreadActive.set(event.thread_id, true);
+      setThreadRunState(event.thread_id, "active");
+      renderProjects();
+    }
+    return;
+  }
   if (event?.type === "bridge_thread_activity_snapshot") {
     if (!Array.isArray(event.active_thread_ids)) return;
-    state.updatingThreads.clear();
-    state.threadRunStates.clear();
+    const previousActiveIds = [...state.updatingThreads];
     const snapshotIds = new Set(
       event.thread_states && typeof event.thread_states === "object"
         ? Object.keys(event.thread_states)
         : event.active_thread_ids,
     );
     for (const threadId of state.taskTrackedIds) {
-      if (snapshotIds.has(threadId)) continue;
+      if (snapshotIds.has(threadId) || state.updatingThreads.has(threadId)) continue;
       state.taskTrackedIds.delete(threadId);
       state.taskOverviews.delete(threadId);
       state.taskDirtyIds.delete(threadId);
     }
     if (event.thread_states && typeof event.thread_states === "object") {
       for (const [threadId, runState] of Object.entries(event.thread_states)) {
+        const turnId = event.thread_turn_ids?.[threadId], sequence = event.thread_sequences?.[threadId];
+        if (Number.isSafeInteger(sequence) && sequence < (state.threadRunEventSequences.get(threadId) || 0)) continue;
+        if (Number.isSafeInteger(sequence)) state.threadRunEventSequences.set(threadId, sequence);
+        if (runState === "active" && turnId) state.threadRunTurnIds.set(threadId, turnId);
+        else if (runState !== "active") state.threadRunTurnIds.delete(threadId);
         state.authoritativeThreadActive.set(threadId, runState === "active");
         setThreadRunState(threadId, runState);
       }
     }
     for (const threadId of event.active_thread_ids) {
-      if (typeof threadId === "string" && threadId) setThreadRunState(threadId, "active");
+      if (typeof threadId === "string" && threadId) {
+        const sequence = event.thread_sequences?.[threadId];
+        if (Number.isSafeInteger(sequence) && sequence < (state.threadRunEventSequences.get(threadId) || 0)) continue;
+        state.authoritativeThreadActive.set(threadId, true);
+        setThreadRunState(threadId, "active");
+      }
+    }
+    for (const threadId of previousActiveIds) {
+      if (!snapshotIds.has(threadId) && !state.threadRunTurnIds.has(threadId)) {
+        state.authoritativeThreadActive.set(threadId, false);
+        setThreadRunState(threadId, "completed");
+      }
     }
     renderProjects();
     renderTaskOverviews();
@@ -6603,6 +6633,8 @@ function handleBridgeEvent(event) {
     params = message.params || {},
     threadId = params.threadId || null;
   if (!method) return;
+  if (threadId && ["turn/started", "turn/completed", "thread/status/changed"].includes(method) &&
+      Number.isSafeInteger(event.bridge_sequence)) state.threadRunEventSequences.set(threadId, event.bridge_sequence);
   if (
     method === "item/completed" &&
     threadId === state.current?.id &&
@@ -6645,6 +6677,7 @@ function handleBridgeEvent(event) {
       state.editableInterruptedTurn = null;
       renderVisibleMessages();
     }
+    if (params.turn?.id) state.threadRunTurnIds.set(threadId, params.turn.id);
     state.authoritativeThreadActive.set(threadId, true);
     setThreadRunState(threadId, "active");
     renderProjects();
@@ -6707,14 +6740,17 @@ function handleBridgeEvent(event) {
     }
     const completedTurnId = params.turn?.id || null,
       completionIsCurrent =
-        threadId !== state.current?.id ||
-        completionMatchesActiveTurn(state.activeTurnId, completedTurnId),
+        completionMatchesActiveTurn(
+          state.threadRunTurnIds.get(threadId) || (threadId === state.current?.id ? state.activeTurnId : null),
+          completedTurnId,
+        ),
       runState = completedTurnRunState(params.turn);
     finishAsyncQuestionTurn(threadId, completedTurnId);
     // An interrupted turn may complete after the queued input has already
     // started a successor turn. Never let that older completion clear the new
     // active turn or replace its green activity state with a terminal state.
     if (completionIsCurrent) {
+      state.threadRunTurnIds.delete(threadId);
       state.authoritativeThreadActive.set(threadId, false);
       setThreadRunState(threadId, runState);
     }
@@ -6761,6 +6797,7 @@ function updateThreadLiveFromStatus(threadId, status) {
   state.authoritativeThreadActive.set(threadId, active);
   if (active) setThreadRunState(threadId, "active");
   else {
+    state.threadRunTurnIds.delete(threadId);
     if (state.threadRunStates.get(threadId) === "active") {
       setThreadRunState(threadId, "completed");
     }

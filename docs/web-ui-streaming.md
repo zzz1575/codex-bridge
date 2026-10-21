@@ -83,3 +83,19 @@ Streaming changes must cover at least these sequences:
 4. Add a later tool group and verify that earlier groups remain separate while only the last group
    carries the running state.
 5. Exercise both tail-following and a reader anchored above the tail, including a mobile viewport.
+
+## Delegated session activity
+
+Global sidebar activity must follow all subscribed sessions, including a worker started through
+`app_server_rpc` while a different conversation is open. Subscribe before a generic `turn/start`;
+retain that subscription through native reconnects. Publish a `bridge_thread_run_state` receipt
+only after a native acknowledgement confirms the turn ID and its active status. The receipt does
+not claim that a queued, waiting or merely assigned task has begun executing.
+
+Keep activity observation independent of rollout warming. Background native sweeps capture an
+observation revision before reading, and cannot replace entries advanced by newer events.
+Snapshots carry per-session event sequences and turn IDs. A client rejects older per-session
+states, accepts a newer authoritative snapshot after missed events, and resets sequence cursors
+when a Bridge restart resets the event stream. Completion of an older turn cannot stop the next
+turn in an unselected conversation. Sidebar updates do not select the worker or rebuild the open
+conversation, composer, or message viewport.
