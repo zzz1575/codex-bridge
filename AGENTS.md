@@ -54,3 +54,12 @@ change can affect these invariants.
 - If sensitive material has already been committed or pushed, stop and report its scope. Removing
   it in a later commit does not remove it from history; coordinate credential rotation and history
   rewriting explicitly rather than doing either silently.
+
+## Source synchronization
+
+- Commit completed Bridge and Android changes after validation. The configured commit hooks
+  synchronize committed source through isolated publication copies and CI-gated pull requests.
+- Check synchronization status; a successful local commit is not proof of GitHub publication.
+- Never bypass privacy checks, overwrite fork-only files, or force-push the main branch.
+- Follow [the maintenance workflow](tools/maintenance/README.md) for upstream merges and failures.
+  Repository synchronization does not deploy or restart any service.

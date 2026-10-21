@@ -1,0 +1,14 @@
+{
+  "repository": "yourname/codex-bridge",
+  "publication_repo": "/srv/codex-source-sync/publication",
+  "state_dir": "/srv/codex-source-sync/state",
+  "incoming_dir": "/srv/codex-source-sync/incoming",
+  "author_name": "yourname",
+  "author_email": "123+yourname@users.noreply.github.com",
+  "deny_values": [],
+  "private_json_files": [],
+  "components": {
+    "bridge": {"repo": "/srv/codex-bridge", "ref": "HEAD", "prefix": ""},
+    "android": {"repo": "/srv/codex-source-sync/android.git", "ref": "refs/heads/source", "prefix": "android"}
+  }
+}

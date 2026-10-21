@@ -1,0 +1,9 @@
+{
+  "git": "git.exe",
+  "source_repo": "C:/projects/codex-android",
+  "state_dir": "C:/source-sync/state",
+  "ssh_host": "your-server",
+  "remote_incoming": "/srv/codex-source-sync/incoming",
+  "remote_script": "/srv/codex-source-sync/tools/sync_source.py",
+  "remote_config": "/srv/codex-source-sync/config.json"
+}
