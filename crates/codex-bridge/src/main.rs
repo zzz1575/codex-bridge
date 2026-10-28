@@ -3810,6 +3810,7 @@ async fn main() -> Result<()> {
         expected_desktop_ws_url.as_deref(),
     )));
     let server_capabilities = Arc::new(RwLock::new(json!({
+        "thread_reorder": true,
         "audio_transcription": {
             "enabled": false,
             "reason": "not_checked",
@@ -8115,7 +8116,7 @@ fn apply_audio_transcription_capability(state: &BridgeState, native: Value) -> V
     } else {
         native
     };
-    let capabilities = json!({"audio_transcription": audio_transcription});
+    let capabilities = json!({"audio_transcription": audio_transcription, "thread_reorder": true});
     if let Ok(mut cached) = state.server_capabilities.write() {
         cached.clone_from(&capabilities);
     }
@@ -8188,6 +8189,7 @@ fn server_capabilities_snapshot(state: &BridgeState) -> Value {
         .map(|cached| cached.clone())
         .unwrap_or_else(|_| {
             json!({
+                "thread_reorder": true,
                 "audio_transcription": {
                     "enabled": false,
                     "reason": "state_unavailable",
@@ -10756,45 +10758,55 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => Response::error("app_server_restart_failed", error.to_string()),
             }
         }
-        Request::ThreadPins => match pinned_thread_state(write_backend, session_store.home()) {
-            Ok((section_id, thread_ids)) => {
-                let project_index = app_server_project_index(
-                    write_backend,
-                    app_server_projects,
-                    false,
-                    session_store.home(),
-                    session_store,
-                );
-                let mut threads = Vec::new();
-                for thread_id in &thread_ids {
-                    if let Ok(Some(thread)) = session_store.find_thread(thread_id) {
-                        let project_path = project_index
-                            .as_ref()
-                            .map(|index| index.group_path_for_thread(&thread));
-                        threads.push(json!({
-                            "id": thread.id,
-                            "title": thread.title,
-                            "cwd": thread.cwd,
-                            "git_branch": thread.git_branch,
-                            "created_at": thread.created_at,
-                            "updated_at_ms": thread.updated_at_ms,
-                            "source": thread.source,
-                            "archived": thread.archived,
-                            "pinned": true,
-                            "project_path": project_path,
-                        }));
+        Request::ThreadPins => {
+            let _guard = match pinned_section::mutation_guard() {
+                Ok(guard) => guard,
+                Err(error) => return write_backend_error(error),
+            };
+            match pinned_thread_state(write_backend, session_store.home()) {
+                Ok((section_id, thread_ids)) => {
+                    let project_index = app_server_project_index(
+                        write_backend,
+                        app_server_projects,
+                        false,
+                        session_store.home(),
+                        session_store,
+                    );
+                    let mut threads = Vec::new();
+                    for thread_id in &thread_ids {
+                        if let Ok(Some(thread)) = session_store.find_thread(thread_id) {
+                            let project_path = project_index
+                                .as_ref()
+                                .map(|index| index.group_path_for_thread(&thread));
+                            threads.push(json!({
+                                "id": thread.id,
+                                "title": thread.title,
+                                "cwd": thread.cwd,
+                                "git_branch": thread.git_branch,
+                                "created_at": thread.created_at,
+                                "updated_at_ms": thread.updated_at_ms,
+                                "source": thread.source,
+                                "archived": thread.archived,
+                                "pinned": true,
+                                "project_path": project_path,
+                            }));
+                        }
                     }
+                    Response::success(json!({
+                        "available": true,
+                        "section_id": section_id,
+                        "thread_ids": thread_ids,
+                        "threads": threads,
+                    }))
                 }
-                Response::success(json!({
-                    "available": true,
-                    "section_id": section_id,
-                    "thread_ids": thread_ids,
-                    "threads": threads,
-                }))
+                Err(error) => write_backend_error(error),
             }
-            Err(error) => write_backend_error(error),
-        },
+        }
         Request::ThreadPin { thread_id, pinned } => {
+            let _guard = match pinned_section::mutation_guard() {
+                Ok(guard) => guard,
+                Err(error) => return write_backend_error(error),
+            };
             let thread = match thread_by_id(session_store, &thread_id) {
                 Ok(thread) => thread,
                 Err(response) => return response,
@@ -10820,6 +10832,15 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(_) => {
                     clear_project_cache(app_server_projects);
                     session_store.invalidate_summary_cache();
+                    if let Ok((section_id, thread_ids)) =
+                        pinned_thread_state(write_backend, session_store.home())
+                    {
+                        write_backend.publish_bridge_event(json!({
+                            "type": "bridge_thread_pins_updated",
+                            "section_id": section_id,
+                            "thread_ids": thread_ids,
+                        }));
+                    }
                     Response::success(json!({
                         "action": "thread_pin",
                         "thread_id": thread.id,
@@ -10827,6 +10848,47 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                     }))
                 }
                 Err(error) => write_backend_error(error),
+            }
+        }
+        Request::ThreadReorder {
+            thread_ids,
+            expected_thread_ids,
+        } => {
+            match pinned_section::reorder(
+                session_store.home(),
+                &thread_ids,
+                &expected_thread_ids,
+                |method, params| write_backend.app_server_rpc(method, params),
+            ) {
+                Ok(saved) => {
+                    clear_project_cache(app_server_projects);
+                    session_store.invalidate_summary_cache();
+                    write_backend.publish_bridge_event(json!({
+                        "type": "bridge_thread_pins_updated",
+                        "section_id": saved.section_id,
+                        "thread_ids": saved.thread_ids,
+                    }));
+                    Response::success(json!({
+                        "action": "thread_reorder",
+                        "status": if saved.changed { "saved" } else { "unchanged" },
+                        "section_id": saved.section_id,
+                        "thread_ids": saved.thread_ids,
+                        "verified": true,
+                    }))
+                }
+                Err(error) => {
+                    // A failed request may already have moved some pins. Invalidate
+                    // cached lists and notify every client using observed facts only.
+                    clear_project_cache(app_server_projects);
+                    session_store.invalidate_summary_cache();
+                    write_backend.publish_bridge_event(
+                        pinned_section::refresh_after_failed_reorder(
+                            session_store.home(),
+                            |method, params| write_backend.app_server_rpc(method, params),
+                        ),
+                    );
+                    write_backend_error(error)
+                }
             }
         }
         Request::WorkspaceDiff { thread_id } => {
@@ -16004,6 +16066,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             include_str!("../../../web-ui/src/composer-state.js"),
             include_str!("../../../web-ui/src/file-preview.js"),
             include_str!("../../../web-ui/src/session-route.js"),
+            include_str!("../../../web-ui/src/session-sort.js"),
             include_str!("../../../web-ui/src/state.js"),
             include_str!("../../../web-ui/src/theme.js"),
             include_str!("../../../web-ui/src/styles.css"),
@@ -16024,6 +16087,7 @@ HTTPS_PROXY = "http://127.0.0.1:7897"
             "thread_archive",
             "thread_pins",
             "thread_pin",
+            "thread_reorder",
             "workspace_diff",
             "select",
             "current",

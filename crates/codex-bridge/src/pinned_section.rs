@@ -4,6 +4,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codex_bridge::BackendFailure;
@@ -13,6 +14,18 @@ use serde_json::{json, Value};
 pub const LEGACY_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const NAME: &str = "Pinned";
 const RECEIPT: &str = "bridge-pinned-section.json";
+static PIN_MUTATION: Mutex<()> = Mutex::new(());
+
+/// One Bridge process serializes pin membership, ordering, and canonical reads.
+/// External native clients are still checked through the snapshot and final read-back.
+pub fn mutation_guard() -> Result<MutexGuard<'static, ()>, BackendFailure> {
+    PIN_MUTATION.lock().map_err(|_| {
+        failure(
+            "thread_pins_busy",
+            "Pin state is unavailable; refresh before saving again",
+        )
+    })
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Receipt {
@@ -205,10 +218,25 @@ where
                     "thread/list returned no pin data",
                 )
             })?;
-        ids.extend(
-            data.iter()
-                .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_owned)),
-        );
+        for thread in data {
+            let id = thread
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    failure(
+                        "app_server_protocol_error",
+                        "Pin data contains no thread identity",
+                    )
+                })?;
+            if ids.iter().any(|existing| existing == id) {
+                return Err(failure(
+                    "app_server_protocol_error",
+                    "Pin data contains a duplicate thread identity",
+                ));
+            }
+            ids.push(id.to_owned());
+        }
         match result.get("nextCursor").and_then(Value::as_str) {
             None => return Ok((section_id, ids)),
             Some(next) if seen.insert(next.to_owned()) => cursor = Some(next.to_owned()),
@@ -224,6 +252,139 @@ where
         "app_server_protocol_error",
         "Pin list exceeded its bounded inventory",
     ))
+}
+
+#[derive(Debug)]
+pub struct Reordered {
+    pub section_id: Option<String>,
+    pub thread_ids: Vec<String>,
+    pub changed: bool,
+}
+
+/// Publish current native facts after an unsuccessful save, never the requested
+/// target order. A missing snapshot is an explicit request for clients to refresh.
+pub fn refresh_after_failed_reorder<F>(home: &Path, rpc: F) -> Value
+where
+    F: FnMut(&str, Value) -> Result<Value, BackendFailure>,
+{
+    let mut event = json!({
+        "type": "bridge_thread_pins_updated",
+        "refresh_required": true,
+        "save_status": "unconfirmed",
+    });
+    if let Ok(_guard) = mutation_guard() {
+        if let Ok((section_id, thread_ids)) = thread_ids(home, rpc) {
+            event["section_id"] = json!(section_id);
+            event["thread_ids"] = json!(thread_ids);
+        }
+    }
+    event
+}
+
+fn validate_order(ids: &[String]) -> Result<(), BackendFailure> {
+    let mut unique = std::collections::HashSet::new();
+    if ids.len() > 10_000
+        || ids.iter().any(|id| {
+            id.is_empty()
+                || id.len() > 256
+                || id.trim() != id
+                || id.chars().any(char::is_control)
+                || !unique.insert(id)
+        })
+    {
+        return Err(failure(
+            "thread_reorder_invalid_order",
+            "Use each current pinned thread exactly once; refresh before saving again",
+        ));
+    }
+    Ok(())
+}
+
+/// Reorder existing pins only. No section creation, pinning, or automatic retry.
+/// A timeout is reconciled by a read, never by replaying an uncertain move.
+pub fn reorder<F>(
+    home: &Path,
+    desired: &[String],
+    expected: &[String],
+    mut rpc: F,
+) -> Result<Reordered, BackendFailure>
+where
+    F: FnMut(&str, Value) -> Result<Value, BackendFailure>,
+{
+    validate_order(desired)?;
+    validate_order(expected)?;
+    let _guard = mutation_guard()?;
+    let (section_id, mut current) = thread_ids(home, &mut rpc).map_err(|error| {
+        failure(
+            "thread_reorder_read_failed",
+            format!(
+                "Cannot read current pin order ({}); refresh before saving again",
+                error.code
+            ),
+        )
+    })?;
+    if current == desired {
+        return Ok(Reordered {
+            section_id,
+            thread_ids: current,
+            changed: false,
+        });
+    }
+    if current != expected {
+        return Err(failure("thread_reorder_stale_snapshot", "Pinned conversations changed elsewhere; refresh and review the new order before saving"));
+    }
+    let mut current_set = current.iter().collect::<Vec<_>>();
+    let mut desired_set = desired.iter().collect::<Vec<_>>();
+    current_set.sort();
+    desired_set.sort();
+    if current_set != desired_set {
+        return Err(failure("thread_reorder_invalid_order", "The requested order must include every current pin exactly once; refresh before saving again"));
+    }
+    let id = section_id.as_ref().ok_or_else(|| {
+        failure(
+            "thread_reorder_invalid_order",
+            "The native pin section is missing; refresh before saving again",
+        )
+    })?;
+    let mut before: Option<&String> = None;
+    for thread in desired.iter().rev() {
+        let position = current
+            .iter()
+            .position(|item| item == thread)
+            .expect("validated permutation");
+        if current.get(position + 1) == before {
+            before = Some(thread);
+            continue;
+        }
+        if let Err(error) = rpc(
+            "thread/section/move",
+            json!({
+                "threadId": thread, "sectionId": id, "beforeThreadId": before,
+            }),
+        ) {
+            if let Ok((verified_section, verified)) = thread_ids(home, &mut rpc) {
+                if verified_section == section_id && verified == desired {
+                    return Ok(Reordered {
+                        section_id,
+                        thread_ids: verified,
+                        changed: true,
+                    });
+                }
+            }
+            return Err(failure("thread_reorder_outcome_unknown", format!("A native move could not be confirmed ({}); some order may have changed. Refresh and review before saving again; no move was retried", error.code)));
+        }
+        current.remove(position);
+        let insertion = before
+            .and_then(|next| current.iter().position(|item| item == next))
+            .unwrap_or(current.len());
+        current.insert(insertion, thread.clone());
+        before = Some(thread);
+    }
+    match thread_ids(home, &mut rpc) {
+        Ok((verified_section, verified)) if verified_section == section_id && verified == desired =>
+            Ok(Reordered {section_id, thread_ids: verified, changed: true}),
+        _ => Err(failure("thread_reorder_verify_failed", "Native pin order could not be verified; refresh and review before saving again. No success was recorded")),
+    }
 }
 
 /// Serialize native creation and fsync the intent before the one external call.
@@ -329,6 +490,280 @@ mod tests {
     }
     fn denied() -> BackendFailure {
         failure("timeout", "fixture timeout")
+    }
+
+    struct NativeFixture {
+        order: Vec<String>,
+        moves: usize,
+        reads: usize,
+        fail_move: Option<usize>,
+        fail_read: Option<usize>,
+        ignore_moves: bool,
+    }
+
+    impl NativeFixture {
+        fn new(order: &[&str]) -> Self {
+            Self {
+                order: ids(order),
+                moves: 0,
+                reads: 0,
+                fail_move: None,
+                fail_read: None,
+                ignore_moves: false,
+            }
+        }
+
+        fn rpc(&mut self, method: &str, params: Value) -> Result<Value, BackendFailure> {
+            match method {
+                "threadSection/list" => Ok(json!({"data":[{"id":LEGACY_ID,"name":NAME}]})),
+                "thread/list" => {
+                    self.reads += 1;
+                    if self.fail_read == Some(self.reads) {
+                        return Err(denied());
+                    }
+                    assert_eq!(params["sectionId"], LEGACY_ID);
+                    assert_eq!(params["sortKey"], "section_position");
+                    Ok(
+                        json!({"data": self.order.iter().map(|id| json!({"id":id})).collect::<Vec<_>>()}),
+                    )
+                }
+                "thread/section/move" => {
+                    self.moves += 1;
+                    assert_eq!(params["sectionId"], LEGACY_ID);
+                    if !self.ignore_moves {
+                        let thread = params["threadId"].as_str().unwrap().to_owned();
+                        self.order.retain(|id| id != &thread);
+                        let insert = params["beforeThreadId"]
+                            .as_str()
+                            .map(|next| self.order.iter().position(|id| id == next).unwrap())
+                            .unwrap_or(self.order.len());
+                        self.order.insert(insert, thread);
+                    }
+                    if self.fail_move == Some(self.moves) {
+                        Err(denied())
+                    } else {
+                        Ok(json!({}))
+                    }
+                }
+                _ => panic!("Reorder must not create sections, pin, or submit turns: {method}"),
+            }
+        }
+    }
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn pinned_reorder_validates_full_permutation_and_verifies_native_order() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["finance", "dispatcher", "pdf"]);
+        let desired = ids(&["dispatcher", "finance", "pdf"]);
+        let saved = reorder(&home, &desired, &fixture.order.clone(), |m, p| {
+            fixture.rpc(m, p)
+        })
+        .unwrap();
+        assert!(saved.changed);
+        assert_eq!(saved.thread_ids, desired);
+        assert_eq!(saved.section_id.as_deref(), Some(LEGACY_ID));
+        assert_eq!(
+            fixture.moves, 1,
+            "Already positioned neighbours need no extra move"
+        );
+        assert_eq!(fixture.reads, 2);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_duplicate_and_invalid_ids_never_reach_native() {
+        let home = home();
+        for desired in [ids(&["a", "a"]), ids(&[" "]), ids(&["a\nb"])] {
+            let result = reorder(&home, &desired, &ids(&["a", "b"]), |_, _| {
+                panic!("Invalid request must not call native")
+            });
+            assert_eq!(result.unwrap_err().code, "thread_reorder_invalid_order");
+        }
+        let result = reorder(&home, &ids(&["a", "b"]), &ids(&["a", "a"]), |_, _| {
+            panic!("Invalid snapshot must not call native")
+        });
+        assert_eq!(result.unwrap_err().code, "thread_reorder_invalid_order");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_cannot_add_drop_or_unpin_threads() {
+        let home = home();
+        for desired in [ids(&["a"]), ids(&["a", "b", "c"]), ids(&["a", "unknown"])] {
+            let mut fixture = NativeFixture::new(&["a", "b"]);
+            let result = reorder(&home, &desired, &ids(&["a", "b"]), |m, p| fixture.rpc(m, p));
+            assert_eq!(result.unwrap_err().code, "thread_reorder_invalid_order");
+            assert_eq!(fixture.moves, 0);
+            assert_eq!(fixture.order, ids(&["a", "b"]));
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_stale_snapshot_never_writes() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "c", "b"]);
+        let result = reorder(
+            &home,
+            &ids(&["c", "b", "a"]),
+            &ids(&["a", "b", "c"]),
+            |m, p| fixture.rpc(m, p),
+        );
+        assert_eq!(result.unwrap_err().code, "thread_reorder_stale_snapshot");
+        assert_eq!(fixture.moves, 0);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_exact_retry_reads_success_without_another_move() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b"]);
+        let result = reorder(&home, &ids(&["a", "b"]), &ids(&["b", "a"]), |m, p| {
+            fixture.rpc(m, p)
+        })
+        .unwrap();
+        assert!(!result.changed);
+        assert_eq!(fixture.moves, 0);
+        assert_eq!(fixture.reads, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_final_read_failure_is_not_reported_saved() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b"]);
+        fixture.fail_read = Some(2);
+        let result = reorder(&home, &ids(&["b", "a"]), &ids(&["a", "b"]), |m, p| {
+            fixture.rpc(m, p)
+        });
+        assert_eq!(result.unwrap_err().code, "thread_reorder_verify_failed");
+        assert_eq!(fixture.moves, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_partial_timeout_stops_without_retry_or_compensation() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b", "c"]);
+        fixture.fail_move = Some(1);
+        let result = reorder(
+            &home,
+            &ids(&["c", "b", "a"]),
+            &ids(&["a", "b", "c"]),
+            |m, p| fixture.rpc(m, p),
+        );
+        assert_eq!(result.unwrap_err().code, "thread_reorder_outcome_unknown");
+        assert_eq!(fixture.moves, 1);
+        assert_eq!(fixture.order, ids(&["b", "c", "a"]));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_partial_failure_notifies_other_clients_with_current_facts() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b", "c"]);
+        fixture.fail_move = Some(1);
+        let desired = ids(&["c", "b", "a"]);
+        assert!(
+            reorder(&home, &desired, &ids(&["a", "b", "c"]), |m, p| fixture
+                .rpc(m, p))
+            .is_err()
+        );
+        let event = refresh_after_failed_reorder(&home, |m, p| fixture.rpc(m, p));
+        assert_eq!(event["type"], "bridge_thread_pins_updated");
+        assert_eq!(event["save_status"], "unconfirmed");
+        assert_eq!(event["refresh_required"], true);
+        assert_eq!(event["thread_ids"], json!(["b", "c", "a"]));
+        assert_ne!(event["thread_ids"], json!(desired));
+        assert!(event.get("verified").is_none());
+        let (_, read_by_other_client) = thread_ids(&home, |m, p| fixture.rpc(m, p)).unwrap();
+        assert_eq!(event["thread_ids"], json!(read_by_other_client));
+        assert_eq!(
+            fixture.moves, 1,
+            "Notification and reconciliation never retry writes"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_failed_reconciliation_requests_refresh_without_invented_ids() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b"]);
+        fixture.fail_read = Some(1);
+        let event = refresh_after_failed_reorder(&home, |m, p| fixture.rpc(m, p));
+        assert_eq!(event["refresh_required"], true);
+        assert_eq!(event["save_status"], "unconfirmed");
+        assert!(event.get("thread_ids").is_none());
+        assert!(event.get("section_id").is_none());
+        assert!(event.get("verified").is_none());
+        assert_eq!(fixture.moves, 0);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_last_move_timeout_is_reconciled_by_read_only() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b"]);
+        fixture.fail_move = Some(1);
+        let result = reorder(&home, &ids(&["b", "a"]), &ids(&["a", "b"]), |m, p| {
+            fixture.rpc(m, p)
+        })
+        .unwrap();
+        assert!(result.changed);
+        assert_eq!(result.thread_ids, ids(&["b", "a"]));
+        assert_eq!(fixture.moves, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_native_noop_or_external_drift_fails_readback() {
+        let home = home();
+        let mut fixture = NativeFixture::new(&["a", "b"]);
+        fixture.ignore_moves = true;
+        let result = reorder(&home, &ids(&["b", "a"]), &ids(&["a", "b"]), |m, p| {
+            fixture.rpc(m, p)
+        });
+        assert_eq!(result.unwrap_err().code, "thread_reorder_verify_failed");
+        assert_eq!(fixture.moves, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pinned_reorder_two_concurrent_saves_cannot_interleave_moves() {
+        let home = home();
+        let fixture = std::sync::Arc::new(Mutex::new(NativeFixture::new(&["a", "b", "c"])));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = [ids(&["b", "a", "c"]), ids(&["a", "c", "b"])]
+            .into_iter()
+            .map(|desired| {
+                let (home, fixture, barrier) = (home.clone(), fixture.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reorder(&home, &desired, &ids(&["a", "b", "c"]), |m, p| {
+                        fixture.lock().unwrap().rpc(m, p)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.code == "thread_reorder_stale_snapshot"))
+                .count(),
+            1
+        );
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn pinned_section_legacy_identity_is_reused_without_creation() {

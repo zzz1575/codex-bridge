@@ -198,6 +198,10 @@ pub enum Request {
         thread_id: String,
         pinned: bool,
     },
+    ThreadReorder {
+        thread_ids: Vec<String>,
+        expected_thread_ids: Vec<String>,
+    },
     WorkspaceDiff {
         thread_id: String,
     },
@@ -377,6 +381,7 @@ impl Request {
             Self::ManagedAppServerRestart => "managed_app_server_restart",
             Self::ThreadPins => "thread_pins",
             Self::ThreadPin { .. } => "thread_pin",
+            Self::ThreadReorder { .. } => "thread_reorder",
             Self::WorkspaceDiff { .. } => "workspace_diff",
             Self::Select { .. } => "select",
             Self::Current => "current",
@@ -474,6 +479,7 @@ pub fn default_socket_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn service_tier_is_optional_in_legacy_requests_and_round_trips_explicit_choices() {
@@ -817,6 +823,22 @@ mod tests {
         assert_eq!(pin["command"], "thread_pin");
         assert_eq!(pin["thread_id"], "thread-1");
         assert_eq!(pin["pinned"], true);
+
+        let reorder = serde_json::to_value(Request::ThreadReorder {
+            thread_ids: vec!["dispatcher".into(), "finance".into()],
+            expected_thread_ids: vec!["finance".into(), "dispatcher".into()],
+        })
+        .unwrap();
+        assert_eq!(reorder["command"], "thread_reorder");
+        assert_eq!(reorder["thread_ids"], json!(["dispatcher", "finance"]));
+        assert_eq!(
+            reorder["expected_thread_ids"],
+            json!(["finance", "dispatcher"])
+        );
+        assert!(serde_json::from_value::<Request>(json!({
+            "command": "thread_reorder", "thread_ids": []
+        }))
+        .is_err());
 
         let diff = serde_json::to_value(Request::WorkspaceDiff {
             thread_id: "thread-1".into(),

@@ -727,6 +727,51 @@ aside {
 .sidebar-sessions #projects {
   flex: 1;
 }
+.session-sort-dialog {
+  width: min(600px, calc(100vw - 28px));
+  max-height: min(760px, calc(100dvh - 32px));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 80px #0007;
+}
+.session-sort-dialog[open] { display: flex; flex-direction: column; }
+.session-sort-dialog::backdrop { background: #0008; }
+.session-sort-head, .session-sort-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  flex: none;
+}
+.session-sort-head { border-bottom: 1px solid var(--line); }
+.session-sort-head h2 { margin: 0; font-size: 17px; }
+.session-sort-close { font-size: 24px; line-height: 1; min-width: 36px; }
+.session-sort-hint { margin: 14px 18px 10px; color: var(--muted); font-size: 13px; }
+.session-sort-toolbar { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 18px; }
+.session-sort-toolbar button { font-size: 13px; min-height: 36px; }
+.session-sort-reload { margin-left: auto; }
+.session-sort-status { flex: none; margin: 10px 18px; min-height: 18px; font-size: 12px; color: var(--muted); }
+.session-sort-status.error { color: var(--danger); }
+.session-sort-list { overflow-y: auto; overscroll-behavior: contain; min-height: 0; margin: 0; padding: 0 12px 8px; list-style: none; }
+.session-sort-row { display: grid; grid-template-columns: 30px 24px minmax(0, 1fr) 40px 40px; gap: 5px; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 7px; margin: 6px 0; background: var(--panel2); }
+.session-sort-row.drop-target { border-color: var(--accent); box-shadow: 0 -3px 0 var(--accent); }
+.session-sort-row button { padding: 0; min-height: 38px; font-size: 18px; }
+.session-sort-row button:disabled { opacity: .35; }
+.session-sort-row .session-sort-handle { cursor: grab; border: 0; background: transparent; color: var(--muted); }
+.session-sort-rank { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; text-align: center; }
+.session-sort-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 14px; }
+.session-sort-footer { justify-content: flex-end; border-top: 1px solid var(--line); }
+.session-sort-footer button { min-height: 40px; min-width: 90px; }
+@media (max-width: 520px) {
+  .session-sort-row { grid-template-columns: 24px 20px minmax(0, 1fr) 42px 42px; gap: 3px; padding: 5px; }
+  .session-sort-row button { min-height: 44px; }
+  .session-sort-list { padding-inline: 8px; }
+  .session-sort-head, .session-sort-footer { padding-inline: 14px; }
+}
 .settings-overlay {
   position: fixed;
   inset: 0;

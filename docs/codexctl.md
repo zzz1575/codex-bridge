@@ -130,6 +130,42 @@ does not move files. The same action is available in the Web UI session tools.
 Override the read store for an isolated or offline inspection by starting the daemon with
 `--codex-home PATH`. This changes the daemon, not `codexctl` itself.
 
+## Pinned conversation order (JSON API)
+
+The authenticated Web UI and socket JSON API use the same native pin section. Read
+`{"command":"thread_pins"}` first: `thread_ids` is the complete persisted order, even when
+some rollout summaries are unavailable. `ls` retains its existing recency semantics.
+
+To save a manual order, send every current pinned UUID exactly once, alongside the original
+order as a concurrency snapshot:
+
+```json
+{
+  "command": "thread_reorder",
+  "thread_ids": ["dispatcher-thread", "finance-thread", "pdf-thread"],
+  "expected_thread_ids": ["finance-thread", "dispatcher-thread", "pdf-thread"]
+}
+```
+
+A verified success returns `action: "thread_reorder"`, `status: "saved"` or `"unchanged"`,
+`verified: true`, `section_id`, and the canonical `thread_ids`. This operation only reorders
+existing pins; it never pins, unpins, creates sections, starts turns, or changes task records.
+An exact retry that already matches the native order returns `unchanged` without another move.
+
+`thread_reorder_stale_snapshot` requires a fresh list and user review before saving again.
+`thread_reorder_outcome_unknown` and `thread_reorder_verify_failed` can mean that part of the
+order changed: refresh and review rather than replaying the original request automatically.
+Bridge serializes its pin mutations and verifies the final native order before reporting success;
+external native clients can still change the order independently.
+
+The status capabilities expose `thread_reorder: true`. A verified update emits the lightweight
+event `{"type":"bridge_thread_pins_updated","section_id":"native-section-id","thread_ids":[...]}`.
+Clients should refresh their pin list without resetting the currently open conversation,
+message scroll, draft, or a locally edited sort dialog.
+An unsuccessful save also emits this event with `refresh_required: true` and
+`save_status: "unconfirmed"`. It includes only the current native `thread_ids` if a read succeeds;
+otherwise the IDs are omitted. This notification never means the requested order was saved.
+
 ## Queue and steer
 
 ```sh
