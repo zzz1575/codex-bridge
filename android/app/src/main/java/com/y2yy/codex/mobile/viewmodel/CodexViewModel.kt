@@ -38,7 +38,7 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
     private var streamJob: Job? = null
     private var streamGeneration = 0L
     private var refreshJob: Job? = null
-    private var listRefreshJob: Job? = null
+    private val sessionListRefreshQueue = SessionRefreshQueue(viewModelScope) { loadSessions() }
     private var streamSequence = -1L
     private var sessionSeeded = false
     private var restorePending = true
@@ -46,6 +46,8 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
     private var sessionGeneration = 0L
     private var pendingRevision = 0L
     private var lastListRefresh = 0L
+    private val sessionRefreshGate = SessionRefreshGate()
+    private var confirmedSessionPins: JSONObject? = null
     private var pageStart = -1
     private var liveRevision = 0L
     private var composerRevision = 0L
@@ -74,8 +76,9 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
                 composerServiceTier = if (it.selected == null) tier else it.composerServiceTier)
         } } }
         viewModelScope.launch {
-            store.cached("sessions")?.let { cached -> runCatching { BridgeParser.sessions(JSONObject(cached)) }.getOrNull()?.let { sessions ->
-                mutable.update { it.copy(sessions = sessions, fromCache = true, loading = false) }
+            store.cached("sessions")?.let { cached -> runCatching { JSONObject(cached) }.getOrNull()?.let { snapshot ->
+                confirmedSessionPins = SessionOrdering.cachedPins(snapshot)
+                mutable.update { it.copy(sessions = BridgeParser.sessions(snapshot), fromCache = true, loading = false) }
             } }
             val savedId = store.lastSession.first()
             mutable.value.sessions.find { it.id == savedId }?.takeIf { navigationRevision == 0L }?.let { session ->
@@ -154,6 +157,11 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
                             if (id == mutable.value.selected?.id) scheduleRefresh()
                             if (id.isNotBlank() && mutable.value.sessions.none { it.id == id }) scheduleListRefresh()
                         }
+                        if (type == "bridge_thread_pins_updated") {
+                            SessionOrdering.pins(event)?.let { confirmedSessionPins = it }
+                            sessionRefreshGate.begin() // Invalidate reads started before this native order change.
+                            scheduleListRefresh()
+                        }
                         if (type in listOf("bridge_approvals_changed", "bridge_server_requests_changed", "app_server_request")) launch { runCatching { loadApprovals() } }
                         if (type == "bridge_event_gap") { scheduleRefresh(); scheduleListRefresh(); mutable.value.selected?.id?.let { id -> launch { loadComposer(id) } } }
                         if (type == "bridge_app_server_connection") {
@@ -198,7 +206,17 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
         } catch (e: Exception) { if (e is CancellationException) throw e; error(e) }
     } }
     private suspend fun loadSessions() {
-        val sessionsJson = api.command(JSONObject().put("command", "ls").put("limit", 200).put("include_archived", false))
+        val refreshTicket = sessionRefreshGate.begin()
+        val (sessionsJson, loadedPins) = coroutineScope {
+            val listing = async { api.command(JSONObject().put("command", "ls").put("limit", 200).put("include_archived", false)) }
+            val pins = async {
+                try { api.command(JSONObject().put("command", "thread_pins")) }
+                catch (e: CancellationException) { throw e }
+                catch (_: Exception) { null } // Older Bridge versions keep their original ls order.
+            }
+            val nativePins = SessionOrdering.pins(pins.await())
+            SessionOrdering.snapshot(listing.await(), nativePins, confirmedSessionPins) to nativePins
+        }
         val readLimit = Semaphore(4)
         val reads = coroutineScope {
             BridgeParser.sessions(sessionsJson).map { session -> async {
@@ -222,15 +240,18 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
         }
         val sessions = reads.map { it.first }
         val projects = runCatching { BridgeParser.projects(api.command(JSONObject().put("command", "projects").put("include_archived", false))) }.getOrElse { mutable.value.projects }
-        mutable.update { old -> SessionActivity.mergeSessions(old, sessions, reads.map { it.second }).copy(
-            selected = old.selected?.let { selected -> sessions.find { it.id == selected.id }?.copy(model = old.composerModel.ifBlank { selected.model }) ?: selected },
-            projects = projects, loading = false, fromCache = false) }
         val byId = sessions.associateBy { it.id }
         sessionsJson.optJSONArray("threads")?.objects()?.forEach { raw -> byId[raw.string("id")]?.let { canonical ->
             raw.put("title", canonical.title).put("cwd", canonical.projectPath).put("model", canonical.model)
         } }
-        store.cache("sessions", sessionsJson.toString())
-        lastListRefresh = System.currentTimeMillis()
+        sessionRefreshGate.publish(refreshTicket) {
+            if (loadedPins != null) confirmedSessionPins = loadedPins
+            mutable.update { old -> SessionActivity.mergeSessions(old, sessions, reads.map { it.second }).copy(
+                selected = old.selected?.let { selected -> sessions.find { it.id == selected.id }?.copy(model = old.composerModel.ifBlank { selected.model }) ?: selected },
+                projects = projects, loading = false, fromCache = false) }
+            store.cache("sessions", sessionsJson.toString())
+            lastListRefresh = System.currentTimeMillis()
+        }
     }
     fun navigationChanged() { navigationRevision++; restorePending = false }
     fun select(session: Session) { navigationChanged(); viewModelScope.launch { open(session) } }
@@ -348,8 +369,7 @@ class CodexViewModel(application: Application): AndroidViewModel(application) {
         refreshJob = viewModelScope.launch { delay(350); runCatching { refreshSelected() } }
     }
     private fun scheduleListRefresh() {
-        if (listRefreshJob?.isActive == true) return
-        listRefreshJob = viewModelScope.launch { delay(350); runCatching { loadSessions() } }
+        sessionListRefreshQueue.request()
     }
     private suspend fun refreshSelected() {
         if (!refreshLock.tryLock()) { selectedRefreshRequested = true; return }
