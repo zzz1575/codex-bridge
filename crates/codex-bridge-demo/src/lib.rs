@@ -48,7 +48,7 @@ struct DemoState {
     model: String,
     effort: String,
     service_tiers: HashMap<String, String>,
-    pinned_thread: Option<String>,
+    pinned_threads: Vec<String>,
     renamed_threads: HashMap<String, String>,
     initialized_projects: Vec<Value>,
     initialization_requests: HashMap<String, (Value, Value)>,
@@ -78,7 +78,7 @@ impl DemoState {
             model: "gpt-5.6-sol".to_owned(),
             effort: "medium".to_owned(),
             service_tiers: HashMap::new(),
-            pinned_thread: Some(PRIMARY_THREAD.to_owned()),
+            pinned_threads: vec![PRIMARY_THREAD.to_owned()],
             renamed_threads: HashMap::new(),
             initialized_projects: Vec::new(),
             initialization_requests: HashMap::new(),
@@ -125,7 +125,7 @@ impl DemoState {
             "updated_at_ms": 1_788_767_541_844_u64,
             "source": "demo",
             "archived": false,
-            "pinned": self.pinned_thread.as_deref() == Some(id),
+            "pinned": self.pinned_threads.iter().any(|pinned| pinned == id),
         })
     }
 
@@ -1006,6 +1006,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             "live_simulation": true,
             "protocol_version": 44,
             "capabilities": {
+                "thread_reorder": true,
                 "audio_transcription": {
                     "enabled": true,
                     "reason": null,
@@ -1109,7 +1110,7 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
             })
         }
         "thread_pins" => {
-            let thread_ids = state.pinned_thread.iter().collect::<Vec<_>>();
+            let thread_ids = &state.pinned_threads;
             let threads = thread_ids
                 .iter()
                 .map(|thread_id| state.thread(thread_id))
@@ -1146,11 +1147,75 @@ fn dispatch(request: Value, state: &mut DemoState) -> Value {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             if pinned {
-                state.pinned_thread = Some(thread_id.to_owned());
-            } else if state.pinned_thread.as_deref() == Some(thread_id) {
-                state.pinned_thread = None;
+                if !state.pinned_threads.iter().any(|id| id == thread_id) {
+                    state.pinned_threads.push(thread_id.to_owned());
+                }
+            } else {
+                state.pinned_threads.retain(|id| id != thread_id);
             }
             json!({"thread_id": thread_id, "pinned": pinned})
+        }
+        "thread_reorder" => {
+            let parse = |field| {
+                request
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .and_then(|values| {
+                        values
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .filter(|id| {
+                                        !id.is_empty()
+                                            && id.len() <= 256
+                                            && id.trim() == *id
+                                            && !id.chars().any(char::is_control)
+                                    })
+                                    .map(str::to_owned)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+            };
+            let (Some(desired), Some(expected)) =
+                (parse("thread_ids"), parse("expected_thread_ids"))
+            else {
+                return error(
+                    "thread_reorder_invalid_order",
+                    "A complete order and original snapshot are required",
+                );
+            };
+            let valid = |ids: &[String]| {
+                ids.len() <= 10_000
+                    && ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len()
+            };
+            if !valid(&desired) || !valid(&expected) {
+                return error(
+                    "thread_reorder_invalid_order",
+                    "Duplicate pinned conversations are invalid",
+                );
+            }
+            let changed = desired != state.pinned_threads;
+            if changed {
+                if expected != state.pinned_threads {
+                    return error(
+                        "thread_reorder_stale_snapshot",
+                        "Pinned conversations changed; refresh before saving",
+                    );
+                }
+                let mut actual_set = state.pinned_threads.clone();
+                let mut desired_set = desired.clone();
+                actual_set.sort();
+                desired_set.sort();
+                if actual_set != desired_set {
+                    return error(
+                        "thread_reorder_invalid_order",
+                        "Include every current pin exactly once",
+                    );
+                }
+                state.pinned_threads = desired;
+            }
+            json!({"action":"thread_reorder", "status":if changed {"saved"} else {"unchanged"}, "section_id":"demo-pins", "thread_ids":state.pinned_threads, "verified":true})
         }
         "current" | "select" => {
             json!({"thread": state.thread(thread_id), "selection": {"method": "demo", "authoritative": true}})
@@ -2189,9 +2254,65 @@ mod tests {
             &mut state,
         );
         let pins = dispatch(json!({"command": "thread_pins"}), &mut state);
-        assert_eq!(pins["result"]["thread_ids"], json!([SECONDARY_THREAD]));
-        assert_eq!(pins["result"]["threads"][0]["id"], SECONDARY_THREAD);
-        assert_eq!(state.thread(PRIMARY_THREAD)["pinned"], false);
+        assert_eq!(
+            pins["result"]["thread_ids"],
+            json!([PRIMARY_THREAD, SECONDARY_THREAD])
+        );
+        assert_eq!(pins["result"]["threads"][1]["id"], SECONDARY_THREAD);
+        assert_eq!(state.thread(PRIMARY_THREAD)["pinned"], true);
         assert_eq!(state.thread(SECONDARY_THREAD)["pinned"], true);
+    }
+
+    #[test]
+    fn reordering_demo_pins_persists_and_exact_retry_is_unchanged() {
+        let mut state = DemoState::new();
+        dispatch(
+            json!({"command":"thread_pin", "thread_id":SECONDARY_THREAD, "pinned":true}),
+            &mut state,
+        );
+        let request = json!({"command":"thread_reorder", "thread_ids":[SECONDARY_THREAD,PRIMARY_THREAD], "expected_thread_ids":[PRIMARY_THREAD,SECONDARY_THREAD]});
+        let saved = result(dispatch(request.clone(), &mut state));
+        assert_eq!(saved["status"], "saved");
+        assert_eq!(saved["verified"], true);
+        let pins = result(dispatch(json!({"command":"thread_pins"}), &mut state));
+        assert_eq!(
+            pins["thread_ids"],
+            json!([SECONDARY_THREAD, PRIMARY_THREAD])
+        );
+        assert_eq!(pins["threads"][0]["id"], SECONDARY_THREAD);
+        assert_eq!(result(dispatch(request, &mut state))["status"], "unchanged");
+    }
+
+    #[test]
+    fn demo_reorder_rejects_stale_incomplete_and_duplicate_orders() {
+        let mut state = DemoState::new();
+        dispatch(
+            json!({"command":"thread_pin", "thread_id":SECONDARY_THREAD, "pinned":true}),
+            &mut state,
+        );
+        for (desired, expected, code) in [
+            (
+                json!([SECONDARY_THREAD, PRIMARY_THREAD]),
+                json!([SECONDARY_THREAD]),
+                "thread_reorder_stale_snapshot",
+            ),
+            (
+                json!([SECONDARY_THREAD]),
+                json!([PRIMARY_THREAD, SECONDARY_THREAD]),
+                "thread_reorder_invalid_order",
+            ),
+            (
+                json!([PRIMARY_THREAD, PRIMARY_THREAD]),
+                json!([PRIMARY_THREAD, SECONDARY_THREAD]),
+                "thread_reorder_invalid_order",
+            ),
+        ] {
+            let reply = dispatch(
+                json!({"command":"thread_reorder", "thread_ids":desired, "expected_thread_ids":expected}),
+                &mut state,
+            );
+            assert_eq!(reply["error"]["code"], code);
+            assert_eq!(state.pinned_threads, vec![PRIMARY_THREAD, SECONDARY_THREAD]);
+        }
     }
 }

@@ -1,4 +1,5 @@
 import { createServerRequestTray } from "./server-requests.js";
+import { showSessionSortDialog } from "./session-sort.js";
 import "./styles.css";
 import {
   $,
@@ -1211,11 +1212,19 @@ async function loadInitialView() {
   if (state.current?.id === requestedId) await revealSessionProject(state.current);
   preloadExpandedProjectThreads();
 }
+let pinLoadGeneration = 0;
+let pinHasSnapshot = false;
 async function loadPins() {
+  const generation = ++pinLoadGeneration;
   try {
     const result = await command({ command: "thread_pins" }, false),
       ids = Array.isArray(result.thread_ids) ? result.thread_ids : [];
+    if (generation !== pinLoadGeneration) return;
+    if (!result.available && pinHasSnapshot) return;
+    if (new Set(ids).size !== ids.length || ids.some((id) => typeof id !== "string"))
+      throw new Error("Invalid pinned conversation snapshot");
     state.pinAvailable = Boolean(result.available);
+    pinHasSnapshot = state.pinAvailable;
     state.pinnedIds = new Set(ids);
     const returned = new Map(
       (Array.isArray(result.threads) ? result.threads : []).map((thread) => [thread.id, thread]),
@@ -1239,6 +1248,8 @@ async function loadPins() {
       );
     }
   } catch {
+    if (generation !== pinLoadGeneration) return;
+    if (pinHasSnapshot) return;
     state.pinAvailable = false;
     state.pinnedIds.clear();
     state.pinnedThreads = [];
@@ -1998,6 +2009,7 @@ async function openSessionById(threadId, { fromHash = false, replaceHash = false
 function renderProjects() {
   const q = $("search").value.trim().toLowerCase(),
     root = $("projects");
+  $("sessionSortBtn").disabled = !state.pinAvailable || state.pinnedIds.size < 2;
   const viewButton = $("sessionViewBtn"),
     recent = state.sessionView === "recent",
     viewLabel = tr(recent ? "projectSessions" : "recentSessions");
@@ -6541,8 +6553,13 @@ function handleTemporaryAppServerEvent(method, params, threadId) {
 }
 
 function handleBridgeEvent(event) {
+  if (event?.type === "bridge_thread_pins_updated") {
+    void loadPins().then(renderProjects);
+    return;
+  }
   if (event?.type === "bridge_event_stream") {
     state.eventStreamConnected = event.status === "ready";
+    if (state.eventStreamConnected) void loadPins().then(renderProjects);
     scheduleActivityFallback();
     schedulePendingFallback(true);
     scheduleTasksFallback();
@@ -7822,6 +7839,11 @@ $("projects").addEventListener("scroll", () => closeThreadArchiveSwipe(null, { i
 $("archived").onchange = () => run(loadProjects);
 $("reloadBtn").onclick = () => window.location.reload();
 $("sessionViewBtn").onclick = toggleSessionView;
+$("sessionSortBtn").onclick = () => run(() => showSessionSortDialog({
+  command, tr, notify,
+  onSaved: async () => { await loadPins(); renderProjects(); },
+  onFailure: async () => { await loadPins(); renderProjects(); },
+}));
 $("tasksBtn").onclick = openTasksDialog;
 $("tasksCloseBtn").onclick = closeTasksDialog;
 $("tasksDialog").onclick = (event) => {

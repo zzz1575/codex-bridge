@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Conversation sorting fixture</title
+  ><link rel="stylesheet" href="../src/styles.css" />
+  <body style="padding: 24px; overflow: auto">
+    <main style="max-width: 720px; margin: auto">
+      <h1>会话排序测试</h1>
+      <p>仅使用合成数据，不连接业务服务。</p>
+      <button id="open">会话排序</button><button id="conflict">下次保存模拟冲突</button>
+      <button id="readFailure">下次读取模拟断线</button
+      ><label><input id="slow" type="checkbox" />延迟保存</label>
+      <p>已保存顺序：<output id="savedOrder"></output></p>
+      <p>保存请求数：<output id="saveCalls">0</output></p>
+      <p id="notice" role="status"></p>
+    </main>
+    <script type="module">
+      import { showSessionSortDialog } from "../src/session-sort.js";
+      import { applyLanguage, t } from "../src/i18n.js";
+      applyLanguage("zh", false);
+      const threads = [
+        { id: "finance", title: "1｜财务", updated_at_ms: 300 },
+        { id: "control", title: "0｜总控", updated_at_ms: 100 },
+        { id: "pdf", title: "2｜PDF识别", updated_at_ms: 200 },
+        { id: "ab", title: "3｜A/B单", updated_at_ms: 150 },
+      ];
+      let order = threads.map((t) => t.id),
+        conflict = false,
+        readFailure = false,
+        calls = 0;
+      const render = () => {
+        document.querySelector("#savedOrder").textContent = order
+          .map((id) => threads.find((t) => t.id === id).title)
+          .join(" → ");
+        document.querySelector("#saveCalls").textContent = String(calls);
+      };
+      const command = async (request) => {
+        if (request.command === "thread_pins") {
+          if (readFailure) {
+            readFailure = false;
+            throw new Error("synthetic network failure");
+          }
+          return { available: true, thread_ids: [...order], threads };
+        }
+        calls++;
+        render();
+        if (document.querySelector("#slow").checked)
+          await new Promise((resolve) => setTimeout(resolve, 900));
+        if (conflict) {
+          conflict = false;
+          [order[2], order[3]] = [order[3], order[2]];
+          render();
+          throw new Error("synthetic stale snapshot");
+        }
+        if (JSON.stringify(request.expected_thread_ids) !== JSON.stringify(order))
+          throw new Error("synthetic stale snapshot");
+        order = [...request.thread_ids];
+        render();
+        return { verified: true, thread_ids: [...order] };
+      };
+      document.querySelector("#open").onclick = () =>
+        showSessionSortDialog({
+          command,
+          tr: t,
+          onSaved: render,
+          onFailure: render,
+          notify: (message) => {
+            document.querySelector("#notice").textContent = message;
+          },
+        });
+      document.querySelector("#conflict").onclick = () => {
+        conflict = true;
+        document.querySelector("#notice").textContent = "已安排下一次保存模拟冲突";
+      };
+      document.querySelector("#readFailure").onclick = () => {
+        readFailure = true;
+        document.querySelector("#notice").textContent = "已安排下一次读取模拟断线";
+      };
+      render();
+    </script>
+  </body>
+</html>
