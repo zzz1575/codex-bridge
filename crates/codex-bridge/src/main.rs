@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, watch};
 
 mod passkey_auth;
 mod pasted_text;
+mod pinned_section;
 mod project_creation;
 mod weekly_usage_history;
 #[cfg(feature = "whisper")]
@@ -81,7 +82,6 @@ const WEB_APP_CSS: &str = include_str!("../../../web-ui/dist/assets/app.css");
 const WEB_FILE_PREVIEW_JS: &str = include_str!("../../../web-ui/dist/assets/file-preview.js");
 const WEB_APP_ICON: &[u8] = include_bytes!("../../../web-ui/dist/app-icon.png");
 const WEB_FAVICON: &[u8] = include_bytes!("../../../web-ui/dist/favicon.ico");
-const PINNED_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
 const MAX_SESSION_RUN_STATES: usize = 256;
 const MAX_PERFORMANCE_EVENTS: usize = 128;
 const MAX_APP_SERVER_TOOL_PAGES: usize = 8;
@@ -4088,7 +4088,7 @@ fn spawn_hot_session_cache(
                                 backend.publish_bridge_event(thread_run_snapshot_event(&run_states));
                             }
                             if refresh_pins {
-                                for thread_id in pinned_thread_ids(&backend)
+                                for thread_id in pinned_thread_ids(&backend, store.home())
                                     .unwrap_or_default()
                                     .into_iter()
                                     .take(pinned_limit)
@@ -7027,50 +7027,20 @@ fn relocated_workspace_roots(thread: &Value, old_cwd: &Path, target: &Path) -> V
     roots
 }
 
-fn pinned_thread_ids(write_backend: &CodexCliBackend) -> Result<Vec<String>, BackendFailure> {
-    let mut ids = Vec::new();
-    let mut cursor = None::<String>;
-    let mut seen_cursors = HashSet::new();
-    loop {
-        let result = write_backend.app_server_rpc(
-            "thread/list",
-            json!({
-                "cursor": cursor,
-                "limit": 100,
-                "modelProviders": [],
-                "sectionId": PINNED_THREAD_SECTION_ID,
-                "sortKey": "section_position",
-                "sortDirection": "asc",
-                "useStateDbOnly": true,
-            }),
-        )?;
-        let data = result
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| BackendFailure {
-                code: "app_server_protocol_error",
-                message: "thread/list returned no pinned thread data".to_owned(),
-            })?;
-        ids.extend(
-            data.iter()
-                .filter_map(|thread| thread.get("id").and_then(Value::as_str).map(str::to_owned)),
-        );
-        let Some(next) = result
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            break;
-        };
-        if !seen_cursors.insert(next.clone()) {
-            return Err(BackendFailure {
-                code: "app_server_protocol_error",
-                message: "thread/list repeated its pinned-thread cursor".to_owned(),
-            });
-        }
-        cursor = Some(next);
-    }
-    Ok(ids)
+fn pinned_thread_state(
+    write_backend: &CodexCliBackend,
+    codex_home: &Path,
+) -> Result<(Option<String>, Vec<String>), BackendFailure> {
+    pinned_section::thread_ids(codex_home, |method, params| {
+        write_backend.app_server_rpc(method, params)
+    })
+}
+
+fn pinned_thread_ids(
+    write_backend: &CodexCliBackend,
+    codex_home: &Path,
+) -> Result<Vec<String>, BackendFailure> {
+    pinned_thread_state(write_backend, codex_home).map(|(_, ids)| ids)
 }
 
 fn typed_thread_tool(item: &Value) -> Option<ThreadToolCall> {
@@ -8335,11 +8305,17 @@ fn fetch_app_server_project_index(
             }),
         )?);
     }
+    let pinned_id = pinned_section::resolve(codex_home, &sections)
+        .ok()
+        .flatten();
     let mut index = ThreadProjectIndex::from_app_server_with_sections(
         &json!({"data": projects}),
         &json!({"data": sections}),
         &threads,
     );
+    if let Some(section_id) = pinned_id {
+        index.exclude_pinned_section(&section_id);
+    }
     let desktop_state_path = codex_home.join(".codex-global-state.json");
     if fs::metadata(&desktop_state_path).is_ok_and(|metadata| metadata.len() <= 8 * 1024 * 1024) {
         if let Some(state) = fs::read(&desktop_state_path)
@@ -9114,7 +9090,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
             let pinned = if write_backend.app_server_socket().is_some_and(|socket| {
                 fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
             }) {
-                pinned_thread_ids(write_backend).unwrap_or_default()
+                pinned_thread_ids(write_backend, session_store.home()).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -10780,8 +10756,8 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Err(error) => Response::error("app_server_restart_failed", error.to_string()),
             }
         }
-        Request::ThreadPins => match pinned_thread_ids(write_backend) {
-            Ok(thread_ids) => {
+        Request::ThreadPins => match pinned_thread_state(write_backend, session_store.home()) {
+            Ok((section_id, thread_ids)) => {
                 let project_index = app_server_project_index(
                     write_backend,
                     app_server_projects,
@@ -10811,7 +10787,7 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 }
                 Response::success(json!({
                     "available": true,
-                    "section_id": PINNED_THREAD_SECTION_ID,
+                    "section_id": section_id,
                     "thread_ids": thread_ids,
                     "threads": threads,
                 }))
@@ -10823,23 +10799,33 @@ fn dispatch(request: Request, state: &BridgeState) -> Response {
                 Ok(thread) => thread,
                 Err(response) => return response,
             };
+            let section_id = if pinned {
+                match pinned_section::ensure(session_store.home(), |method, params| {
+                    write_backend.app_server_rpc(method, params)
+                }) {
+                    Ok(id) => Some(id),
+                    Err(error) => return write_backend_error(error),
+                }
+            } else {
+                None
+            };
             match write_backend.app_server_rpc(
                 "thread/section/move",
                 json!({
                     "threadId": thread.id,
-                    "sectionId": if pinned {
-                        Some(PINNED_THREAD_SECTION_ID)
-                    } else {
-                        None::<&str>
-                    },
+                    "sectionId": section_id,
                     "beforeThreadId": Value::Null,
                 }),
             ) {
-                Ok(_) => Response::success(json!({
-                    "action": "thread_pin",
-                    "thread_id": thread.id,
-                    "pinned": pinned,
-                })),
+                Ok(_) => {
+                    clear_project_cache(app_server_projects);
+                    session_store.invalidate_summary_cache();
+                    Response::success(json!({
+                        "action": "thread_pin",
+                        "thread_id": thread.id,
+                        "pinned": pinned,
+                    }))
+                }
                 Err(error) => write_backend_error(error),
             }
         }

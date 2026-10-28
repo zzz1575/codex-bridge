@@ -518,6 +518,14 @@ impl ThreadProjectIndex {
         }
     }
 
+    /// A native pin section is displayed in the dedicated pins list; it must
+    /// not detach its threads from their existing native project grouping.
+    pub fn exclude_pinned_section(&mut self, section_id: &str) {
+        self.sections.retain(|(id, _)| id != section_id);
+        self.thread_sections.retain(|_, id| id != section_id);
+        self.section_projects.retain(|_, id| id != section_id);
+    }
+
     pub fn native_project_id_for_path(&self, project_path: &Path) -> Option<String> {
         let canonical = fs::canonicalize(project_path).ok()?;
         self.native_project_ids.get(&canonical).cloned()
@@ -4532,6 +4540,24 @@ mod tests {
             .unwrap();
         assert_eq!(available, 1);
         assert_eq!(threads[0].id, "thread-chat");
+    }
+
+    #[test]
+    fn dynamic_pinned_section_keeps_threads_in_their_native_project() {
+        let project = json!({"data":[{"id":"project","name":"Example","roots":[{"path":"/example/project"}]}]});
+        let sections = json!({"data":[{"id":"dynamic-pins","name":"Pinned"}]});
+        let threads = vec![
+            json!({"id":"finance","projectId":"project","cwd":"/example/project","section":{"id":"dynamic-pins"}}),
+        ];
+        let mut index =
+            ThreadProjectIndex::from_app_server_with_sections(&project, &sections, &threads);
+        index.exclude_pinned_section("dynamic-pins");
+        assert!(index.sections.is_empty());
+        assert!(!index.thread_sections.contains_key("finance"));
+        assert_eq!(
+            index.thread_projects.get("finance"),
+            Some(&Some("project".to_owned()))
+        );
     }
 
     #[test]
