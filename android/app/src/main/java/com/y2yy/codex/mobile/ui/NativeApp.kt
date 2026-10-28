@@ -76,6 +76,8 @@ import com.y2yy.codex.mobile.data.AttachmentInputs
 import com.y2yy.codex.mobile.data.ServerRequests
 import com.y2yy.codex.mobile.data.PendingMessages
 import com.y2yy.codex.mobile.data.TaskProgress
+import com.y2yy.codex.mobile.data.TurnInterruption
+import com.y2yy.codex.mobile.data.ModelResponseWait
 import com.y2yy.codex.mobile.model.*
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -481,6 +483,11 @@ private fun HistoryTurnCard(turnId: String, toolCount: Int, fileCount: Int, load
 
 @Composable
 private fun MessageView(message: ChatMessage, onTool: (String) -> Unit, onRetryImage: (String) -> Unit) {
+    val interruption = remember(message) { TurnInterruption.presentation(message) }
+    if (interruption != null) {
+        TurnInterruptionCard(message.id, interruption)
+        return
+    }
     val progress = remember(message) { TaskProgress.presentation(message) }
     if (progress != null) {
         TaskProgressCard(message.id, progress)
@@ -708,11 +715,12 @@ private fun SelectionBlock(value: String) {
 
 @Composable
 private fun ActivityCard(state: AppUiState) {
+    val waiting = ModelResponseWait.isWaiting(state)
     Surface(color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = .55f), shape = RoundedCornerShape(14.dp)) {
         Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
             if (state.running) CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp) else Icon(Icons.Outlined.Info, null, modifier = Modifier.size(17.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(state.activity.ifBlank { "正在执行任务…" }, style = MaterialTheme.typography.bodySmall)
+                Text(if (waiting) "等待模型响应" else state.activity.ifBlank { "正在执行任务…" }, style = MaterialTheme.typography.bodySmall)
             }
         }
     }

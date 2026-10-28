@@ -24,8 +24,8 @@ android {
         applicationId 'com.y2yy.codex.mobile'
         minSdk 28
         targetSdk 35
-        versionCode 14
-        versionName '2.2.9'
+        versionCode 15
+        versionName '2.2.10'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         buildConfigField 'String', 'SERVER_URL', JsonOutput.toJson(access.url ?: '')
         buildConfigField 'String', 'SERVER_USER', JsonOutput.toJson(access.user ?: '')

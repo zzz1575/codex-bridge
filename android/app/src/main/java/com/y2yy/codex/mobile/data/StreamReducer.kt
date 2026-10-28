@@ -56,6 +56,12 @@ object StreamReducer {
             "item/started", "item/completed" -> {
                 val item = p.optJSONObject("item") ?: return next
                 val id = item.string("id")
+                if (item.string("type") == "reasoning") {
+                    // A reasoning start is progress even when it has no user-visible text.
+                    // Delayed events from older turns cannot clear the current waiting state.
+                    return if (next.running && turnId.isNotBlank() && turnId == next.activeTurnId)
+                        next.copy(modelProgressTurnId = turnId) else next
+                }
                 if (item.string("type") == "agentMessage") {
                     val existing = next.messages.find { it.id == id || it.id == "live:$id" }
                     val updated = ChatMessage(id, "assistant", item.string("text"), streaming = method == "item/started", turnId = turnId)

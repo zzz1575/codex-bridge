@@ -85,6 +85,8 @@ data class AppUiState(
     val activity: String = "",
     val running: Boolean = false,
     val activeTurnId: String? = null,
+    /** Ephemeral evidence of native reasoning; never persisted as execution truth. */
+    val modelProgressTurnId: String? = null,
     val hasOlder: Boolean = false,
     val loadingOlder: Boolean = false,
     val attachments: List<Attachment> = emptyList(),
